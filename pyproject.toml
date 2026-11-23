@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hfw-toolkit"
+version = "0.2.0"
+description = "Horizon Forbidden West PC Decima Rigged Machine Assembler (Blender 4.2+/5.x & UE5), DXIL Material/Shader Deep-Dive Studio, and Music/SFX/Voicelines Audio Extractor"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "av>=14.0.0",
+    "lz4",
+    "mmh3",
+    "numpy",
+    "pillow",
+    "texture2ddecoder",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+hfw-toolkit = "hfw_toolkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hfw_toolkit*"]
+
+[tool.setuptools.package-data]
+hfw_toolkit = [
+    "data/*.json.gz",
+    "web/static/*",
+]

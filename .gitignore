@@ -1,0 +1,53 @@
+# Python virtual environments & bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local user configuration (stores machine-specific game & Blender paths)
+hfw_toolkit_config.json
+
+# Generated caches, SQLite asset index & local exports
+cache/
+exports/
+dump/
+
+# Optional native tool binaries (auto-detected from Windows SDK or placed locally)
+bin/*.dll
+bin/*.exe
+bin/*.pdb
+
+# Extracted game assets, 3D scenes & audio outputs
+*.blend
+*.blend1
+*.fbx
+*.dds
+*.png
+*.tga
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.at9
+*.core
+*.stream
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# IDE & OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

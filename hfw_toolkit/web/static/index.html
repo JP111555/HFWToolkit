@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HFWToolkit — Horizon Forbidden West Material &amp; Shader Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-title">HFWToolkit</span>
+      <span class="brand-sub">Decima Machine Assembler &amp; Material/Shader Deep-Dive Studio</span>
+    </div>
+    <div class="topbar-right">
+      <div class="topbar-stats" id="topbar-stats">Loading catalog...</div>
+      <button class="btn-ghost" id="btn-open-setup" title="Configure HFW &amp; Blender paths, inspect version compatibility, or install Blender add-on">⚙️ Setup &amp; Status</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- LEFT SIDEBAR -->
+    <aside class="sidebar">
+      <div class="nav-modes">
+        <button class="mode-btn active" data-mode="machines">Machines</button>
+        <button class="mode-btn" data-mode="audio">Audio &amp; Music</button>
+        <button class="mode-btn" data-mode="texturesets">TextureSets</button>
+        <button class="mode-btn" data-mode="diff">Diff</button>
+      </div>
+
+      <!-- Mode 1: Machines -->
+      <div class="sidebar-pane" id="pane-machines">
+        <div class="search-box">
+          <input id="machine-search" type="text" placeholder="Search Slitherfang, Clawstrider, Slaughterspine..." />
+        </div>
+        <div class="list-scroll" id="machine-list"></div>
+      </div>
+
+      <!-- Mode 2: Audio & Music Explorer -->
+      <div class="sidebar-pane hidden" id="pane-audio">
+        <div class="au-kind-tabs">
+          <button class="au-kind-btn active" data-aukind="music">Music</button>
+          <button class="au-kind-btn" data-aukind="sfx">SFX</button>
+          <button class="au-kind-btn" data-aukind="voicelines">Voicelines</button>
+        </div>
+        <div class="search-box compact">
+          <input id="au-search" type="text" placeholder="Search songs &amp; cues (PlasmaSpine, MQ11, Boss, EndCredits...)" />
+        </div>
+        <div class="search-box compact" style="padding-top:0;">
+          <select id="au-cat-filter" style="width:100%;"><option value="">All Categories</option></select>
+        </div>
+        <div class="list-scroll" id="au-list"></div>
+      </div>
+
+      <!-- Mode 2: Global TextureSet Search -->
+      <div class="sidebar-pane hidden" id="pane-texturesets">
+        <div class="search-box">
+          <input id="ts-search" type="text" placeholder="Search 10,660 TextureSets (muscle, plasma, detail, apex...)" />
+        </div>
+        <div class="list-scroll" id="ts-list"></div>
+      </div>
+
+      <!-- Mode 3: Material Diff -->
+      <div class="sidebar-pane hidden" id="pane-diff">
+        <div class="diff-form">
+          <label>Material A (e.g. Standard Plate)</label>
+          <input id="diff-a" type="text" placeholder="group:index (e.g. 902:3737)" />
+          <label>Material B (e.g. Apex / Other Plate)</label>
+          <input id="diff-b" type="text" placeholder="group:index (e.g. 1818:9261)" />
+          <button id="btn-run-diff" class="btn-primary">Compare Materials</button>
+          <p class="hint">Tip: Open any material and click <strong>"Set as Diff A / B"</strong> to compare two materials side-by-side.</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MIDDLE CONTEXT COLUMN (Machine Parts & Materials) -->
+    <section class="midbar" id="midbar">
+      <div class="empty-state" id="mid-empty">
+        <h3>Select a Machine</h3>
+        <p>Pick a machine like <strong>Slitherfang</strong>, <strong>Clawstrider</strong>, or <strong>Slaughterspine</strong> on the left to inspect its rigged parts, armor plates, materials, and shaders — or export a ready-to-pose Blender 5.3 <code>.blend</code>.</p>
+      </div>
+
+      <div class="hidden" id="mid-machine">
+        <div class="mid-header">
+          <div>
+            <h2 id="m-title">Machine</h2>
+            <div class="meta-line" id="m-meta"></div>
+          </div>
+        </div>
+
+        <div class="mid-controls">
+          <label class="ctrl-label">Variant / Plate Set</label>
+          <select id="m-variant"></select>
+          <div class="export-row" style="flex-wrap:wrap;">
+            <button id="btn-export-blend" class="btn-primary">Export Ready .blend</button>
+            <button id="btn-export-ue5" class="btn-ghost" title="Export rigged SkeletalMesh FBX + textures + ue5_import_machine.py with all animated shaders!">Export UE5 Rig + Shaders</button>
+          </div>
+          <div class="export-row">
+            <label class="chk-inline" title="Unchecked (default): keep native game-packed textures. Checked: split into separate semantic PNG maps."><input type="checkbox" id="chk-unpack" /> Unpack Maps</label>
+            <label class="chk-inline" title="Embed PNG textures inside the .blend file"><input type="checkbox" id="chk-pack" /> Pack .blend</label>
+          </div>
+          <div class="export-status hidden" id="export-status"></div>
+        </div>
+
+        <div class="sub-tabs">
+          <button class="subtab-btn active" data-subtab="materials">Materials (<span id="m-mat-count">0</span>)</button>
+          <button class="subtab-btn" data-subtab="parts">Parts &amp; Plates (<span id="m-part-count">0</span>)</button>
+        </div>
+
+        <div class="search-box compact">
+          <input id="mid-filter" type="text" placeholder="Filter materials or armor plates..." />
+        </div>
+        <div class="list-scroll" id="mid-list"></div>
+      </div>
+    </section>
+
+    <!-- MAIN DEEP-DIVE WORKSPACE -->
+    <main class="workspace" id="workspace">
+      <div class="empty-state hero" id="ws-empty">
+        <h1>Horizon Forbidden West — Material &amp; Shader Studio</h1>
+        <p>Explore how Guerrilla Games built HFW's machines, packed multi-channel <code>TextureSet</code>s, tiled micro-detail / muscle-fiber normals, and compiled SM 6.6 DXIL shaders — with visual, beginner-friendly explanations, interactive node graphs, and direct Blender 5.3 &amp; Unreal Engine 5 exports.</p>
+        <div class="quick-picks">
+          <button class="pill-btn" data-quick="Slitherfang">Inspect Slitherfang</button>
+          <button class="pill-btn" data-quick="Clawstrider">Inspect Clawstrider</button>
+          <button class="pill-btn" data-quick="Slaughterspine">Inspect Slaughterspine</button>
+          <button class="pill-btn" id="btn-quick-audio">🎵 Browse Music, SFX &amp; Voicelines</button>
+        </div>
+      </div>
+
+      <!-- Material Inspector View -->
+      <div class="hidden" id="ws-material">
+        <div class="mat-banner">
+          <div class="mat-banner-left">
+            <h2 id="mat-title">Material</h2>
+            <div class="tag-row" id="mat-tags"></div>
+          </div>
+          <div class="mat-banner-actions">
+            <button class="btn-ghost" id="btn-set-diff-a">Set Diff A</button>
+            <button class="btn-ghost" id="btn-set-diff-b">Set Diff B</button>
+          </div>
+        </div>
+
+        <nav class="ws-tabs">
+          <button class="ws-tab active" data-tab="explain">1. Explain (No HLSL)</button>
+          <button class="ws-tab" data-tab="textures">2. Texture &amp; Channel Lab</button>
+          <button class="ws-tab" data-tab="decima-graph">3. Decima Node Graph</button>
+          <button class="ws-tab" data-tab="ue5-graph">4. Unreal Engine 5 Graph &amp; Export</button>
+          <button class="ws-tab" data-tab="code">5. Readable Code &amp; Glossary</button>
+          <button class="ws-tab" data-tab="dxil">6. Raw DXIL &amp; Bindings</button>
+        </nav>
+
+        <div class="ws-body">
+          <div class="tab-panel" id="tab-explain"></div>
+          <div class="tab-panel hidden" id="tab-textures"></div>
+          <div class="tab-panel hidden" id="tab-decima-graph"></div>
+          <div class="tab-panel hidden" id="tab-ue5-graph"></div>
+          <div class="tab-panel hidden" id="tab-code"></div>
+          <div class="tab-panel hidden" id="tab-dxil"></div>
+        </div>
+      </div>
+
+      <!-- Standalone TextureSet View -->
+      <div class="hidden" id="ws-textureset"></div>
+
+      <!-- Material Diff View -->
+      <div class="hidden" id="ws-diff"></div>
+
+      <!-- Audio, Music, SFX & Voicelines Studio View -->
+      <div class="hidden" id="ws-audio">
+        <div class="au-wrap">
+          <div class="kpi-bar" id="au-kpi-bar"></div>
+
+          <!-- Sticky Now-Playing Audition Player -->
+          <div class="au-player-bar hidden" id="au-player-bar">
+            <div class="au-now-meta">
+              <div class="au-now-title" id="au-now-title">Now Playing</div>
+              <div class="au-path-sub" id="au-now-path"></div>
+              <div class="au-sub-quote hidden" id="au-now-sub"></div>
+            </div>
+            <audio id="au-player" controls style="min-width:290px;max-width:460px;flex:1;"></audio>
+            <a class="btn-ghost" id="au-now-dl" href="#" style="text-decoration:none;white-space:nowrap;">⬇ Download</a>
+          </div>
+
+          <!-- Extraction Controls Card -->
+          <div class="card au-extract-card">
+            <div class="au-controls-row">
+              <label class="au-field">
+                <span>Format</span>
+                <select id="au-format">
+                  <option value="wav">WAV (16-bit Lossless)</option>
+                  <option value="flac">FLAC (Lossless Compressed)</option>
+                  <option value="mp3">MP3 (320 kbps)</option>
+                  <option value="ogg">OGG (Opus)</option>
+                  <option value="at9">AT9 (Raw Sony ATRAC9)</option>
+                </select>
+              </label>
+              <label class="au-field" style="flex:1;min-width:210px;">
+                <span>Output Folder (optional override)</span>
+                <input id="au-out-dir" type="text" placeholder="exports/Audio" />
+              </label>
+              <label class="chk-inline" title="When checked, preserves Guerrilla's reconstructed Music/SFX/Voicelines folder tree. Uncheck for a single flat folder.">
+                <input type="checkbox" id="au-preserve-structure" checked /> Preserve Developer Directory Structure
+              </label>
+            </div>
+
+            <!-- Music-Specific Options -->
+            <div class="au-controls-row" id="au-music-opts" style="margin-top:8px;">
+              <label class="chk-inline" title="Render a full beat-synced combined song for multi-stem cues"><input type="checkbox" id="au-mix-cues" checked /> Mix Full Songs</label>
+              <label class="chk-inline" title="Also export each individual music layer/stem into a Stems/ subfolder"><input type="checkbox" id="au-export-stems" checked /> Export Individual Stems</label>
+              <label class="chk-inline" title="Also copy bonus DigitalExtras/OST MP3 tracks into Music/OfficialSoundtrack_OST/"><input type="checkbox" id="au-include-ost" /> Include DigitalExtras OST</label>
+            </div>
+
+            <!-- Voiceline-Specific Options -->
+            <div class="au-controls-row hidden" id="au-vo-opts" style="margin-top:8px;">
+              <label class="au-field">
+                <span>Spoken Language</span>
+                <select id="au-lang"><option value="en">en — English</option></select>
+              </label>
+              <label class="au-field">
+                <span>Folder Grouping</span>
+                <select id="au-group-by">
+                  <option value="quest">Quest / Scene → Speaker</option>
+                  <option value="speaker">Speaker → Quest / Scene</option>
+                </select>
+              </label>
+              <label class="chk-inline"><input type="checkbox" id="au-write-transcript" checked /> Export Transcript CSV</label>
+            </div>
+
+            <div class="au-controls-row" style="margin-top:10px;">
+              <button class="btn-primary" id="au-btn-extract-selected" disabled>Extract Selected</button>
+              <button class="btn-ghost" id="au-btn-extract-matching">Extract All Matching</button>
+              <button class="btn-ghost" id="au-btn-extract-all-music" style="border-color:#6366f1;color:#a5b4fc;">🎵 Extract ALL Game Music</button>
+              <button class="btn-ghost hidden" id="au-btn-deep-index" title="Index all ~168k SFX sound graph names &amp; spoken dialogue subtitles into SQLite for instant full-text search">Deep-Index All Clips &amp; Subtitles</button>
+              <button class="btn-ghost" id="au-btn-open-folder">Open Output Folder</button>
+            </div>
+            <div class="export-status hidden" id="au-job-status" style="margin-top:8px;"></div>
+          </div>
+
+          <!-- Selected Cue or Directory Detail -->
+          <div class="card au-detail-card">
+            <div class="au-detail-head" id="au-detail-head">
+              <div>
+                <h3 style="margin:0;">Select a Music Cue, SFX Folder, or Voiceline Folder on the left</h3>
+                <div class="hint" style="margin-top:4px;">Preview any song, stem, SFX, or voiceline directly in your browser or batch-extract with Guerrilla's folder tree preserved.</div>
+              </div>
+            </div>
+            <div class="search-box compact hidden" id="au-detail-filter-wrap" style="padding:10px 0 4px;">
+              <input id="au-detail-filter" type="text" placeholder="Filter clips inside this folder by sound name, speaker, or spoken subtitle..." />
+            </div>
+            <div id="au-detail-body" style="margin-top:10px;"></div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Glossary Tooltip Popover -->
+  <div class="glossary-pop hidden" id="glossary-pop"></div>
+
+  <!-- Setup & System Compatibility Modal -->
+  <div class="modal-backdrop hidden" id="setup-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 style="margin:0;">Setup, Paths &amp; Multi-Version Compatibility</h2>
+          <span class="hint">Zero-setup static PE64 RTTI scanner — works directly on any Horizon Forbidden West PC install without external dumps or injectors.</span>
+        </div>
+        <button class="btn-ghost" id="btn-close-setup">✕ Close</button>
+      </div>
+      <div class="modal-body">
+        <div id="setup-health-box" class="health-grid"></div>
+        <div class="setup-form">
+          <label>Horizon Forbidden West Game Directory (containing <code>HorizonForbiddenWest.exe</code> &amp; <code>LocalCacheWinGame/package</code>)</label>
+          <input type="text" id="cfg-game-dir" placeholder="C:\Program Files (x86)\Steam\steamapps\common\Horizon Forbidden West Complete Edition" />
+          <label>Blender Executable (Blender 4.2+ / 5.x <code>blender.exe</code>)</label>
+          <input type="text" id="cfg-blender-exe" placeholder="C:\Program Files\Blender Foundation\Blender 5.3\blender.exe" />
+          <div class="setup-actions">
+            <button class="btn-primary" id="btn-save-cfg">Save Paths &amp; Reload</button>
+            <button class="btn-ghost" id="btn-autodetect-cfg">Auto-Detect Paths (Steam / Epic / Registry)</button>
+            <button class="btn-ghost" id="btn-install-addon">Install Blender N-Panel Add-on</button>
+            <button class="btn-ghost" id="btn-open-exports">Open Exports Folder</button>
+          </div>
+          <div id="setup-msg" class="export-status hidden" style="margin-top:8px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/shader_graph.js"></script>
+  <script src="/static/texture_lab.js"></script>
+  <script src="/static/audio_lab.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

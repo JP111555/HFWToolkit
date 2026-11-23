@@ -1,0 +1,852 @@
+"""Canonical Assembly Bundle exporter (decouples HFW Python 3.14 reader from Blender 5.3 Python 3.13 & UE5)."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+from hfw_toolkit.decima.reader import ObjectId
+from hfw_toolkit.decima.streaming_graph import HFWGame
+from hfw_toolkit.extract.machine_assembler import MachineAssembly
+from hfw_toolkit.extract.materials import MaterialInfo
+from hfw_toolkit.extract.textures import (
+    LANE_TO_IDX,
+    PackingChannel,
+    decode_texture,
+    export_packed_texture,
+    export_packed_texture_set,
+    export_standalone_texture,
+    export_texture_array_atlas,
+    reconstruct_normal_map,
+    save_unpacked_texture_set,
+    unpack_texture_set,
+)
+
+# Known Decima binding hashes for machine detail texture arrays (e.g. Tex 20:0 256x256x23 BC7)
+_DETAIL_ARRAY_BINDING_HASHES: frozenset[int] = frozenset({0x342B11E0})
+
+# Known Decima binding hashes for specialized machine muscle / core / eye / canister / VFX shaders
+# (verified directly from disassembled HFW PixelProgram DXIL: 8260:1, 19501:0, 4628:0, 32906:0, 41249:0, 37840:0)
+_HASH_MUSCLE_BRAID = 0x1B7B57EB      # 4019:1 (64x1024 BC7): R,G = braided muscle normal, B = glow crevice mask
+_HASH_MUSCLE_VEINS = 0x6DEF9DB3      # 4019:0 (128x512 BC5U): R = strand alpha, G = glowing circuit veins
+_HASH_MUSCLE_PULSE = 0x3A91D95B      # 5645:0 (32x512 BC4U): scrolling energy pulse streaks
+_HASH_MUSCLE_RAMP_A = 0x49853A2A     # 5147:0 (64x16 RGBA8): muscle cable energy ramp
+_HASH_MUSCLE_RAMP_B = 0x313B7FE9     # 5147:0 (64x16 RGBA8): ForwardBackground body muscle fiber energy bands
+_HASH_MUSCLE_DISSOLVE = 0x7912A47E   # 107:0 (512x512 BC4U): noise / dissolve mask
+_HASH_CORE_COLOR = 0x6687326C        # 19456:0 (1024x1024 BC7): Thunderjaw Brain/Heart & Slitherfang neck core
+_HASH_CORE_NORMAL = 0x09299177       # 19456:1 (512x512 BC5U): Brain/Heart/Core normal map
+_HASH_VFX_SHELL_LUT = 0x4754E88E     # 487:0 (8x8 R8): ForwardForeground full-body Focus/VFX shell
+_HASH_VFX_SHELL_ARR = 0x1263CD7F     # 1:8 (256x256x60 BC1): ForwardForeground VFX shell array
+_HASH_EYE_VB = 0x2A15D368            # 4628:0 inner machine eye glow shader variable
+_HASH_GLASS_TINT_VB = 0x01943DD3     # 41249:0 canister glass shell RGBA tint
+_HASH_CORE_TINT_VB = 0x5D2FABB8      # 32906:0 / 1348:90 core emissive tint RGB
+
+# DXIL-verified elemental sack, canister & outer eye lens bindings (from scratch/dxil_sacks/*.txt)
+_HASH_SAC_FLOW_MAP = 0x7C771B98      # 172:0 (256x256 BC7): RG dual-phase elemental sac flow vectors
+_HASH_SAC_FLUID_TEX = 0x23FE87DB     # 1703:0 (256x256 BC4U): elemental fluid caustics / bubbles
+_HASH_SAC_COLOR_VB = 0x249F1E74      # PerInstance elemental sac glow RGB
+_HASH_EMISSIVE_TINT_VB = 0x0E470C22  # Canister / elemental window glow RGB (sh=7564:6 / 7036:2)
+_HASH_EYE_IRIS_MASK = 0x5E969132     # 8837:0 / 20273:0 / 15787:3 outer eye lens POM iris glow mask
+
+# Shaders verified from DXIL to emit animated canister fluid/collar glow
+_CANISTER_GLOW_SHADERS: frozenset[str] = frozenset({"7564:6", "7036:2"})
+
+
+# Authentic HFW linear RGB elemental palettes (calibrated for Blender AgX & UE5 ACES)
+_ELEMENT_RGB: dict[str, list[float]] = {
+    "fire": [1.0, 0.20, 0.01],         # Blaze / Fire (Molten Orange)
+    "acid": [0.36, 0.92, 0.03],        # Acid / Metalbite (Corrosive Lime-Green)
+    "adhesive": [0.96, 0.66, 0.02],    # Adhesive / Glue (Amber-Gold)
+    "fertilizer": [0.12, 0.80, 0.14],  # Plowhorn Bio-Fertilizer (Emerald Green)
+    "cryo": [0.08, 0.62, 1.0],         # Cryo / Chillwater / Frost (Glacial Cyan-Blue)
+    "purgewater": [0.04, 0.44, 0.96],  # Purgewater (Deep Aqua-Blue)
+    "plasma": [0.46, 0.05, 1.0],       # Plasma / Glowblast (Electric Violet)
+    "shock": [0.04, 0.46, 1.0],        # Shock / Sparker (Electric Blue)
+    "amplify": [1.0, 0.72, 0.04],      # Spikesnout Amplifying Sac (Golden Yellow)
+    "stamina": [0.92, 0.06, 0.24],     # Spikesnout Stamina Drain Sac (Crimson-Magenta)
+    "dampener": [0.08, 0.86, 0.48],    # Spikesnout Damage Dampener Sac (Mint-Emerald)
+    "rage": [0.92, 0.12, 0.04],        # Tremortusk Rage Sac (Crimson Red)
+    "echo": [0.24, 0.76, 0.96],        # Burrower Sonic/Echo Sac (Sonic Cyan)
+}
+
+
+def _match_element_from_text(text: str) -> str | None:
+    """Match an HFW elemental type keyword from a part name, catalog part name, material name, or variant description."""
+    low = text.lower()
+    if not low.strip():
+        return None
+    # Specific HFW compound/sac terms first (highest specificity)
+    if any(k in low for k in ("metalbite", "acid", "corros")):
+        return "acid"
+    if any(k in low for k in ("adhesive", "glue")):
+        return "adhesive"
+    if any(k in low for k in ("fertiliz",)):
+        return "fertilizer"
+    if any(k in low for k in ("amplif", "buffing")):
+        return "amplify"
+    if any(k in low for k in ("stamina", "debuff")):
+        return "stamina"
+    if any(k in low for k in ("dampener", "tailsac")):
+        return "dampener"
+    if any(k in low for k in ("blaze", "inferno", "fireclaw", "fire")):
+        return "fire"
+    if any(k in low for k in ("chillwater", "cryo", "frost", "freeze", "ice")):
+        return "cryo"
+    if any(k in low for k in ("purgewater", "purge", "water")):
+        return "purgewater"
+    if any(k in low for k in ("glowblast", "plasma")):
+        return "plasma"
+    if any(k in low for k in ("sparker", "shock", "volt", "electr")):
+        return "shock"
+    if any(k in low for k in ("rage",)):
+        return "rage"
+    if any(k in low for k in ("echo",)):
+        return "echo"
+    return None
+
+
+def _is_placeholder_sac_color(f4: tuple[float, ...] | list[float]) -> bool:
+    """Detect Decima's runtime-overridden default placeholder values on `0x249F1E74`."""
+    r, g, b = float(f4[0]), float(f4[1]), float(f4[2])
+    if max(r, g, b) <= 0.02:
+        return True
+    # Debug bright green [0.0, 1.0, 0.0] (e.g. Fireclaw shoulders)
+    if abs(r) < 0.015 and abs(g - 1.0) < 0.015 and abs(b) < 0.015:
+        return True
+    # Ubiquitous default Cryo placeholder blue [0.135, 0.27, 0.54] (Slaughterspine, Bellowback, Clawstrider, Bilegut, Plowhorn, Spikesnout, Slitherfang, Snapmaw, Widemaw, Tideripper!)
+    if abs(r - 0.135) < 0.015 and abs(g - 0.27) < 0.015 and abs(b - 0.54) < 0.015:
+        return True
+    # Neutral dim gray placeholder [0.057, 0.057, 0.057] (Burrower Echo sac)
+    if abs(r - 0.057) < 0.015 and abs(g - 0.057) < 0.015 and abs(b - 0.057) < 0.015:
+        return True
+    # Slitherfang default body blue placeholder [0.0, 0.146, 0.614]
+    if abs(r) < 0.015 and abs(g - 0.146) < 0.015 and abs(b - 0.614) < 0.015:
+        return True
+    return False
+
+
+def _infer_elemental_glow_color(
+    primary_hint: str,
+    fallback: list[float] | None = None,
+    *,
+    mesh_hint: str = "",
+    mat_hint: str = "",
+    variant_hint: str = "",
+    machine_hint: str = "",
+) -> list[float]:
+    """Infer authentic linear elemental RGB glow color in strict priority order:
+    1. Official HFW Focus Catalog part name (e.g. `Metalbite Sac` on Standard Slaughterspine vs `Purgewater Sac` on Apex Slaughterspine!)
+    2. Mesh/Helper part name (e.g. `AcidSac_L`, `BlazeSac_C_01`, `L_glueSacMesh`)
+    3. Material name (e.g. `AcidCanister_NMT`, `BlazeCanister_NMT`, `CryoCanister_NMT`)
+    4. Machine Variant official name & description (e.g. `Fire Bellowback`, `Acid Bellowback`, `Frost Bellowback`, `Apex Bellowback` -> Adhesive)
+    5. Machine species fallback (e.g. Bilegut -> Acid, Fireclaw -> Fire, Frostclaw/Snapmaw -> Cryo, Tideripper/Widemaw -> Purgewater)
+    """
+    for ctx in (primary_hint, mesh_hint, mat_hint, variant_hint):
+        elem = _match_element_from_text(ctx)
+        if elem is not None:
+            return list(_ELEMENT_RGB[elem])
+
+    # Species-level fallback when neither part nor variant specifies an element
+    low = f"{primary_hint} {mesh_hint} {mat_hint} {variant_hint} {machine_hint}".lower()
+    if any(k in low for k in ("inferno", "fireclaw")):
+        return list(_ELEMENT_RGB["fire"])
+    if any(k in low for k in ("bilegut", "frog", "snake", "slitherfang")):
+        return list(_ELEMENT_RGB["acid"])
+    if any(k in low for k in ("seabeast", "tideripper", "widemaw", "hippo")):
+        return list(_ELEMENT_RGB["purgewater"])
+    if any(k in low for k in ("cryobear", "frostclaw", "snapmaw", "beachlizard")):
+        return list(_ELEMENT_RGB["cryo"])
+    if any(k in low for k in ("plasmaspine", "slaughterspine")):
+        return list(_ELEMENT_RGB["plasma"])
+    return list(fallback) if fallback is not None else [0.08, 0.56, 1.0]
+
+
+def _safe_name(text: str, max_len: int = 64) -> str:
+    s = re.sub(r"[^A-Za-z0-9_\-.]+", "_", text).strip("_")
+    return (s or "Asset")[:max_len]
+
+
+def _target_channels_to_packing(target_channels: dict[str, str]) -> dict[str, PackingChannel]:
+    out: dict[str, PackingChannel] = {}
+    for lane, spec in target_channels.items():
+        parts = spec.split(".")
+        stype = parts[0]
+        sch = parts[1] if len(parts) > 1 else "R"
+        out[lane] = PackingChannel(tex_type=stype, source_channel=sch)
+    return out
+
+
+def _extract_material_textures(
+    game: HFWGame,
+    mat: MaterialInfo,
+    tex_dir: Path,
+    ts_packed_cache: dict[str, list[dict[str, Any]]],
+    ts_unpacked_cache: dict[str, dict[str, str]],
+    standalone_packed_cache: dict[str, dict[str, Any] | None],
+    standalone_unpacked_cache: dict[str, dict[str, str]],
+    array_atlas_cache: dict[str, dict[str, Any] | None],
+    standalone_raw_cache: dict[str, dict[str, Any] | None],
+    max_texture_size: int | None = None,
+    unpack_textures: bool = False,
+    is_plasma_machine: bool = False,
+    machine_hint: str = "",
+    variant_hint: str = "",
+    catalog_part_hint: str = "",
+    mesh_part_hint: str = "",
+) -> dict[str, Any]:
+    """Export textures referenced by `mat`'s primary technique.
+
+    By default (`unpack_textures=False`), exports the exact native game-packed RGBA textures
+    (`packed_entries`) so Blender unpacks channels directly in shader nodes.
+    When `unpack_textures=True`, exports individual unpacked semantic PNGs (`maps`).
+    Always extracts Guerrilla's 23-slice `2DArray` machine detail atlas (`detail_array`) when bound,
+    detects specialized machine muscle / glowing fiber / eye / core / canister / VFX shaders,
+    and NEVER misclassifies status-effect BC5 maps (e.g. acid bubbles 241:0 / frost cracks 243:0) as detail normals.
+    """
+    packed_entries: list[dict[str, Any]] = []
+    seen_packed_ids: set[str] = set()
+    maps: dict[str, str] = {}
+    detail_maps: dict[str, str] = {}
+    detail_array: dict[str, Any] | None = None
+    detail_tile_x = 12.0
+    detail_tile_y = 12.0
+    emissive_color: list[float] | None = None
+    emissive_strength = 0.0
+    special_shader: dict[str, Any] | None = None
+    emissive_overlay: dict[str, Any] | None = None
+
+    pt = mat.primary_technique
+    if pt is None:
+        return {
+            "texture_mode": "unpacked" if unpack_textures else "packed",
+            "packed_entries": packed_entries,
+            "maps": maps,
+            "detail_maps": detail_maps,
+            "detail_array": detail_array,
+            "detail_tile": [detail_tile_x, detail_tile_y],
+            "emissive_color": emissive_color,
+            "emissive_strength": emissive_strength,
+            "special_shader": special_shader,
+            "emissive_overlay": emissive_overlay,
+        }
+
+    # Inspect VariableBindings for Decima detail UV tiling scale & special shader parameters
+    vb_by_hash = {vb.binding_name_hash: vb for vb in pt.variable_bindings}
+    if 0x3806EAE3 in vb_by_hash:
+        vb_tile = vb_by_hash[0x3806EAE3]
+        if 0.5 < vb_tile.float4[0] <= 128.0:
+            detail_tile_x = float(vb_tile.float4[0])
+            detail_tile_y = float(vb_tile.float4[1]) if 0.5 < vb_tile.float4[1] <= 128.0 else detail_tile_x
+
+    def _export_raw_tex(rid: str, label: str, color_space: str | None = None) -> dict[str, Any] | None:
+        ckey = f"{rid}|{color_space or 'auto'}"
+        if ckey not in standalone_raw_cache:
+            try:
+                tobj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                standalone_raw_cache[ckey] = export_standalone_texture(
+                    game, tobj, label, tex_dir, color_space=color_space, max_dimension=max_texture_size
+                )
+            except Exception:
+                standalone_raw_cache[ckey] = None
+        return standalone_raw_cache[ckey]
+
+    def _add_packed(entry: dict[str, Any] | None) -> None:
+        if not entry:
+            return
+        tid = entry.get("texture_id") or entry.get("filename", "")
+        if tid in seen_packed_ids:
+            return
+        seen_packed_ids.add(tid)
+        packed_entries.append(entry)
+
+    tb_by_hash: dict[int, Any] = {}
+    for tb in pt.texture_bindings:
+        if tb.resource_id:
+            tb_by_hash[tb.binding_name_hash] = tb
+
+    for tb in pt.texture_bindings:
+        if not tb.resource_id:
+            continue
+        rid = tb.resource_id
+        target_dict = detail_maps if tb.is_detail_texture else maps
+
+        if tb.resource_type == "TextureSet":
+            if not unpack_textures:
+                if rid not in ts_packed_cache:
+                    try:
+                        ts_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                        ts_packed_cache[rid] = export_packed_texture_set(
+                            game, ts_obj, tex_dir, max_dimension=max_texture_size
+                        )
+                    except Exception:
+                        ts_packed_cache[rid] = []
+                for entry in ts_packed_cache[rid]:
+                    if not tb.is_detail_texture:
+                        _add_packed(entry)
+            else:
+                if rid not in ts_unpacked_cache:
+                    try:
+                        ts_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                        uts = unpack_texture_set(game, ts_obj, max_dimension=max_texture_size)
+                        ts_unpacked_cache[rid] = save_unpacked_texture_set(uts, tex_dir)
+                    except Exception:
+                        ts_unpacked_cache[rid] = {}
+                for mtype, fname in ts_unpacked_cache[rid].items():
+                    target_dict.setdefault(mtype, fname)
+
+        elif tb.resource_type == "Texture":
+            # Case A: Decima's mask-driven Machine Detail Texture2DArray (e.g. 20:0 256x256x23 BC7)!
+            if tb.binding_name_hash in _DETAIL_ARRAY_BINDING_HASHES:
+                if rid not in array_atlas_cache:
+                    try:
+                        tex_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                        array_atlas_cache[rid] = export_texture_array_atlas(
+                            game, tex_obj, tex_dir, cols=5, max_slice_dim=256
+                        )
+                    except Exception:
+                        array_atlas_cache[rid] = None
+                if array_atlas_cache[rid] is not None and detail_array is None:
+                    detail_array = dict(array_atlas_cache[rid])
+                    detail_array["tile_x"] = detail_tile_x
+                    detail_array["tile_y"] = detail_tile_y
+                continue
+
+            # Case B: Direct Texture binding that belongs to a TextureSetParent (has explicit target_channels!)
+            if tb.target_channels:
+                if not unpack_textures:
+                    if rid not in standalone_packed_cache:
+                        try:
+                            tex_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                            packing = _target_channels_to_packing(tb.target_channels)
+                            standalone_packed_cache[rid] = export_packed_texture(
+                                game, tex_obj, packing, tb.name, tex_dir, max_dimension=max_texture_size
+                            )
+                        except Exception:
+                            standalone_packed_cache[rid] = None
+                    if not tb.is_detail_texture:
+                        _add_packed(standalone_packed_cache[rid])
+                else:
+                    if rid not in standalone_unpacked_cache:
+                        saved: dict[str, str] = {}
+                        try:
+                            tex_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                            dec = decode_texture(game, tex_obj, max_dimension=max_texture_size)
+                            if dec is not None:
+                                safe = _safe_name(tb.name, 50)
+                                uid = rid.replace(":", "_")
+                                by_type: dict[str, dict[int, np.ndarray]] = {}
+                                for lane, spec in tb.target_channels.items():
+                                    parts = spec.split(".")
+                                    stype = parts[0]
+                                    sch = parts[1] if len(parts) > 1 else "R"
+                                    src_idx = LANE_TO_IDX.get(lane, 0)
+                                    dst_idx = LANE_TO_IDX.get(sch, 0)
+                                    by_type.setdefault(stype, {})[dst_idx] = dec.rgba[:, :, src_idx]
+                                for stype, ch_map in by_type.items():
+                                    if stype == "Normal" and 0 in ch_map and 1 in ch_map:
+                                        for suffix, flip in (("Normal_DX", False), ("Normal_GL", True)):
+                                            fn = f"{safe}_{uid}_{suffix}.png"
+                                            fp = tex_dir / fn
+                                            if not fp.exists():
+                                                Image.fromarray(
+                                                    reconstruct_normal_map(ch_map[0], ch_map[1], flip), mode="RGB"
+                                                ).save(fp)
+                                            saved[suffix] = fn
+                                    elif stype in ("Color", "Incandescence"):
+                                        h, w = next(iter(ch_map.values())).shape
+                                        z = np.zeros((h, w), dtype=np.uint8)
+                                        rgb = np.stack([ch_map.get(0, z), ch_map.get(1, z), ch_map.get(2, z)], axis=-1)
+                                        fn = f"{safe}_{uid}_{stype}.png"
+                                        fp = tex_dir / fn
+                                        if not fp.exists():
+                                            Image.fromarray(rgb, mode="RGB").save(fp)
+                                        saved[stype] = fn
+                                    else:
+                                        arr = next(iter(ch_map.values()))
+                                        fn = f"{safe}_{uid}_{stype}.png"
+                                        fp = tex_dir / fn
+                                        if not fp.exists():
+                                            Image.fromarray(arr, mode="L").save(fp)
+                                        saved[stype] = fn
+                        except Exception:
+                            pass
+                        standalone_unpacked_cache[rid] = saved
+                    for mtype, fname in standalone_unpacked_cache[rid].items():
+                        target_dict.setdefault(mtype, fname)
+            # Case C: Standalone textures WITHOUT TextureSetParent (status-effect maps 241:0/243:0, weather 16:0, etc.)
+            # are skipped here; specialized muscle/core/VFX shaders below explicitly export the ones they need.
+
+    # Detect specialized DXIL-verified HFW machine shaders (braided muscles, glowing body muscle fibers,
+    # inner eye optics, canister cores/glass, Thunderjaw Brain/Heart & Slitherfang coils, VFX overlay shells).
+    passes_set = set(pt.available_passes)
+    has_tset = bool(mat.texture_set_ids)
+    has_mapped = bool(packed_entries or maps)
+
+    if _HASH_MUSCLE_BRAID in tb_by_hash or (_HASH_MUSCLE_VEINS in tb_by_hash and _HASH_MUSCLE_PULSE in tb_by_hash):
+        # Class A: Braided mechanical muscle cables (Guerrilla shader 8260:1, e.g. Clawstrider 5540:23 / 5540:35)
+        braid = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_BRAID].resource_id, "HFW_MuscleBraid", "Non-Color") if _HASH_MUSCLE_BRAID in tb_by_hash else None
+        veins = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_VEINS].resource_id, "HFW_MuscleVeins", "Non-Color") if _HASH_MUSCLE_VEINS in tb_by_hash else None
+        pulse = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_PULSE].resource_id, "HFW_MusclePulse", "Non-Color") if _HASH_MUSCLE_PULSE in tb_by_hash else None
+        ramp = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_RAMP_A].resource_id, "HFW_MuscleRamp", "Non-Color") if _HASH_MUSCLE_RAMP_A in tb_by_hash else None
+        special_shader = {
+            "kind": "muscle_cables",
+            "braid_file": braid["filename"] if braid else "",
+            "veins_file": veins["filename"] if veins else "",
+            "pulse_file": pulse["filename"] if pulse else "",
+            "ramp_file": ramp["filename"] if ramp else "",
+            # Exact DXIL 8260:1 calm electric cyan-blue (0.0, 0.231, 1.0) & alert crimson (0.95, 0.08, 0.02)
+            "glow_color": [0.0, 0.231, 1.0],
+            "alert_color": [0.95, 0.08, 0.02],
+            "glow_strength": 6.0,
+        }
+    elif (not has_tset) and ("ForwardBackground" in passes_set) and (_HASH_MUSCLE_RAMP_B in tb_by_hash):
+        # Class B: Translucent glowing body muscle fiber overlay (Guerrilla shaders 19501:0 / 21395:0 / 20640:0 / 26679:0)
+        # Present on Slaughterspine, Clawstrider, Slitherfang & Thunderjaw body muscle cavities (UV0=Mask_Alpha, UV1=flow)!
+        ramp = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_RAMP_B].resource_id, "HFW_MuscleFiberRamp", "Non-Color")
+        dissolve = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_DISSOLVE].resource_id, "HFW_MuscleDissolve", "Non-Color") if _HASH_MUSCLE_DISSOLVE in tb_by_hash else None
+        special_shader = {
+            "kind": "muscle_fiber_overlay",
+            "ramp_file": ramp["filename"] if ramp else "",
+            "dissolve_file": dissolve["filename"] if dissolve else "",
+            # Exact DXIL 19501:0 linear colors calibrated for AgX: rich Calm Amber, Electric Plasma Violet, Apex Red
+            "calm_color": [0.95, 0.24, 0.02],
+            "plasma_color": [0.46, 0.05, 1.0] if is_plasma_machine else [0.05, 0.34, 1.0],
+            "alert_color": [1.0, 0.04, 0.01],
+            "charge_state": 1.0 if is_plasma_machine else 0.0,
+            "alert_state": 0.0,
+            "glow_strength": 3.4,
+            "fiber_density": 96.0,
+            "normal_offset": 0.0014,
+        }
+    elif _HASH_CORE_COLOR in tb_by_hash and _HASH_CORE_NORMAL in tb_by_hash:
+        # Class C: Machine glowing energy core / Brain / Heart / Neck coils (32906:0, 1348:90)
+        core_col = _export_raw_tex(tb_by_hash[_HASH_CORE_COLOR].resource_id, "HFW_CoreColor", "sRGB")
+        core_nrm = _export_raw_tex(tb_by_hash[_HASH_CORE_NORMAL].resource_id, "HFW_CoreNormal", "Non-Color")
+        tint = [0.08, 0.55, 1.0]
+        if _HASH_CORE_TINT_VB in vb_by_hash:
+            f4 = vb_by_hash[_HASH_CORE_TINT_VB].float4
+            if max(f4[:3]) > 0.01:
+                tint = [float(f4[0]), float(f4[1]), float(f4[2])]
+        special_shader = {
+            "kind": "machine_core_emissive",
+            "color_file": core_col["filename"] if core_col else "",
+            "normal_file": core_nrm["filename"] if core_nrm else "",
+            "glow_color": tint,
+            "glow_strength": 4.5,
+        }
+    elif (not has_tset) and (not has_mapped) and ("ForwardForeground" in passes_set) and (_HASH_VFX_SHELL_LUT in tb_by_hash):
+        # Class D: Full-body UV-less Focus/Stealth/VFX overlay shell (37840:0, 38845:0) -> transparent & hidden in Focus_Overlay!
+        special_shader = {
+            "kind": "vfx_overlay_shell",
+            "glow_color": [0.25, 0.10, 1.0] if is_plasma_machine else [0.05, 0.65, 1.0],
+            "opacity": 0.0,
+        }
+    elif (not has_tset) and (not has_mapped) and ("ForwardForeground" in passes_set) and (_HASH_GLASS_TINT_VB in vb_by_hash):
+        # Class E: Translucent canister outer glass shell (41249:0, e.g. 14705:34)
+        f4 = vb_by_hash[_HASH_GLASS_TINT_VB].float4
+        special_shader = {
+            "kind": "canister_glass",
+            "tint_color": [float(f4[0]), float(f4[1]), float(f4[2])],
+            "alpha": 0.25,
+        }
+    elif (not has_tset) and (not has_mapped) and ("DeferredEmissive" in passes_set) and (_HASH_MUSCLE_DISSOLVE in tb_by_hash):
+        if _HASH_EYE_VB in vb_by_hash:
+            # Class F: Inner glowing machine eye optical sensor (4628:0)
+            special_shader = {
+                "kind": "machine_eye_glow",
+                "glow_color": [0.04, 0.52, 1.0],
+                "alert_color": [1.0, 0.12, 0.02],
+                "glow_strength": 8.0,
+            }
+        else:
+            # Class G: Elemental canister glowing fluid core (21080:1, e.g. Shock/Plasma/Cryo/Acid/Blaze canister core)
+            noise_tex = _export_raw_tex(tb_by_hash[_HASH_MUSCLE_DISSOLVE].resource_id, "HFW_CanisterCoreNoise", "Non-Color")
+            if mat.object_id.startswith("13567:"):
+                c_col = [0.48, 0.06, 1.0]
+            elif mat.object_id.startswith("10036:"):
+                c_col = [0.05, 0.50, 1.0]
+            elif mat.object_id.startswith("14705:"):
+                c_col = [0.16, 0.72, 1.0]
+            elif mat.object_id.startswith("13451:"):
+                c_col = [0.46, 0.90, 0.06]
+            elif mat.object_id.startswith("13323:"):
+                c_col = [1.0, 0.45, 0.02]
+            elif mat.object_id.startswith("15271:"):
+                c_col = [0.08, 0.52, 0.96]
+            else:
+                c_col = _infer_elemental_glow_color(
+                    catalog_part_hint,
+                    [0.42, 0.05, 1.0] if is_plasma_machine else [0.05, 0.48, 1.0],
+                    mesh_hint=mesh_part_hint,
+                    mat_hint=mat.name,
+                    variant_hint=variant_hint,
+                    machine_hint=machine_hint,
+                )
+            special_shader = {
+                "kind": "canister_glow_core",
+                "noise_file": noise_tex["filename"] if noise_tex else "",
+                "glow_color": c_col,
+                "glow_strength": 6.5,
+            }
+
+    # Detect DXIL-verified Emissive/Animated Overlays on standard PBR materials (sacks, canisters, outer eyes)!
+    if special_shader is None:
+        shader_id = pt.shader_id or ""
+
+        # Overlay 1: Elemental Sacks (Cryo, Acid/Metalbite, Blaze/Fire, Purgewater, Adhesive, Fertilizer, Spikesnout!)
+        # Exact DXIL signature: binds 0x7c771b98 (172:0 Flow Map) + 0x23fe87db (1703:0 Fluid Caustics) + mat_id==0 * Mask_Alpha!
+        if _HASH_SAC_FLOW_MAP in tb_by_hash and _HASH_SAC_FLUID_TEX in tb_by_hash:
+            flow_tex = _export_raw_tex(tb_by_hash[_HASH_SAC_FLOW_MAP].resource_id, "HFW_SacFlowMap", "Non-Color")
+            fluid_tex = _export_raw_tex(tb_by_hash[_HASH_SAC_FLUID_TEX].resource_id, "HFW_SacFluidCaustics", "Non-Color")
+            sac_col = None
+            # Only trust PerInstance 0x249F1E74 when it is NOT one of Decima's runtime-overridden placeholders
+            # (such as [0.135, 0.27, 0.54] default blue, [0.0, 1.0, 0.0] debug green, or [0.057, 0.057, 0.057] gray!).
+            if _HASH_SAC_COLOR_VB in vb_by_hash:
+                f4 = vb_by_hash[_HASH_SAC_COLOR_VB].float4
+                if not _is_placeholder_sac_color(f4):
+                    sac_col = [float(f4[0]), float(f4[1]), float(f4[2])]
+            if sac_col is None:
+                sac_col = _infer_elemental_glow_color(
+                    catalog_part_hint,
+                    mesh_hint=mesh_part_hint,
+                    mat_hint=mat.name,
+                    variant_hint=variant_hint,
+                    machine_hint=machine_hint,
+                )
+            emissive_overlay = {
+                "kind": "elemental_sack_overlay",
+                "flow_file": flow_tex["filename"] if flow_tex else "",
+                "fluid_file": fluid_tex["filename"] if fluid_tex else "",
+                "glow_color": sac_col,
+                "glow_strength": 3.4,
+                "flow_speed": 0.35,
+                "flow_strength": 0.14,
+                "mask_id": 0.0,  # Exact DXIL L476: round(Mask * 20) == 0 * Mask_Alpha
+            }
+
+        # Overlay 2: Elemental Canisters (Acid 13451:37/69, Water 15271:21/61, Blaze 13323:33/56, Plasma 13567:44, Shock 10036:34)
+        elif (
+            shader_id in _CANISTER_GLOW_SHADERS
+            or "canister" in mat.name.lower()
+            or (
+                _HASH_EMISSIVE_TINT_VB in vb_by_hash
+                and max(vb_by_hash[_HASH_EMISSIVE_TINT_VB].float4[:3]) > 0.25
+                and not (
+                    # Exclude Decima's ubiquitous default debug green [0.1, 0.7, 0.05] on ordinary armor plates
+                    abs(vb_by_hash[_HASH_EMISSIVE_TINT_VB].float4[0] - 0.10) < 0.02
+                    and abs(vb_by_hash[_HASH_EMISSIVE_TINT_VB].float4[1] - 0.70) < 0.02
+                    and abs(vb_by_hash[_HASH_EMISSIVE_TINT_VB].float4[2] - 0.05) < 0.02
+                )
+            )
+        ):
+            can_col = None
+            if _HASH_EMISSIVE_TINT_VB in vb_by_hash:
+                f4 = vb_by_hash[_HASH_EMISSIVE_TINT_VB].float4
+                is_default_gray = max(f4[:3]) <= 0.12
+                is_default_green = abs(f4[0] - 0.10) < 0.02 and abs(f4[1] - 0.70) < 0.02 and abs(f4[2] - 0.05) < 0.02
+                if not is_default_gray and not is_default_green:
+                    can_col = [float(f4[0]), float(f4[1]), float(f4[2])]
+            if can_col is None:
+                can_col = _infer_elemental_glow_color(
+                    catalog_part_hint,
+                    mesh_hint=mesh_part_hint,
+                    mat_hint=mat.name,
+                    variant_hint=variant_hint,
+                    machine_hint=machine_hint,
+                )
+            noise_tex = (
+                _export_raw_tex(tb_by_hash[_HASH_MUSCLE_DISSOLVE].resource_id, "HFW_CanisterNoise", "Non-Color")
+                if _HASH_MUSCLE_DISSOLVE in tb_by_hash
+                else None
+            )
+            emissive_overlay = {
+                "kind": "canister_emissive_overlay",
+                "noise_file": noise_tex["filename"] if noise_tex else "",
+                "glow_color": can_col,
+                "glow_strength": 6.0 if shader_id == "7564:6" else 4.5,
+                "pulse_speed": 8.0,  # Exact DXIL acid_canister_shell L994: sin(Time * 8.0) * 0.3 + 0.4
+                "is_fluid_body": shader_id == "7564:6",
+            }
+
+        # Overlay 3: Outer Machine Eye Lens with POM Iris Glow Mask (`0x5e969132` -> 8837:0 / 20273:0 / 15787:3)
+        elif _HASH_EYE_IRIS_MASK in tb_by_hash:
+            iris_tex = _export_raw_tex(tb_by_hash[_HASH_EYE_IRIS_MASK].resource_id, "HFW_EyeIrisMask", "Non-Color")
+            emissive_overlay = {
+                "kind": "machine_eye_lens_overlay",
+                "iris_file": iris_tex["filename"] if iris_tex else "",
+                "calm_color": [0.04, 0.56, 1.0],
+                "alert_color": [1.0, 0.10, 0.02],
+                "alert_state": 0.0,
+                "glow_strength": 9.0,
+            }
+
+        # Overlay 4: Slaughterspine Plasma Charge-Up Shader (`dxil_ss_plasmaspike.ll` L623-768 & L725-732)!
+        # Uses Vertex Color `Color0.R` (PlasmaSpikes, PlasmaChargers, PlasmaCore, TailBlasters, Jaw/Rib Vents),
+        # `Color0.G` (Head-to-Tail plasma surge wave), `(1 - AO_remap)^2` crevice coil focus, `mat_id == 1` body conduits,
+        # and animated `107:0` plasma turbulence noise! Ordinary non-plasma armor plates stay 0 emission automatically.
+        elif is_plasma_machine and ("DeferredEmissive" in passes_set) and (has_mapped or has_tset):
+            noise_tex = (
+                _export_raw_tex(tb_by_hash[_HASH_MUSCLE_DISSOLVE].resource_id, "HFW_PlasmaNoise", "Non-Color")
+                if _HASH_MUSCLE_DISSOLVE in tb_by_hash
+                else _export_raw_tex("107:0", "HFW_PlasmaNoise", "Non-Color")
+            )
+            emissive_overlay = {
+                "kind": "plasma_charge_overlay",
+                "noise_file": noise_tex["filename"] if noise_tex else "",
+                "plasma_color": [0.46, 0.05, 1.0],
+                "rim_color": [0.18, 0.03, 0.95],
+                "idle_led_color": [0.85, 0.18, 0.02],
+                "plasma_charge": 1.0,
+                "glow_strength": 4.2,
+            }
+
+    has_emissive = (
+        "Incandescence" in maps
+        or any("Incandescence" in v for e in packed_entries for v in e.get("packing", {}).values())
+        or "DeferredEmissive" in mat.material_tags
+    )
+    if has_emissive:
+        emissive_strength = 4.0
+
+    return {
+        "texture_mode": "unpacked" if unpack_textures else "packed",
+        "packed_entries": packed_entries,
+        "maps": maps,
+        "detail_maps": detail_maps,
+        "detail_array": detail_array,
+        "detail_tile": [detail_tile_x, detail_tile_y],
+        "emissive_color": emissive_color,
+        "emissive_strength": emissive_strength,
+        "special_shader": special_shader,
+        "emissive_overlay": emissive_overlay,
+    }
+
+
+def export_assembly_bundle(
+    game: HFWGame,
+    assembly: MachineAssembly,
+    bundle_dir: Path,
+    max_texture_size: int | None = None,
+    unpack_textures: bool = False,
+) -> Path:
+    """Write a complete self-contained Canonical Assembly Bundle (`assembly.json` + `geometry.npz` + `textures/`).
+
+    Parameters
+    ----------
+    unpack_textures:
+        When False (default), exports the game's native packed RGBA textures and lets Blender
+        separate channels in shader nodes. When True, unpacks each TextureSet into individual
+        semantic PNGs (`_Color`, `_Normal_GL`, `_Roughness`, `_AO`, `_Reflectance`, `_Mask`, etc.).
+    """
+    bundle_dir = Path(bundle_dir)
+    tex_dir = bundle_dir / "textures"
+    tex_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_packed_cache: dict[str, list[dict[str, Any]]] = {}
+    ts_unpacked_cache: dict[str, dict[str, str]] = {}
+    standalone_packed_cache: dict[str, dict[str, Any] | None] = {}
+    standalone_unpacked_cache: dict[str, dict[str, str]] = {}
+    array_atlas_cache: dict[str, dict[str, Any] | None] = {}
+    standalone_raw_cache: dict[str, dict[str, Any] | None] = {}
+
+    machine_hint = f"{assembly.codename} {assembly.display_name}"
+    variant_hint = f"{assembly.official_variant_name} {assembly.variant_label} {assembly.official_variant_description}"
+    is_plasma_machine = any(
+        kw in f"{machine_hint} {variant_hint}".lower()
+        for kw in ("plasma", "slaughterspine")
+    )
+
+    # Map each material_id -> official HFW Focus Catalog part names (Priority 1) + mesh part names (Priority 2)
+    # (so Slaughterspine's Metalbite Sac = Acid Green, Apex Slaughterspine's Purgewater Sac = Aqua Blue,
+    # Fire vs Acid Clawstrider, Fire vs Frost vs Acid vs Apex Bellowback, Bilegut Acid vs Adhesive sacs, etc.!)
+    mat_cat_hints: dict[str, list[str]] = {}
+    mat_mesh_hints: dict[str, list[str]] = {}
+    for part in assembly.parts:
+        if part.state_index > 0:
+            continue
+        for pr in part.mesh.primitives:
+            if not pr.material_id:
+                continue
+            if part.catalog_part_name:
+                mat_cat_hints.setdefault(pr.material_id, []).append(part.catalog_part_name)
+            if part.name:
+                mat_mesh_hints.setdefault(pr.material_id, []).append(part.name)
+
+    materials_manifest: dict[str, Any] = {}
+    for mid, mat in assembly.materials.items():
+        c_hint = " ".join(dict.fromkeys(mat_cat_hints.get(mid, ())))
+        m_hint = " ".join(dict.fromkeys(mat_mesh_hints.get(mid, ())))
+        tex_info = _extract_material_textures(
+            game,
+            mat,
+            tex_dir,
+            ts_packed_cache,
+            ts_unpacked_cache,
+            standalone_packed_cache,
+            standalone_unpacked_cache,
+            array_atlas_cache,
+            standalone_raw_cache,
+            max_texture_size=max_texture_size,
+            unpack_textures=unpack_textures,
+            is_plasma_machine=is_plasma_machine,
+            machine_hint=machine_hint,
+            variant_hint=variant_hint,
+            catalog_part_hint=c_hint,
+            mesh_part_hint=m_hint,
+        )
+        pt = mat.primary_technique
+        materials_manifest[mid] = {
+            "material_id": mid,
+            "name": mat.name,
+            "tags": mat.material_tags,
+            "shader_id": pt.shader_id if pt else None,
+            "shader_hash": pt.shader_hash if pt else "",
+            "passes": pt.available_passes if pt else [],
+            "texture_sets": mat.texture_set_ids,
+            "texture_mode": tex_info["texture_mode"],
+            "packed_entries": tex_info["packed_entries"],
+            "maps": tex_info["maps"],
+            "detail_maps": tex_info["detail_maps"],
+            "detail_array": tex_info["detail_array"],
+            "detail_tile": tex_info["detail_tile"],
+            "emissive_color": tex_info["emissive_color"],
+            "emissive_strength": tex_info["emissive_strength"],
+            "special_shader": tex_info["special_shader"],
+            "emissive_overlay": tex_info["emissive_overlay"],
+            "variables": [
+                {
+                    "hash": f"{vb.binding_name_hash:#010x}",
+                    "type": vb.variable_type,
+                    "float4": list(vb.float4),
+                }
+                for vb in (pt.variable_bindings if pt else ())
+            ],
+        }
+
+    # Pack all geometry arrays into a single compressed .npz archive
+    arrays: dict[str, np.ndarray] = {}
+    parts_manifest: list[dict[str, Any]] = []
+
+    for p_idx, part in enumerate(assembly.parts):
+        prims_meta: list[dict[str, Any]] = []
+        for pr_idx, prim in enumerate(part.mesh.primitives):
+            prefix = f"p{p_idx}_m{pr_idx}"
+            arrays[f"{prefix}_pos"] = prim.positions.astype(np.float32, copy=False)
+            arrays[f"{prefix}_idx"] = prim.indices.astype(np.uint32, copy=False)
+            if prim.normals is not None:
+                arrays[f"{prefix}_nrm"] = prim.normals.astype(np.float32, copy=False)
+            for u_i, uv in enumerate(prim.uvs):
+                arrays[f"{prefix}_uv{u_i}"] = uv.astype(np.float32, copy=False)
+            for c_i, col in enumerate(prim.colors):
+                arrays[f"{prefix}_col{c_i}"] = col.astype(np.float32, copy=False)
+            if prim.bone_indices is not None and prim.bone_weights is not None:
+                arrays[f"{prefix}_bi"] = prim.bone_indices.astype(np.uint16, copy=False)
+                arrays[f"{prefix}_bw"] = prim.bone_weights.astype(np.float32, copy=False)
+
+            prims_meta.append(
+                {
+                    "key": prefix,
+                    "material_id": prim.material_id,
+                    "vertex_count": int(len(prim.positions)),
+                    "index_count": int(len(prim.indices)),
+                    "has_normals": prim.normals is not None,
+                    "uv_count": len(prim.uvs),
+                    "color_count": len(prim.colors),
+                    "has_weights": prim.bone_indices is not None and prim.bone_weights is not None,
+                }
+            )
+
+        if not prims_meta:
+            continue
+
+        # Route pure UV-less Focus/VFX overlay shell meshes cleanly into the hidden `Focus_Overlay` collection!
+        part_coll = part.collection
+        part_enabled = part.enabled_by_default
+        if all(
+            (materials_manifest.get(pm["material_id"], {}).get("special_shader") or {}).get("kind") == "vfx_overlay_shell"
+            for pm in prims_meta
+            if pm["material_id"]
+        ) and any(pm["material_id"] for pm in prims_meta):
+            part_coll = "Focus_Overlay"
+            part_enabled = False
+
+        parts_manifest.append(
+            {
+                "part_id": part.part_id,
+                "name": part.name,
+                "collection": part_coll,
+                "source_kind": part.source_kind,
+                "is_skinned": part.is_skinned,
+                "parent_joint_index": part.parent_joint_index,
+                "parent_joint_name": part.parent_joint_name,
+                "helper_name": part.helper_name,
+                "local_offset_matrix": part.local_offset_matrix.tolist(),
+                "world_matrix": part.world_matrix.tolist(),
+                "enabled_by_default": part_enabled,
+                "state_index": part.state_index,
+                "primitives": prims_meta,
+            }
+        )
+
+    # Include helpers referenced by parts so armature stays clean and organized
+    used_helper_names = {p["helper_name"] for p in parts_manifest if p["helper_name"]}
+    helpers_manifest = []
+    seen_helper_names: set[str] = set()
+    for h in assembly.skeleton.helpers:
+        if not h.name or h.name in seen_helper_names:
+            continue
+        if h.name in used_helper_names:
+            seen_helper_names.add(h.name)
+            helpers_manifest.append(
+                {
+                    "name": h.name,
+                    "parent_joint_index": h.parent_joint_index,
+                    "offset_matrix": h.offset_matrix.tolist(),
+                    "world_matrix": h.world_matrix.tolist(),
+                }
+            )
+
+    joints_manifest = [
+        {
+            "index": j.index,
+            "name": j.name,
+            "parent_index": j.parent_index,
+            "local_matrix": j.local_matrix.tolist(),
+            "world_matrix": j.world_matrix.tolist(),
+        }
+        for j in assembly.skeleton.joints
+    ]
+
+    manifest = {
+        "schema_version": 2,
+        "texture_mode": "unpacked" if unpack_textures else "packed",
+        "entity_id": assembly.entity_id,
+        "codename": assembly.codename,
+        "display_name": assembly.display_name,
+        "variant_label": assembly.variant_label,
+        "skeleton_id": assembly.skeleton.object_id,
+        "joints": joints_manifest,
+        "helpers": helpers_manifest,
+        "parts": parts_manifest,
+        "materials": materials_manifest,
+    }
+
+    np.savez_compressed(bundle_dir / "geometry.npz", **arrays)
+    (bundle_dir / "assembly.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Also write the ready-to-run Unreal Engine 5 Machine Rig + Animated Materials importer (`ue5_import_machine.py`)!
+    try:
+        from hfw_toolkit.shaders.unreal_export import generate_ue5_machine_script
+
+        fbx_name = f"{_safe_name(assembly.display_name)}.fbx"
+        ue5_py = generate_ue5_machine_script(manifest, bundle_dir, fbx_filename=fbx_name)
+        (bundle_dir / "ue5_import_machine.py").write_text(ue5_py, encoding="utf-8")
+    except Exception:
+        pass
+
+    return bundle_dir
