@@ -326,17 +326,17 @@ code, pre { font-family: "Cascadia Code", "Consolas", monospace; }
 /* Audio, Music, SFX & Voicelines Studio */
 .layout.audio-wide { grid-template-columns: 330px 1fr; }
 .layout.audio-wide .midbar { display: none; }
-#ws-audio { padding: 18px 20px; overflow-y: auto; height: 100%; }
+#ws-audio, #ws-characters, #ws-assets { padding: 18px 20px; overflow-y: auto; height: 100%; }
 .au-wrap { max-width: 1400px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
 .au-kind-tabs {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
   padding: 8px 8px 4px; background: #0c121e;
 }
-.au-kind-btn {
+.au-kind-btn, .ch-kind-btn {
   background: var(--bg3); color: var(--muted); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 4px; font-size: 11.5px; font-weight: 700; cursor: pointer;
 }
-.au-kind-btn.active { background: #16304c; color: var(--cyan); border-color: var(--cyan); }
+.au-kind-btn.active, .ch-kind-btn.active { background: #16304c; color: var(--cyan); border-color: var(--cyan); }
 .au-path-sub {
   font-size: 10.5px; color: #7c90ad; margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

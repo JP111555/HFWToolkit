@@ -757,6 +757,7 @@ def _ensure_elemental_sack_group(
     ng.interface.new_socket(name="Smoothness", in_out="OUTPUT", socket_type="NodeSocketFloat")
     ng.interface.new_socket(name="Emission Color", in_out="OUTPUT", socket_type="NodeSocketColor")
     ng.interface.new_socket(name="Emission Strength", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    ng.interface.new_socket(name="Sac Mask", in_out="OUTPUT", socket_type="NodeSocketFloat")
 
     n_in = ng.nodes.new("NodeGroupInput")
     n_in.location = (-1650, 0)
@@ -933,11 +934,11 @@ def _ensure_elemental_sack_group(
     ng.links.new(n_in.outputs["Sac Glow Color"], mix_rim.inputs[6])
     ng.links.new(rim_hsv.outputs["Color"], mix_rim.inputs[7])
 
-    # 6. Fluid & Breathing Pulse Modulation: rich swirling caustic contrast (0.28 + 1.25 * fluid) * breathing pulse
+    # 6. Fluid & Breathing Pulse Modulation: rich swirling caustic contrast (0.38 + 1.15 * fluid) * breathing pulse
     fl_mod = ng.nodes.new("ShaderNodeMath")
     fl_mod.operation = "MULTIPLY_ADD"
-    fl_mod.inputs[1].default_value = 1.25
-    fl_mod.inputs[2].default_value = 0.28
+    fl_mod.inputs[1].default_value = 1.15
+    fl_mod.inputs[2].default_value = 0.38
     fl_mod.location = (400, -340)
     ng.links.new(fluid_val_sock, fl_mod.inputs[0])
 
@@ -977,10 +978,10 @@ def _ensure_elemental_sack_group(
     ng.links.new(m_mask.outputs["Value"], em_str.inputs[0])
     ng.links.new(n_in.outputs["Glow Strength"], em_str.inputs[1])
 
-    # 7. Subtle translucent tint on Base Color & rubbery sheen Smoothness ONLY where sac_mask > 0
+    # 7. Wet translucent membrane tint & high-gloss liquid Smoothness (0.88 -> Roughness 0.12) ONLY where sac_mask > 0
     tint_w = ng.nodes.new("ShaderNodeMath")
     tint_w.operation = "MULTIPLY"
-    tint_w.inputs[1].default_value = 0.45
+    tint_w.inputs[1].default_value = 0.55
     tint_w.location = (440, 340)
     ng.links.new(sac_mask.outputs["Value"], tint_w.inputs[0])
 
@@ -993,7 +994,7 @@ def _ensure_elemental_sack_group(
 
     mix_sm = ng.nodes.new("ShaderNodeMix")
     mix_sm.data_type = "FLOAT"
-    mix_sm.inputs[3].default_value = 0.72
+    mix_sm.inputs[3].default_value = 0.88
     mix_sm.location = (680, 180)
     ng.links.new(sac_mask.outputs["Value"], mix_sm.inputs["Factor"])
     ng.links.new(n_in.outputs["Base Smoothness"], mix_sm.inputs[2])
@@ -1002,6 +1003,7 @@ def _ensure_elemental_sack_group(
     ng.links.new(mix_sm.outputs[0], n_out.inputs["Smoothness"])
     ng.links.new(mix_rim.outputs[2], n_out.inputs["Emission Color"])
     ng.links.new(em_str.outputs["Value"], n_out.inputs["Emission Strength"])
+    ng.links.new(sac_mask.outputs["Value"], n_out.inputs["Sac Mask"])
     return ng
 
 
@@ -1032,6 +1034,7 @@ def _ensure_canister_glow_group(noise_img: bpy.types.Image | None) -> bpy.types.
     ng.interface.new_socket(name="Color", in_out="OUTPUT", socket_type="NodeSocketColor")
     ng.interface.new_socket(name="Emission Color", in_out="OUTPUT", socket_type="NodeSocketColor")
     ng.interface.new_socket(name="Emission Strength", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    ng.interface.new_socket(name="Fluid Mask", in_out="OUTPUT", socket_type="NodeSocketFloat")
 
     n_in = ng.nodes.new("NodeGroupInput")
     n_in.location = (-1320, 0)
@@ -1182,6 +1185,7 @@ def _ensure_canister_glow_group(noise_img: bpy.types.Image | None) -> bpy.types.
     ng.links.new(bc_mix.outputs[2], n_out.inputs["Color"])
     ng.links.new(n_in.outputs["Glow Color"], n_out.inputs["Emission Color"])
     ng.links.new(em_str.outputs["Value"], n_out.inputs["Emission Strength"])
+    ng.links.new(is_m20.outputs["Value"], n_out.inputs["Fluid Mask"])
     return ng
 
 
@@ -1310,68 +1314,223 @@ def _ensure_muscle_cables_group() -> bpy.types.ShaderNodeTree:
     n_out = ng.nodes.new("NodeGroupOutput")
     n_out.location = (520, 0)
 
-    # braid_glow = saturate((Braid - 0.05) * 1.053) * (0.45 + Pulse * 1.2)
+    # Exact DXIL 8260:1 L325-386: dark carbon braided cable with glowing crevices, scrolling pulse streaks & veins,
+    # fading to pure dark metallic cable on grazing silhouettes (`saturate((-0.25 - dot(N,V)) * 4.0)`)
+    # and transitioning through a rich Dark Ember -> Vibrant Muscle Color -> Hot Bright Core gradient!
     br_adj = ng.nodes.new("ShaderNodeMath")
     br_adj.operation = "MULTIPLY_ADD"
     br_adj.inputs[1].default_value = 1.053
     br_adj.inputs[2].default_value = -0.053
     br_adj.use_clamp = True
-    br_adj.location = (-480, 220)
+    br_adj.location = (-520, 220)
     ng.links.new(n_in.outputs["Braid Mask"], br_adj.inputs[0])
 
     pl_scale = ng.nodes.new("ShaderNodeMath")
     pl_scale.operation = "MULTIPLY_ADD"
-    pl_scale.inputs[1].default_value = 1.2
-    pl_scale.inputs[2].default_value = 0.45
-    pl_scale.location = (-480, 40)
+    pl_scale.inputs[1].default_value = 1.10
+    pl_scale.inputs[2].default_value = 0.10
+    pl_scale.location = (-520, 40)
     ng.links.new(n_in.outputs["Pulse Mask"], pl_scale.inputs[0])
 
     br_pl = ng.nodes.new("ShaderNodeMath")
     br_pl.operation = "MULTIPLY"
-    br_pl.location = (-240, 140)
+    br_pl.location = (-280, 140)
     ng.links.new(br_adj.outputs["Value"], br_pl.inputs[0])
     ng.links.new(pl_scale.outputs["Value"], br_pl.inputs[1])
 
-    # Add circuit veins + Fresnel view-angle edge boost
+    vn_scl = ng.nodes.new("ShaderNodeMath")
+    vn_scl.operation = "MULTIPLY"
+    vn_scl.inputs[1].default_value = 0.65
+    vn_scl.location = (-280, -20)
+    ng.links.new(n_in.outputs["Vein Mask"], vn_scl.inputs[0])
+
     vn_add = ng.nodes.new("ShaderNodeMath")
     vn_add.operation = "ADD"
     vn_add.use_clamp = True
-    vn_add.location = (-40, 100)
+    vn_add.location = (-80, 100)
     ng.links.new(br_pl.outputs["Value"], vn_add.inputs[0])
-    ng.links.new(n_in.outputs["Vein Mask"], vn_add.inputs[1])
+    ng.links.new(vn_scl.outputs["Value"], vn_add.inputs[1])
 
+    # DXIL 8260:1 L377-379: `LayerWeight.Facing` = 1 - |N.V| (0 at center, 1 at grazing edge)!
+    # Map 0.0 (center) -> 1.0 glow, 0.72+ (grazing edge) -> 0.0 dark carbon cable!
     lw = ng.nodes.new("ShaderNodeLayerWeight")
-    lw.inputs["Blend"].default_value = 0.35
-    lw.location = (-240, -80)
+    lw.inputs["Blend"].default_value = 0.50
+    lw.location = (-520, -180)
 
-    fr_boost = ng.nodes.new("ShaderNodeMath")
-    fr_boost.operation = "MULTIPLY_ADD"
-    fr_boost.inputs[1].default_value = 0.65
-    fr_boost.inputs[2].default_value = 0.65
-    fr_boost.location = (-40, -80)
-    ng.links.new(lw.outputs["Facing"], fr_boost.inputs[0])
+    center_mr = ng.nodes.new("ShaderNodeMapRange")
+    center_mr.interpolation_type = "SMOOTHSTEP"
+    center_mr.clamp = True
+    center_mr.label = "DXIL Center-Facing Falloff (Dark Edges)"
+    center_mr.inputs["From Min"].default_value = 0.08
+    center_mr.inputs["From Max"].default_value = 0.74
+    center_mr.inputs["To Min"].default_value = 1.0
+    center_mr.inputs["To Max"].default_value = 0.0
+    center_mr.location = (-280, -180)
+    ng.links.new(lw.outputs["Facing"], center_mr.inputs["Value"])
+
+    center_pow = ng.nodes.new("ShaderNodeMath")
+    center_pow.operation = "POWER"
+    center_pow.inputs[1].default_value = 1.45
+    center_pow.location = (-80, -180)
+    ng.links.new(center_mr.outputs["Result"], center_pow.inputs[0])
 
     tot_m = ng.nodes.new("ShaderNodeMath")
     tot_m.operation = "MULTIPLY"
-    tot_m.location = (140, 60)
+    tot_m.use_clamp = True
+    tot_m.location = (100, 60)
     ng.links.new(vn_add.outputs["Value"], tot_m.inputs[0])
-    ng.links.new(fr_boost.outputs["Value"], tot_m.inputs[1])
+    ng.links.new(center_pow.outputs["Value"], tot_m.inputs[1])
 
     tot_str = ng.nodes.new("ShaderNodeMath")
     tot_str.operation = "MULTIPLY"
-    tot_str.location = (320, 40)
+    tot_str.location = (320, 60)
     ng.links.new(tot_m.outputs["Value"], tot_str.inputs[0])
     ng.links.new(n_in.outputs["Glow Strength"], tot_str.inputs[1])
 
+    # Dynamic 3-Tier Thermal Gradient: Deep Burnt Ember -> Vibrant Muscle Color -> Hot Bright Core!
     mix_c = ng.nodes.new("ShaderNodeMix")
     mix_c.data_type = "RGBA"
-    mix_c.location = (220, -200)
+    mix_c.location = (-80, -400)
     ng.links.new(n_in.outputs["Alert State"], mix_c.inputs["Factor"])
     ng.links.new(n_in.outputs["Glow Color"], mix_c.inputs[6])
     ng.links.new(n_in.outputs["Alert Color"], mix_c.inputs[7])
 
-    ng.links.new(mix_c.outputs[2], n_out.inputs["Emission Color"])
+    ember_gam = ng.nodes.new("ShaderNodeGamma")
+    ember_gam.inputs["Gamma"].default_value = 2.2
+    ember_gam.label = "Deep Ember Color"
+    ember_gam.location = (100, -320)
+    ng.links.new(mix_c.outputs[2], ember_gam.inputs["Color"])
+
+    ember_dim = ng.nodes.new("ShaderNodeVectorMath")
+    ember_dim.operation = "SCALE"
+    ember_dim.inputs["Scale"].default_value = 0.42
+    ember_dim.location = (260, -320)
+    ng.links.new(ember_gam.outputs["Color"], ember_dim.inputs[0])
+
+    hot_mix = ng.nodes.new("ShaderNodeMix")
+    hot_mix.data_type = "RGBA"
+    hot_mix.inputs["Factor"].default_value = 0.45
+    hot_mix.inputs[7].default_value = (1.0, 0.90, 0.72, 1.0)
+    hot_mix.label = "Hot Core Color"
+    hot_mix.location = (100, -520)
+    ng.links.new(mix_c.outputs[2], hot_mix.inputs[6])
+
+    t_low = ng.nodes.new("ShaderNodeMapRange")
+    t_low.interpolation_type = "SMOOTHSTEP"
+    t_low.clamp = True
+    t_low.inputs["From Min"].default_value = 0.04
+    t_low.inputs["From Max"].default_value = 0.48
+    t_low.location = (100, -140)
+    ng.links.new(tot_m.outputs["Value"], t_low.inputs["Value"])
+
+    t_hi = ng.nodes.new("ShaderNodeMapRange")
+    t_hi.interpolation_type = "SMOOTHSTEP"
+    t_hi.clamp = True
+    t_hi.inputs["From Min"].default_value = 0.56
+    t_hi.inputs["From Max"].default_value = 0.96
+    t_hi.location = (260, -140)
+    ng.links.new(tot_m.outputs["Value"], t_hi.inputs["Value"])
+
+    g_mid = ng.nodes.new("ShaderNodeMix")
+    g_mid.data_type = "RGBA"
+    g_mid.label = "Ember -> Muscle Color"
+    g_mid.location = (440, -280)
+    ng.links.new(t_low.outputs["Result"], g_mid.inputs["Factor"])
+    ng.links.new(ember_dim.outputs["Vector"], g_mid.inputs[6])
+    ng.links.new(mix_c.outputs[2], g_mid.inputs[7])
+
+    g_hot = ng.nodes.new("ShaderNodeMix")
+    g_hot.data_type = "RGBA"
+    g_hot.label = "Muscle Color -> Hot Core"
+    g_hot.location = (620, -280)
+    ng.links.new(t_hi.outputs["Result"], g_hot.inputs["Factor"])
+    ng.links.new(g_mid.outputs[2], g_hot.inputs[6])
+    ng.links.new(hot_mix.outputs[2], g_hot.inputs[7])
+
+    ng.links.new(g_hot.outputs[2], n_out.inputs["Emission Color"])
     ng.links.new(tot_str.outputs["Value"], n_out.inputs["Emission Strength"])
+    return ng
+
+
+def _ensure_machine_shader_control_group(defaults: dict[str, Any] | None = None) -> bpy.types.ShaderNodeTree:
+    """Create/update the unified `HFW_MachineShaderControl` shared controller node group.
+
+    Exposes intuitive, artist-friendly single-point controls synced with the Blender N-Panel across
+    ALL muscles, braided cables, optical eye sensors, elemental sacs, canisters, and plasma charge parts:
+      - Muscle Color / Muscle Glow Scale
+      - Eye Color / Eye Alert Color / Eye Alert State / Eye Glow Scale
+      - Liquid Override Color / Liquid Override Mix / Liquid Glow Scale
+      - Plasma Color / Plasma Charge
+      - Animation Speed
+    """
+    ng_name = "HFW_MachineShaderControl"
+    d = defaults or {}
+    mc = d.get("muscle_color", [0.95, 0.28, 0.02])
+    ec = d.get("eye_color", [0.04, 0.56, 1.0])
+    eac = d.get("eye_alert_color", [1.0, 0.08, 0.01])
+    pc = d.get("plasma_color", [0.46, 0.05, 1.0])
+    lc = d.get("liquid_override_color", [0.08, 0.62, 1.0])
+
+    existing = bpy.data.node_groups.get(ng_name)
+    if existing is not None:
+        if defaults:
+            # Update defaults when importing a fresh machine/variant
+            val_updates = {
+                "Muscle Glow Scale": 1.0,
+                "Eye Alert State": 0.0,
+                "Eye Glow Scale": 1.0,
+                "Liquid Override Mix": float(d.get("liquid_override_fac", 0.0)),
+                "Liquid Glow Scale": float(d.get("liquid_glow_scale", 1.0)),
+                "Plasma Charge": float(d.get("plasma_charge", 1.0 if d.get("is_plasma") else 0.0)),
+                "Animation Speed": float(d.get("animation_speed", 1.0)),
+            }
+            col_updates = {
+                "Muscle Color": (mc[0], mc[1], mc[2], 1.0),
+                "Eye Color": (ec[0], ec[1], ec[2], 1.0),
+                "Eye Alert Color": (eac[0], eac[1], eac[2], 1.0),
+                "Liquid Override Color": (lc[0], lc[1], lc[2], 1.0),
+                "Plasma Color": (pc[0], pc[1], pc[2], 1.0),
+            }
+            for n in existing.nodes:
+                if n.type == "VALUE" and n.label in val_updates:
+                    n.outputs[0].default_value = val_updates[n.label]
+                elif n.type == "RGB" and n.label in col_updates:
+                    n.outputs[0].default_value = col_updates[n.label]
+        return existing
+
+    ng = bpy.data.node_groups.new(ng_name, "ShaderNodeTree")
+    n_out = ng.nodes.new("NodeGroupOutput")
+    n_out.location = (320, 0)
+
+    specs: list[tuple[str, str, Any]] = [
+        ("Muscle Color", "NodeSocketColor", (mc[0], mc[1], mc[2], 1.0)),
+        ("Muscle Glow Scale", "NodeSocketFloat", 1.0),
+        ("Eye Color", "NodeSocketColor", (ec[0], ec[1], ec[2], 1.0)),
+        ("Eye Alert Color", "NodeSocketColor", (eac[0], eac[1], eac[2], 1.0)),
+        ("Eye Alert State", "NodeSocketFloat", 0.0),
+        ("Eye Glow Scale", "NodeSocketFloat", 1.0),
+        ("Liquid Override Color", "NodeSocketColor", (lc[0], lc[1], lc[2], 1.0)),
+        ("Liquid Override Mix", "NodeSocketFloat", float(d.get("liquid_override_fac", 0.0))),
+        ("Liquid Glow Scale", "NodeSocketFloat", float(d.get("liquid_glow_scale", 1.0))),
+        ("Plasma Color", "NodeSocketColor", (pc[0], pc[1], pc[2], 1.0)),
+        ("Plasma Charge", "NodeSocketFloat", float(d.get("plasma_charge", 1.0 if d.get("is_plasma") else 0.0))),
+        ("Animation Speed", "NodeSocketFloat", float(d.get("animation_speed", 1.0))),
+    ]
+
+    y = 480
+    for name, stype, default_val in specs:
+        ng.interface.new_socket(name=name, in_out="OUTPUT", socket_type=stype)
+        if stype == "NodeSocketColor":
+            node = ng.nodes.new("ShaderNodeRGB")
+            node.outputs[0].default_value = default_val
+        else:
+            node = ng.nodes.new("ShaderNodeValue")
+            node.outputs[0].default_value = default_val
+        node.label = name
+        node.location = (-220, y)
+        ng.links.new(node.outputs[0], n_out.inputs[name])
+        y -= 110
+
     return ng
 
 
@@ -1705,14 +1864,15 @@ def _ensure_muscle_fiber_group() -> bpy.types.ShaderNodeTree:
     n_out = ng.nodes.new("NodeGroupOutput")
     n_out.location = (980, 0)
 
-    # 1. Smooth BC7-noise-free Mask_Alpha modulation (eliminates harsh dark speckles inside muscle grooves!)
+    # 1. Exact DXIL L434 `saturate(Mask_Alpha * 40.0)` with subtle anti-blackout floor (0.28..1.0) so ALL
+    #    muscle bundles glow without turning grazing/cavity edges into a flat neon slab!
     ma_mr = ng.nodes.new("ShaderNodeMapRange")
     ma_mr.interpolation_type = "SMOOTHSTEP"
     ma_mr.clamp = True
-    ma_mr.label = "Smooth Cavity Mask (No BC7 Noise)"
-    ma_mr.inputs["From Min"].default_value = 0.004
-    ma_mr.inputs["From Max"].default_value = 0.09
-    ma_mr.inputs["To Min"].default_value = 0.16
+    ma_mr.label = "DXIL Mask_Alpha * 40"
+    ma_mr.inputs["From Min"].default_value = 0.0
+    ma_mr.inputs["From Max"].default_value = 0.025
+    ma_mr.inputs["To Min"].default_value = 0.28
     ma_mr.inputs["To Max"].default_value = 1.0
     ma_mr.location = (-820, 260)
     ng.links.new(n_in.outputs["Mask Alpha (UV0)"], ma_mr.inputs["Value"])
@@ -1753,38 +1913,46 @@ def _ensure_muscle_fiber_group() -> bpy.types.ShaderNodeTree:
     f_abs.location = (-80, -200)
     ng.links.new(f_sub.outputs["Value"], f_abs.inputs[0])
 
-    # Crisp thin optical fiber strands (`abs` is 0..0.5; smoothstep 0.18..0.46 -> 0.03..1.0 leaves dark synthetic cable visible!)
+    # Crisp distinct glowing optical filaments (`To Min = 0.0` so dark synthetic carbon cables show cleanly between strands!)
     f_x2 = ng.nodes.new("ShaderNodeMapRange")
     f_x2.interpolation_type = "SMOOTHSTEP"
     f_x2.clamp = True
     f_x2.label = "96-Strand Optical Filaments"
     f_x2.inputs["From Min"].default_value = 0.18
     f_x2.inputs["From Max"].default_value = 0.46
-    f_x2.inputs["To Min"].default_value = 0.03
+    f_x2.inputs["To Min"].default_value = 0.0
     f_x2.inputs["To Max"].default_value = 1.0
     f_x2.location = (100, -200)
     ng.links.new(f_abs.outputs["Value"], f_x2.inputs["Value"])
 
-    # 3. DXIL View-Facing Mask (`saturate(dot(N, V) * 2.5)` — softens grazing muscle curves!)
+    # 3. Exact DXIL `19501:0` L312-313 + L444 View-Facing Falloff (`dot(N, V)^2`!):
+    #    Curved muscle bundle silhouettes fade cleanly to dark black metallic cables while camera-facing centers glow!
     lw = ng.nodes.new("ShaderNodeLayerWeight")
-    lw.inputs["Blend"].default_value = 0.45
+    lw.inputs["Blend"].default_value = 0.50
     lw.location = (-560, 40)
 
     face_mr = ng.nodes.new("ShaderNodeMapRange")
     face_mr.interpolation_type = "SMOOTHSTEP"
     face_mr.clamp = True
-    face_mr.label = "View-Facing Softening"
-    face_mr.inputs["From Min"].default_value = 0.0
-    face_mr.inputs["From Max"].default_value = 0.92
+    face_mr.label = "DXIL View-Facing Falloff (Dark Rims)"
+    face_mr.inputs["From Min"].default_value = 0.06
+    face_mr.inputs["From Max"].default_value = 0.78
     face_mr.inputs["To Min"].default_value = 1.0
-    face_mr.inputs["To Max"].default_value = 0.15
-    face_mr.location = (-320, 40)
+    face_mr.inputs["To Max"].default_value = 0.03
+    face_mr.location = (-360, 40)
     ng.links.new(lw.outputs["Facing"], face_mr.inputs["Value"])
 
-    # 4. Combine smooth cavity * energy wave * optical strands * view-facing * Glow Strength
+    face_pow = ng.nodes.new("ShaderNodeMath")
+    face_pow.operation = "POWER"
+    face_pow.inputs[1].default_value = 1.75
+    face_pow.label = "DXIL N.V Gradient Curve"
+    face_pow.location = (-160, 40)
+    ng.links.new(face_mr.outputs["Result"], face_pow.inputs[0])
+
+    # 4. Combine cavity * energy wave * optical strands * view-facing -> `heat` (0..1) * Glow Strength
     m1 = ng.nodes.new("ShaderNodeMath")
     m1.operation = "MULTIPLY"
-    m1.location = (-100, 180)
+    m1.location = (-100, 200)
     ng.links.new(ma_mr.outputs["Result"], m1.inputs[0])
     ng.links.new(n_in.outputs["Energy Wave (5147)"], m1.inputs[1])
 
@@ -1796,39 +1964,92 @@ def _ensure_muscle_fiber_group() -> bpy.types.ShaderNodeTree:
 
     m3 = ng.nodes.new("ShaderNodeMath")
     m3.operation = "MULTIPLY"
+    m3.use_clamp = True
     m3.location = (260, 120)
     ng.links.new(m2.outputs["Value"], m3.inputs[0])
-    ng.links.new(face_mr.outputs["Result"], m3.inputs[1])
+    ng.links.new(face_pow.outputs["Value"], m3.inputs[1])
 
     tot_str = ng.nodes.new("ShaderNodeMath")
     tot_str.operation = "MULTIPLY"
-    tot_str.location = (420, 120)
+    tot_str.location = (440, 120)
     ng.links.new(m3.outputs["Value"], tot_str.inputs[0])
     ng.links.new(n_in.outputs["Glow Strength"], tot_str.inputs[1])
 
-    # 5. Color state blend: Calm Amber -> Plasma Violet -> Alert Red
+    # 5. Color state blend + Dynamic 3-Tier In-Game Gradient (Deep Dark Ember -> Muscle Color -> Hot Bright Core!)
     mix_cp = ng.nodes.new("ShaderNodeMix")
     mix_cp.data_type = "RGBA"
-    mix_cp.location = (-40, 380)
+    mix_cp.location = (-120, 460)
     ng.links.new(n_in.outputs["Charge State"], mix_cp.inputs["Factor"])
     ng.links.new(n_in.outputs["Calm Color"], mix_cp.inputs[6])
     ng.links.new(n_in.outputs["Plasma Color"], mix_cp.inputs[7])
 
     mix_al = ng.nodes.new("ShaderNodeMix")
     mix_al.data_type = "RGBA"
-    mix_al.location = (200, 380)
+    mix_al.location = (60, 460)
     ng.links.new(n_in.outputs["Alert State"], mix_al.inputs["Factor"])
     ng.links.new(mix_cp.outputs[2], mix_al.inputs[6])
     ng.links.new(n_in.outputs["Alert Color"], mix_al.inputs[7])
 
-    # 6. Pure additive optical glow + Cycles/Eevee Shadow-Ray & Backface Bypass (ZERO Cycles z-fight/shadow/bounce glitches!)
+    ember_gam = ng.nodes.new("ShaderNodeGamma")
+    ember_gam.inputs["Gamma"].default_value = 2.2
+    ember_gam.label = "Deep Ember Rim"
+    ember_gam.location = (240, 560)
+    ng.links.new(mix_al.outputs[2], ember_gam.inputs["Color"])
+
+    ember_dim = ng.nodes.new("ShaderNodeVectorMath")
+    ember_dim.operation = "SCALE"
+    ember_dim.inputs["Scale"].default_value = 0.38
+    ember_dim.location = (400, 560)
+    ng.links.new(ember_gam.outputs["Color"], ember_dim.inputs[0])
+
+    hot_mix = ng.nodes.new("ShaderNodeMix")
+    hot_mix.data_type = "RGBA"
+    hot_mix.inputs["Factor"].default_value = 0.48
+    hot_mix.inputs[7].default_value = (1.0, 0.90, 0.72, 1.0)
+    hot_mix.label = "Hot Spark Core"
+    hot_mix.location = (240, 340)
+    ng.links.new(mix_al.outputs[2], hot_mix.inputs[6])
+
+    t_low = ng.nodes.new("ShaderNodeMapRange")
+    t_low.interpolation_type = "SMOOTHSTEP"
+    t_low.clamp = True
+    t_low.inputs["From Min"].default_value = 0.03
+    t_low.inputs["From Max"].default_value = 0.42
+    t_low.location = (240, 220)
+    ng.links.new(m3.outputs["Value"], t_low.inputs["Value"])
+
+    t_hi = ng.nodes.new("ShaderNodeMapRange")
+    t_hi.interpolation_type = "SMOOTHSTEP"
+    t_hi.clamp = True
+    t_hi.inputs["From Min"].default_value = 0.52
+    t_hi.inputs["From Max"].default_value = 0.94
+    t_hi.location = (400, 220)
+    ng.links.new(m3.outputs["Value"], t_hi.inputs["Value"])
+
+    g_mid = ng.nodes.new("ShaderNodeMix")
+    g_mid.data_type = "RGBA"
+    g_mid.label = "Ember -> Muscle Color"
+    g_mid.location = (560, 440)
+    ng.links.new(t_low.outputs["Result"], g_mid.inputs["Factor"])
+    ng.links.new(ember_dim.outputs["Vector"], g_mid.inputs[6])
+    ng.links.new(mix_al.outputs[2], g_mid.inputs[7])
+
+    g_hot = ng.nodes.new("ShaderNodeMix")
+    g_hot.data_type = "RGBA"
+    g_hot.label = "Muscle Color -> Hot Core"
+    g_hot.location = (720, 440)
+    ng.links.new(t_hi.outputs["Result"], g_hot.inputs["Factor"])
+    ng.links.new(g_mid.outputs[2], g_hot.inputs[6])
+    ng.links.new(hot_mix.outputs[2], g_hot.inputs[7])
+
+    # 6. Pure additive optical glow + Cycles/Eevee Shadow-Ray Bypass (ZERO Cycles z-fight/shadow/bounce glitches!)
     tr_bsdf = ng.nodes.new("ShaderNodeBsdfTransparent")
     tr_bsdf.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-    tr_bsdf.location = (420, -100)
+    tr_bsdf.location = (440, -100)
 
     em_bsdf = ng.nodes.new("ShaderNodeEmission")
-    em_bsdf.location = (420, 260)
-    ng.links.new(mix_al.outputs[2], em_bsdf.inputs["Color"])
+    em_bsdf.location = (440, 260)
+    ng.links.new(g_hot.outputs[2], em_bsdf.inputs["Color"])
     ng.links.new(tot_str.outputs["Value"], em_bsdf.inputs["Strength"])
 
     add_sh = ng.nodes.new("ShaderNodeAddShader")
@@ -1837,21 +2058,13 @@ def _ensure_muscle_fiber_group() -> bpy.types.ShaderNodeTree:
     ng.links.new(em_bsdf.outputs["Emission"], add_sh.inputs[1])
 
     lp = ng.nodes.new("ShaderNodeLightPath")
-    lp.location = (220, -340)
-    geo = ng.nodes.new("ShaderNodeNewGeometry")
-    geo.location = (220, -520)
+    lp.location = (380, -340)
 
-    bypass = ng.nodes.new("ShaderNodeMath")
-    bypass.operation = "MAXIMUM"
-    bypass.label = "Skip Shadow & Backface Rays"
-    bypass.location = (460, -380)
-    ng.links.new(lp.outputs["Is Shadow Ray"], bypass.inputs[0])
-    ng.links.new(geo.outputs["Backfacing"], bypass.inputs[1])
-
+    # Bypass ONLY Shadow Rays (NOT Backfacing!) so mirrored/inner-cavity muscle fibers NEVER go invisible!
     mix_safe = ng.nodes.new("ShaderNodeMixShader")
     mix_safe.label = "Cycles/Eevee Safe Additive Overlay"
     mix_safe.location = (800, 20)
-    ng.links.new(bypass.outputs["Value"], mix_safe.inputs["Fac"])
+    ng.links.new(lp.outputs["Is Shadow Ray"], mix_safe.inputs["Fac"])
     ng.links.new(add_sh.outputs["Shader"], mix_safe.inputs[1])
     ng.links.new(tr_bsdf.outputs["BSDF"], mix_safe.inputs[2])
     ng.links.new(mix_safe.outputs["Shader"], n_out.inputs["Shader"])
@@ -1915,11 +2128,26 @@ def _build_special_material(
         mc_grp.node_tree = _ensure_muscle_cables_group()
         mc_grp.label = "HFW Braided Muscle Glow (8260:1)"
         mc_grp.location = (20, 220)
-        gc = spec.get("glow_color", [0.0, 0.231, 1.0])
+        gc = spec.get("glow_color", [0.95, 0.28, 0.02])
         ac = spec.get("alert_color", [0.95, 0.08, 0.02])
         mc_grp.inputs["Glow Color"].default_value = (gc[0], gc[1], gc[2], 1.0)
         mc_grp.inputs["Alert Color"].default_value = (ac[0], ac[1], ac[2], 1.0)
-        mc_grp.inputs["Glow Strength"].default_value = float(spec.get("glow_strength", 6.0))
+        base_str = float(spec.get("glow_strength", 6.0))
+        mc_grp.inputs["Glow Strength"].default_value = base_str
+
+        # Link to unified HFW_MachineShaderControl so Muscle Color & Glow Scale update ALL muscles in unison!
+        mctrl = nt.nodes.new("ShaderNodeGroup")
+        mctrl.node_tree = _ensure_machine_shader_control_group()
+        mctrl.label = "HFW Machine Shader Control"
+        mctrl.location = (-360, 560)
+        nt.links.new(mctrl.outputs["Muscle Color"], mc_grp.inputs["Glow Color"])
+        nt.links.new(mctrl.outputs["Eye Alert Color"], mc_grp.inputs["Alert Color"])
+        str_mul = nt.nodes.new("ShaderNodeMath")
+        str_mul.operation = "MULTIPLY"
+        str_mul.inputs[0].default_value = base_str
+        str_mul.location = (-120, 420)
+        nt.links.new(mctrl.outputs["Muscle Glow Scale"], str_mul.inputs[1])
+        nt.links.new(str_mul.outputs["Value"], mc_grp.inputs["Glow Strength"])
 
         # 4019:1 (braided interlocking muscle normal R,G + crevice glow B) at UV * (6, 2)
         braid_img = _load_image(tex_dir, spec.get("braid_file", ""), "Non-Color", img_cache)
@@ -1947,15 +2175,20 @@ def _build_special_material(
             nt.links.new(nrm_rec.outputs["Normal RGB"], nrm_map.inputs["Color"])
             nt.links.new(nrm_map.outputs["Normal"], bsdf.inputs["Normal"])
 
-        # 5645:0 (scrolling spark/pulse streaks) at UV * (6, 3) + animated (0, Time * 0.65)!
+        # 5645:0 (scrolling spark/pulse streaks) at UV * (6, 3) + animated (0, Time * AnimSpeed * 0.65)!
         pulse_img = _load_image(tex_dir, spec.get("pulse_file", ""), "Non-Color", img_cache)
         if pulse_img is not None:
-            t_drv = _add_time_driver_node(nt, (-1540, -140), "HFW Muscle Pulse Time")
+            t_drv = _add_time_driver_node(nt, (-1720, -140), "HFW Muscle Pulse Time")
+            t_spd = nt.nodes.new("ShaderNodeMath")
+            t_spd.operation = "MULTIPLY"
+            t_spd.location = (-1540, -140)
+            nt.links.new(t_drv.outputs[0], t_spd.inputs[0])
+            nt.links.new(mctrl.outputs["Animation Speed"], t_spd.inputs[1])
             t_scr = nt.nodes.new("ShaderNodeMath")
             t_scr.operation = "MULTIPLY"
             t_scr.inputs[1].default_value = -0.65
             t_scr.location = (-1340, -140)
-            nt.links.new(t_drv.outputs[0], t_scr.inputs[0])
+            nt.links.new(t_spd.outputs["Value"], t_scr.inputs[0])
 
             comb_off = nt.nodes.new("ShaderNodeCombineXYZ")
             comb_off.location = (-1180, -160)
@@ -2002,7 +2235,7 @@ def _build_special_material(
         mf_grp.label = "HFW Glowing Muscle Fibers (19501:0)"
         mf_grp.location = (220, 0)
 
-        cc = spec.get("calm_color", [0.95, 0.24, 0.02])
+        cc = spec.get("calm_color", [0.95, 0.28, 0.02])
         pc = spec.get("plasma_color", [0.46, 0.05, 1.0])
         ac = spec.get("alert_color", [1.0, 0.04, 0.01])
         mf_grp.inputs["Calm Color"].default_value = (cc[0], cc[1], cc[2], 1.0)
@@ -2010,16 +2243,32 @@ def _build_special_material(
         mf_grp.inputs["Alert Color"].default_value = (ac[0], ac[1], ac[2], 1.0)
         c_state = float(spec.get("charge_state", 0.0))
         mf_grp.inputs["Charge State"].default_value = c_state
+        base_str = float(spec.get("glow_strength", 4.5))
+        mf_grp.inputs["Glow Strength"].default_value = base_str
+        mf_grp.inputs["Alert State"].default_value = float(spec.get("alert_state", 0.0))
+        mf_grp.inputs["Fiber Density"].default_value = float(spec.get("fiber_density", 96.0))
+
+        # Link to unified HFW_MachineShaderControl for 1-click Muscle Color, Glow Scale & Animation Speed!
+        mctrl = nt.nodes.new("ShaderNodeGroup")
+        mctrl.node_tree = _ensure_machine_shader_control_group()
+        mctrl.label = "HFW Machine Shader Control"
+        mctrl.location = (-360, 560)
+        nt.links.new(mctrl.outputs["Muscle Color"], mf_grp.inputs["Calm Color"])
+        nt.links.new(mctrl.outputs["Plasma Color"], mf_grp.inputs["Plasma Color"])
+        nt.links.new(mctrl.outputs["Eye Alert Color"], mf_grp.inputs["Alert Color"])
+        str_mul = nt.nodes.new("ShaderNodeMath")
+        str_mul.operation = "MULTIPLY"
+        str_mul.inputs[0].default_value = base_str
+        str_mul.location = (-60, 340)
+        nt.links.new(mctrl.outputs["Muscle Glow Scale"], str_mul.inputs[1])
+        nt.links.new(str_mul.outputs["Value"], mf_grp.inputs["Glow Strength"])
         if c_state >= 0.5:
-            # Link Slaughterspine's optical muscle fibers to the shared single-slider `HFW_PlasmaChargeControl`!
+            # Link Slaughterspine's optical muscle fibers to `HFW_PlasmaChargeControl`!
             pctrl = nt.nodes.new("ShaderNodeGroup")
             pctrl.node_tree = _ensure_plasma_charge_control_group()
             pctrl.label = "Slaughterspine Plasma Charge"
-            pctrl.location = (-120, 420)
+            pctrl.location = (-120, 480)
             nt.links.new(pctrl.outputs["Plasma Charge"], mf_grp.inputs["Charge State"])
-        mf_grp.inputs["Alert State"].default_value = float(spec.get("alert_state", 0.0))
-        mf_grp.inputs["Glow Strength"].default_value = float(spec.get("glow_strength", 3.4))
-        mf_grp.inputs["Fiber Density"].default_value = float(spec.get("fiber_density", 96.0))
 
         # Bind UV0 to existing NMT_AO_MSKA texture node(s) so Mask_Alpha uses UV0!
         if "Mask_Alpha" in sockets:
@@ -2031,15 +2280,20 @@ def _build_special_material(
                     nt.links.new(uv0_n.outputs["UV"], node.inputs["Vector"])
             nt.links.new(sockets["Mask_Alpha"], mf_grp.inputs["Mask Alpha (UV0)"])
 
-        # Sample 5147:0 energy wave ramp on UV1 * (6, 12) + animated (0, Time * 0.50) (DXIL L236-251, L290, L318)
+        # Sample 5147:0 energy wave ramp on UV1 * (6, 12) + animated (0, Time * AnimSpeed * 0.50) (DXIL L236-251, L290, L318)
         ramp_img = _load_image(tex_dir, spec.get("ramp_file", ""), "Non-Color", img_cache)
         if ramp_img is not None:
-            t_drv = _add_time_driver_node(nt, (-1520, -340), "HFW Fiber Wave Time")
+            t_drv = _add_time_driver_node(nt, (-1720, -340), "HFW Fiber Wave Time")
+            t_spd = nt.nodes.new("ShaderNodeMath")
+            t_spd.operation = "MULTIPLY"
+            t_spd.location = (-1520, -340)
+            nt.links.new(t_drv.outputs[0], t_spd.inputs[0])
+            nt.links.new(mctrl.outputs["Animation Speed"], t_spd.inputs[1])
             t_scr = nt.nodes.new("ShaderNodeMath")
             t_scr.operation = "MULTIPLY"
             t_scr.inputs[1].default_value = -0.50
             t_scr.location = (-1320, -340)
-            nt.links.new(t_drv.outputs[0], t_scr.inputs[0])
+            nt.links.new(t_spd.outputs["Value"], t_scr.inputs[0])
 
             comb_off = nt.nodes.new("ShaderNodeCombineXYZ")
             comb_off.location = (-1140, -340)
@@ -2065,21 +2319,28 @@ def _build_special_material(
             sep_r.location = (-360, -180)
             nt.links.new(t_rmp.outputs["Color"], sep_r.inputs["Color"])
 
-            # Combine Blue + Alpha energy wave bands (DXIL L291 + L319 -> L338)
+            # Exact DXIL L323-338: combine subtle traveling wave (`0.38 * B`) + crisp bright spark pulses (`A`)
+            # mapped across authentic dark-to-bright dynamic range (`0.08..1.0`, NOT solid 0.55 floor!)
+            b_scl = nt.nodes.new("ShaderNodeMath")
+            b_scl.operation = "MULTIPLY"
+            b_scl.inputs[1].default_value = 0.42
+            b_scl.location = (-260, -100)
+            nt.links.new(sep_r.outputs["Blue"], b_scl.inputs[0])
+
             wave_add = nt.nodes.new("ShaderNodeMath")
             wave_add.operation = "ADD"
             wave_add.use_clamp = True
-            wave_add.location = (-140, -160)
-            nt.links.new(sep_r.outputs["Blue"], wave_add.inputs[0])
+            wave_add.location = (-100, -160)
+            nt.links.new(b_scl.outputs["Value"], wave_add.inputs[0])
             nt.links.new(t_rmp.outputs["Alpha"], wave_add.inputs[1])
 
             wave_map = nt.nodes.new("ShaderNodeMapRange")
             wave_map.clamp = True
             wave_map.inputs["From Min"].default_value = 0.0
             wave_map.inputs["From Max"].default_value = 1.0
-            wave_map.inputs["To Min"].default_value = 0.35
+            wave_map.inputs["To Min"].default_value = 0.12
             wave_map.inputs["To Max"].default_value = 1.0
-            wave_map.location = (20, -160)
+            wave_map.location = (60, -160)
             nt.links.new(wave_add.outputs["Value"], wave_map.inputs["Value"])
             nt.links.new(wave_map.outputs["Result"], mf_grp.inputs["Energy Wave (5147)"])
 
@@ -2185,22 +2446,35 @@ def _build_special_material(
         return True
 
     if kind == "machine_eye_glow":
-        # Class F: Inner glowing machine eye optical sensor (4628:0) with animated scan pulse!
+        # Class F: Inner glowing machine eye optical sensor (4628:0) synced to HFW_MachineShaderControl!
         bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
         bsdf.location = (360, 0)
         bsdf.inputs["Base Color"].default_value = (0.01, 0.02, 0.04, 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.05
-        t_drv = _add_time_driver_node(nt, (-560, -140), "HFW Eye Pulse Time")
+        bsdf.inputs["Roughness"].default_value = 0.04
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 1.0
+            bsdf.inputs["Coat Roughness"].default_value = 0.02
+        t_drv = _add_time_driver_node(nt, (-680, -140), "HFW Eye Pulse Time")
+        mctrl = nt.nodes.new("ShaderNodeGroup")
+        mctrl.node_tree = _ensure_machine_shader_control_group()
+        mctrl.label = "HFW Machine Shader Control"
+        mctrl.location = (-680, 260)
         el_grp = nt.nodes.new("ShaderNodeGroup")
         el_grp.node_tree = _ensure_eye_lens_group(None)
         el_grp.label = "HFW Machine Eye Glow (4628:0)"
-        el_grp.location = (-120, -80)
-        gc = spec.get("glow_color", [0.04, 0.52, 1.0])
-        ac = spec.get("alert_color", [1.0, 0.12, 0.02])
-        el_grp.inputs["Calm Color"].default_value = (gc[0], gc[1], gc[2], 1.0)
-        el_grp.inputs["Alert Color"].default_value = (ac[0], ac[1], ac[2], 1.0)
-        el_grp.inputs["Glow Strength"].default_value = float(spec.get("glow_strength", 9.0))
+        el_grp.location = (-80, -40)
+        base_eye_str = float(spec.get("glow_strength", 9.0))
         nt.links.new(t_drv.outputs[0], el_grp.inputs["Time"])
+        nt.links.new(mctrl.outputs["Eye Color"], el_grp.inputs["Calm Color"])
+        nt.links.new(mctrl.outputs["Eye Alert Color"], el_grp.inputs["Alert Color"])
+        nt.links.new(mctrl.outputs["Eye Alert State"], el_grp.inputs["Alert State"])
+        nt.links.new(mctrl.outputs["Animation Speed"], el_grp.inputs["Animate Speed"])
+        es_mul = nt.nodes.new("ShaderNodeMath")
+        es_mul.operation = "MULTIPLY"
+        es_mul.inputs[0].default_value = base_eye_str
+        es_mul.location = (-320, -40)
+        nt.links.new(mctrl.outputs["Eye Glow Scale"], es_mul.inputs[1])
+        nt.links.new(es_mul.outputs["Value"], el_grp.inputs["Glow Strength"])
         if "Emission Color" in bsdf.inputs:
             nt.links.new(el_grp.outputs["Emission Color"], bsdf.inputs["Emission Color"])
         if "Emission Strength" in bsdf.inputs:
@@ -2209,59 +2483,110 @@ def _build_special_material(
         return True
 
     if kind == "canister_glow_core":
-        # Class G: Elemental canister glowing liquid core (21080:1) with scrolling 107:0 fluid noise & pulse!
+        # Class G: Elemental canister glowing pressurized liquid core (21080:1) with wet glossy depth,
+        # Fresnel subsurface edge darkening, dual-scrolling 107:0 fluid noise & HFW_MachineShaderControl!
         bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
-        bsdf.location = (380, 0)
+        bsdf.location = (440, 0)
         gc = spec.get("glow_color", [0.05, 0.48, 1.0])
-        bsdf.inputs["Base Color"].default_value = (gc[0] * 0.25, gc[1] * 0.25, gc[2] * 0.25, 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.12
+        bsdf.inputs["Roughness"].default_value = 0.08
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 0.90
+            bsdf.inputs["Coat Roughness"].default_value = 0.04
+        if "Subsurface Weight" in bsdf.inputs:
+            bsdf.inputs["Subsurface Weight"].default_value = 0.40
 
-        t_drv = _add_time_driver_node(nt, (-980, -140), "HFW Canister Core Time")
+        mctrl = nt.nodes.new("ShaderNodeGroup")
+        mctrl.node_tree = _ensure_machine_shader_control_group()
+        mctrl.label = "HFW Machine Shader Control"
+        mctrl.location = (-1080, 480)
+
+        # Native elemental color (with optional global Liquid Override mix!)
+        liq_col = nt.nodes.new("ShaderNodeMix")
+        liq_col.data_type = "RGBA"
+        liq_col.label = "Native Liquid <-> Override"
+        liq_col.inputs[6].default_value = (gc[0], gc[1], gc[2], 1.0)
+        liq_col.location = (-440, 440)
+        nt.links.new(mctrl.outputs["Liquid Override Mix"], liq_col.inputs["Factor"])
+        nt.links.new(mctrl.outputs["Liquid Override Color"], liq_col.inputs[7])
+
+        # Fresnel liquid depth rim (deeper saturated rim -> luminous glowing fluid core!)
+        rim_hsv = nt.nodes.new("ShaderNodeHueSaturation")
+        rim_hsv.inputs["Hue"].default_value = 0.52
+        rim_hsv.inputs["Saturation"].default_value = 1.25
+        rim_hsv.inputs["Value"].default_value = 0.40
+        rim_hsv.location = (-200, 320)
+        nt.links.new(liq_col.outputs[2], rim_hsv.inputs["Color"])
+
+        lw = nt.nodes.new("ShaderNodeLayerWeight")
+        lw.inputs["Blend"].default_value = 0.40
+        lw.location = (-200, 560)
+
+        mix_depth = nt.nodes.new("ShaderNodeMix")
+        mix_depth.data_type = "RGBA"
+        mix_depth.label = "Liquid Core <-> Rim Depth"
+        mix_depth.location = (60, 420)
+        nt.links.new(lw.outputs["Facing"], mix_depth.inputs["Factor"])
+        nt.links.new(liq_col.outputs[2], mix_depth.inputs[6])
+        nt.links.new(rim_hsv.outputs["Color"], mix_depth.inputs[7])
+
+        bc_dark = nt.nodes.new("ShaderNodeHueSaturation")
+        bc_dark.inputs["Value"].default_value = 0.30
+        bc_dark.location = (180, 220)
+        nt.links.new(liq_col.outputs[2], bc_dark.inputs["Color"])
+        nt.links.new(bc_dark.outputs["Color"], bsdf.inputs["Base Color"])
+
+        t_drv = _add_time_driver_node(nt, (-1260, -140), "HFW Canister Core Time")
+        t_spd = nt.nodes.new("ShaderNodeMath")
+        t_spd.operation = "MULTIPLY"
+        t_spd.location = (-1040, -140)
+        nt.links.new(t_drv.outputs[0], t_spd.inputs[0])
+        nt.links.new(mctrl.outputs["Animation Speed"], t_spd.inputs[1])
+
         t_f = nt.nodes.new("ShaderNodeMath")
         t_f.operation = "MULTIPLY"
-        t_f.inputs[1].default_value = 3.5
-        t_f.location = (-740, -140)
-        nt.links.new(t_drv.outputs[0], t_f.inputs[0])
+        t_f.inputs[1].default_value = 3.2
+        t_f.location = (-820, -140)
+        nt.links.new(t_spd.outputs["Value"], t_f.inputs[0])
 
         s_p = nt.nodes.new("ShaderNodeMath")
         s_p.operation = "SINE"
-        s_p.location = (-560, -140)
+        s_p.location = (-620, -140)
         nt.links.new(t_f.outputs["Value"], s_p.inputs[0])
 
         pulse = nt.nodes.new("ShaderNodeMath")
         pulse.operation = "MULTIPLY_ADD"
-        pulse.inputs[1].default_value = 0.22
-        pulse.inputs[2].default_value = 0.80
-        pulse.location = (-360, -140)
+        pulse.inputs[1].default_value = 0.18
+        pulse.inputs[2].default_value = 0.85
+        pulse.location = (-420, -140)
         nt.links.new(s_p.outputs["Value"], pulse.inputs[0])
 
         noise_img = _load_image(tex_dir, spec.get("noise_file", ""), "Non-Color", img_cache)
         if noise_img is not None:
             tc_n = nt.nodes.new("ShaderNodeTexCoord")
-            tc_n.location = (-980, 180)
+            tc_n.location = (-1060, 120)
             t_scr = nt.nodes.new("ShaderNodeMath")
             t_scr.operation = "MULTIPLY"
             t_scr.inputs[1].default_value = 0.30
-            t_scr.location = (-740, 80)
-            nt.links.new(t_drv.outputs[0], t_scr.inputs[0])
+            t_scr.location = (-820, 40)
+            nt.links.new(t_spd.outputs["Value"], t_scr.inputs[0])
             c_off = nt.nodes.new("ShaderNodeCombineXYZ")
-            c_off.location = (-560, 80)
+            c_off.location = (-620, 40)
             nt.links.new(t_scr.outputs["Value"], c_off.inputs["Y"])
             mp_n = nt.nodes.new("ShaderNodeMapping")
-            mp_n.inputs["Scale"].default_value = (2.0, 2.0, 1.0)
-            mp_n.location = (-380, 180)
+            mp_n.inputs["Scale"].default_value = (2.2, 2.2, 1.0)
+            mp_n.location = (-440, 120)
             nt.links.new(tc_n.outputs["UV"], mp_n.inputs["Vector"])
             nt.links.new(c_off.outputs["Vector"], mp_n.inputs["Location"])
             t_n = nt.nodes.new("ShaderNodeTexImage")
             t_n.image = noise_img
-            t_n.label = "HFW Canister Core Noise (107:0)"
-            t_n.location = (-160, 180)
+            t_n.label = "HFW Canister Core Fluid Noise (107:0)"
+            t_n.location = (-200, 120)
             nt.links.new(mp_n.outputs["Vector"], t_n.inputs["Vector"])
             n_mod = nt.nodes.new("ShaderNodeMath")
             n_mod.operation = "MULTIPLY_ADD"
-            n_mod.inputs[1].default_value = 0.65
-            n_mod.inputs[2].default_value = 0.55
-            n_mod.location = (80, 140)
+            n_mod.inputs[1].default_value = 0.72
+            n_mod.inputs[2].default_value = 0.52
+            n_mod.location = (60, 80)
             nt.links.new(t_n.outputs["Color"], n_mod.inputs[0])
             comb_m = nt.nodes.new("ShaderNodeMath")
             comb_m.operation = "MULTIPLY"
@@ -2272,31 +2597,69 @@ def _build_special_material(
         else:
             em_base = pulse.outputs["Value"]
 
+        em_str0 = nt.nodes.new("ShaderNodeMath")
+        em_str0.operation = "MULTIPLY"
+        em_str0.inputs[1].default_value = float(spec.get("glow_strength", 6.8))
+        em_str0.location = (140, -220)
+        nt.links.new(em_base, em_str0.inputs[0])
+
         em_str = nt.nodes.new("ShaderNodeMath")
         em_str.operation = "MULTIPLY"
-        em_str.inputs[1].default_value = float(spec.get("glow_strength", 6.5))
-        em_str.location = (240, -180)
-        nt.links.new(em_base, em_str.inputs[0])
+        em_str.location = (280, -220)
+        nt.links.new(em_str0.outputs["Value"], em_str.inputs[0])
+        nt.links.new(mctrl.outputs["Liquid Glow Scale"], em_str.inputs[1])
 
         if "Emission Color" in bsdf.inputs:
-            bsdf.inputs["Emission Color"].default_value = (gc[0], gc[1], gc[2], 1.0)
+            nt.links.new(mix_depth.outputs[2], bsdf.inputs["Emission Color"])
         if "Emission Strength" in bsdf.inputs:
             nt.links.new(em_str.outputs["Value"], bsdf.inputs["Emission Strength"])
         nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
         return True
 
     if kind == "canister_glass":
-        # Class E: Translucent canister outer glass shell (41249:0)
+        # Class E: Physical Fresnel Glass Canister Shell (41249:0) with Cycles/Eevee Shadow-Ray Bypass!
+        # Center stays crystal-clear so inner glowing liquid shines vibrantly, while curved edges catch glossy glass rims!
         _configure_blended_material(mat)
         bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
-        bsdf.location = (360, 0)
+        bsdf.location = (180, 120)
         tc = spec.get("tint_color", [0.80, 0.92, 0.91])
         bsdf.inputs["Base Color"].default_value = (tc[0], tc[1], tc[2], 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.08
-        bsdf.inputs["Alpha"].default_value = float(spec.get("alpha", 0.25))
+        bsdf.inputs["Roughness"].default_value = 0.05
+        if "IOR" in bsdf.inputs:
+            bsdf.inputs["IOR"].default_value = float(spec.get("ior", 1.45))
         if "Transmission Weight" in bsdf.inputs:
-            bsdf.inputs["Transmission Weight"].default_value = 0.85
-        nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+            bsdf.inputs["Transmission Weight"].default_value = 0.90
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 1.0
+            bsdf.inputs["Coat Roughness"].default_value = 0.03
+
+        lw = nt.nodes.new("ShaderNodeLayerWeight")
+        lw.inputs["Blend"].default_value = 0.30
+        lw.location = (-360, 40)
+        al_mr = nt.nodes.new("ShaderNodeMapRange")
+        al_mr.clamp = True
+        al_mr.label = "Fresnel Glass Rim Alpha"
+        al_mr.inputs["From Min"].default_value = 0.0
+        al_mr.inputs["From Max"].default_value = 1.0
+        al_mr.inputs["To Min"].default_value = 0.14
+        al_mr.inputs["To Max"].default_value = 0.68
+        al_mr.location = (-120, 40)
+        nt.links.new(lw.outputs["Fresnel"], al_mr.inputs["Value"])
+        nt.links.new(al_mr.outputs["Result"], bsdf.inputs["Alpha"])
+
+        # Shadow-Ray transparent bypass so Cycles never casts dark opaque shadows onto inner liquid core!
+        tr_bsdf = nt.nodes.new("ShaderNodeBsdfTransparent")
+        tr_bsdf.inputs["Color"].default_value = (0.95, 0.98, 1.0, 1.0)
+        tr_bsdf.location = (180, -240)
+        lp = nt.nodes.new("ShaderNodeLightPath")
+        lp.location = (180, -400)
+        mix_sh = nt.nodes.new("ShaderNodeMixShader")
+        mix_sh.label = "Glass Shadow Bypass"
+        mix_sh.location = (480, 0)
+        nt.links.new(lp.outputs["Is Shadow Ray"], mix_sh.inputs["Fac"])
+        nt.links.new(bsdf.outputs["BSDF"], mix_sh.inputs[1])
+        nt.links.new(tr_bsdf.outputs["BSDF"], mix_sh.inputs[2])
+        nt.links.new(mix_sh.outputs["Shader"], out_node.inputs["Surface"])
         return True
 
     if kind == "vfx_overlay_shell":
@@ -2319,6 +2682,637 @@ def _build_special_material(
         return True
 
     return False
+
+
+def _ensure_character_control_group(controls: dict[str, Any] | None = None) -> bpy.types.ShaderNodeTree:
+    """Create/update shared `HFW_CharacterControl` node group driving Head + Body skin tone & Hair color seamlessly."""
+    ng_name = "HFW_CharacterControl"
+    c = controls or {}
+    st = c.get("skin_tone_linear") or [0.453, 0.246, 0.209]
+    hc = c.get("hair_color_linear") or [0.045, 0.032, 0.025]
+
+    existing = bpy.data.node_groups.get(ng_name)
+    if existing is not None:
+        if controls:
+            for n in existing.nodes:
+                if n.label == "Skin Tone" and n.type == "RGB" and c.get("skin_tone_linear"):
+                    n.outputs[0].default_value = (float(st[0]), float(st[1]), float(st[2]), 1.0)
+                elif n.label == "Hair Color" and n.type == "RGB" and c.get("hair_color_linear"):
+                    n.outputs[0].default_value = (float(hc[0]), float(hc[1]), float(hc[2]), 1.0)
+        return existing
+
+    ng = bpy.data.node_groups.new(ng_name, "ShaderNodeTree")
+    ng.interface.new_socket(name="Skin Tone", in_out="OUTPUT", socket_type="NodeSocketColor")
+    ng.interface.new_socket(name="Skin Brightness", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    ng.interface.new_socket(name="Subsurface Weight", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    ng.interface.new_socket(name="Hair Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+
+    n_out = ng.nodes.new("NodeGroupOutput")
+    n_out.location = (220, 0)
+
+    rgb = ng.nodes.new("ShaderNodeRGB")
+    rgb.label = "Skin Tone"
+    rgb.outputs[0].default_value = (float(st[0]), float(st[1]), float(st[2]), 1.0)
+    rgb.location = (-200, 140)
+    ng.links.new(rgb.outputs[0], n_out.inputs["Skin Tone"])
+
+    br = ng.nodes.new("ShaderNodeValue")
+    br.label = "Skin Brightness"
+    br.outputs[0].default_value = 1.0
+    br.location = (-200, -20)
+    ng.links.new(br.outputs[0], n_out.inputs["Skin Brightness"])
+
+    sss = ng.nodes.new("ShaderNodeValue")
+    sss.label = "Subsurface Weight"
+    sss.outputs[0].default_value = 0.14
+    sss.location = (-200, -140)
+    ng.links.new(sss.outputs[0], n_out.inputs["Subsurface Weight"])
+
+    hrgb = ng.nodes.new("ShaderNodeRGB")
+    hrgb.label = "Hair Color"
+    hrgb.outputs[0].default_value = (float(hc[0]), float(hc[1]), float(hc[2]), 1.0)
+    hrgb.location = (-200, -300)
+    ng.links.new(hrgb.outputs[0], n_out.inputs["Hair Color"])
+
+    return ng
+
+
+def _build_layered_outfit_material(
+    mat: bpy.types.Material,
+    layered: dict[str, Any],
+    tex_dir: Path,
+    img_cache: dict[str, bpy.types.Image],
+) -> bool:
+    """Build Guerrilla's exact DXIL 8-Layer Character Outfit Shader OR Building Block Tileable Shader.
+
+    DXIL-verified exact 8-corner `MSK.RGB` mapping (`75185:637` L1809..1874 & `74:0` LUT):
+      0: Black   (0,0,0)    4: Cyan    (0,1,1)
+      1: Red     (1,0,0)    5: Magenta (1,0,1)
+      2: Green   (0,1,0)    6: Yellow  (1,1,0)
+      3: Blue    (0,0,1)    7: White   (1,1,1)
+
+    In `outfit_dxil` / `outfit_fallback` mode:
+      - `Shaders_HRZ2/Materials/*_Base_CLR` maps are `0.5`-centered **Linear** micro-detail maps (`Non-Color`),
+        combined with Guerrilla's exact DXIL formula `pow(2.0 * DetailTex, 2.2) * DyeColor_linear` so `0.50`
+        neutral texels reproduce the exact authored dye color without darkening!
+    In `building_block` mode:
+      - `textures/building_block_tileables/*` maps are direct full-color `sRGB` concrete/wood/metal/moss maps
+        blended directly by `MSK.RGB` at 4x tiling!
+    """
+    layers = layered.get("layers") or []
+    if not layers:
+        return False
+
+    mode = str(layered.get("mode", "outfit_dxil"))
+    is_bb = mode == "building_block"
+
+    nt = mat.node_tree
+    nt.nodes.clear()
+    mat["hfw_shader_kind"] = "building_block_layered" if is_bb else "character_outfit_layered"
+
+    out_node = nt.nodes.new("ShaderNodeOutputMaterial")
+    out_node.location = (1060, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (680, 0)
+    nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+
+    # UV tiling (16x on Character Outfits per DXIL L294-295; 4x on Building Block Tileables!)
+    uv_scale = float(layered.get("uv_scale", 4.0 if is_bb else 16.0))
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    tc.location = (-1860, 260)
+    uv_tile = nt.nodes.new("ShaderNodeVectorMath")
+    uv_tile.operation = "SCALE"
+    uv_tile.inputs["Scale"].default_value = uv_scale
+    uv_tile.label = f"HFW Micro-Tile ({uv_scale:.0f}x)"
+    uv_tile.location = (-1620, 260)
+    nt.links.new(tc.outputs["UV"], uv_tile.inputs[0])
+
+    tribe_hint = str(layered.get("tribe_hint", "")).lower()
+
+    def _layer_fallback_tint_linear(lname: str, lcat: str, l_idx: int) -> tuple[float, float, float]:
+        nl = f"{lcat}/{lname}".lower()
+        if "bronze" in nl or "brass" in nl or "gold" in nl:
+            srgb = (0.76, 0.56, 0.28)
+        elif "copper" in nl:
+            srgb = (0.78, 0.44, 0.28)
+        elif "robotplate" in nl or "iron" in nl or "metal" in nl or "steel" in nl or "anodized" in nl:
+            srgb = (0.58, 0.60, 0.62)
+        elif "carbon" in nl or "rubber" in nl:
+            srgb = (0.14, 0.15, 0.17)
+        elif "fullgrain" in nl:
+            srgb = (0.33, 0.27, 0.20)
+        elif "finegrain" in nl or "nubuck" in nl:
+            srgb = (0.45, 0.34, 0.24)
+        elif "buckskin" in nl or "suede" in nl:
+            srgb = (0.58, 0.44, 0.28)
+        elif "leather" in nl:
+            srgb = (0.38, 0.24, 0.18)
+        elif "wood" in nl or "bark" in nl or "bone" in nl:
+            srgb = (0.50, 0.38, 0.26)
+        elif "shell" in nl or "nacre" in nl or "pearl" in nl:
+            srgb = (0.74, 0.72, 0.70)
+        elif "carja" in tribe_hint:
+            srgb = (0.78, 0.60, 0.10) if l_idx % 2 == 0 else (0.55, 0.30, 0.22)
+        elif "quen" in tribe_hint or "seyka" in tribe_hint:
+            srgb = (0.62, 0.72, 0.78) if l_idx % 2 == 0 else (0.86, 0.62, 0.50)
+        elif "tenakth" in tribe_hint:
+            srgb = (0.20, 0.42, 0.52) if l_idx % 2 == 0 else (0.58, 0.22, 0.16)
+        elif "utaru" in tribe_hint:
+            srgb = (0.36, 0.48, 0.32) if l_idx % 2 == 0 else (0.66, 0.60, 0.46)
+        elif "oseram" in tribe_hint or "erend" in tribe_hint:
+            srgb = (0.58, 0.30, 0.16) if l_idx % 2 == 0 else (0.36, 0.24, 0.18)
+        else:
+            srgb = (0.22, 0.40, 0.57) if l_idx % 2 == 1 else (0.58, 0.54, 0.48)
+        return (srgb[0] ** 2.2, srgb[1] ** 2.2, srgb[2] ** 2.2)
+
+    # Build all 8 corner slots (0=Black, 1=Red, 2=Green, 3=Blue, 4=Cyan, 5=Magenta, 6=Yellow, 7=White)
+    # Cache per-file micro-normal/smoothness nodes so shared sub-materials (e.g. Metal_Robotplate on 4 corners)
+    # are sampled once instead of duplicating TextureImage nodes!
+    layer_cols: list[Any] = []
+    layer_micro_tex: list[Any] = []  # Neutral-0.5 expanded micro-detail (used when hybrid macro_color_file is present!)
+    layer_rghs: list[Any] = []
+    layer_mets: list[Any] = []
+    layer_dnx: list[Any] = []
+    layer_dny: list[Any] = []
+    nrm_node_cache: dict[str, tuple[Any, Any, Any]] = {}  # filename -> (sep_dn.R, sep_dn.G, sep_dn.B)
+    rfl_node_cache: dict[str, Any] = {}
+
+    def _get_submat_nrm_rgh(nfile: str, y_slot: float) -> tuple[Any, Any, Any] | None:
+        if not nfile:
+            return None
+        if nfile in nrm_node_cache:
+            return nrm_node_cache[nfile]
+        dn_img = _load_image(tex_dir, nfile, "Non-Color", img_cache)
+        if dn_img is None:
+            return None
+        t_dn = nt.nodes.new("ShaderNodeTexImage")
+        t_dn.image = dn_img
+        t_dn.label = f"Micro NMT/GLS ({Path(nfile).stem[:22]})"
+        t_dn.location = (-1380, -2100 - len(nrm_node_cache) * 260)
+        nt.links.new(uv_tile.outputs["Vector"], t_dn.inputs["Vector"])
+        sep_dn = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_dn.location = (-1100, -2100 - len(nrm_node_cache) * 260)
+        nt.links.new(t_dn.outputs["Color"], sep_dn.inputs["Color"])
+        res = (sep_dn.outputs["Red"], sep_dn.outputs["Green"], sep_dn.outputs["Blue"])
+        nrm_node_cache[nfile] = res
+        return res
+
+    for idx, lay in enumerate(layers[:8]):
+        cname = lay.get("name", f"Layer{idx}")
+        ccat = lay.get("category", "")
+        c_tag = lay.get("corner_name", f"L{idx}")
+        clow = f"{ccat}/{cname}".lower()
+
+        if is_bb:
+            # Building block tileables ALREADY hold authentic full-color sRGB concrete/wood/moss albedo!
+            c_img = _load_image(tex_dir, lay.get("color_file", ""), "sRGB", img_cache)
+            if c_img is not None:
+                tn = nt.nodes.new("ShaderNodeTexImage")
+                tn.image = c_img
+                tn.label = f"{c_tag} {cname} Albedo"
+                tn.location = (-1320, 680 - idx * 280)
+                nt.links.new(uv_tile.outputs["Vector"], tn.inputs["Vector"])
+                layer_cols.append(tn.outputs["Color"])
+                layer_micro_tex.append(tn.outputs["Color"])
+            else:
+                tint_n = nt.nodes.new("ShaderNodeRGB")
+                tint_n.label = f"{c_tag} {cname} Color"
+                tint_n.outputs[0].default_value = (0.22, 0.21, 0.19, 1.0)
+                tint_n.location = (-1320, 680 - idx * 280)
+                layer_cols.append(tint_n.outputs[0])
+                layer_micro_tex.append(tint_n.outputs[0])
+            is_met = bool(lay.get("is_metallic", False))
+            layer_mets.append(0.75 if is_met else 0.0)
+            layer_rghs.append(0.42 if is_met else 0.78)
+            layer_dnx.append(0.5)
+            layer_dny.append(0.5)
+        else:
+            # Character Outfit: exact DXIL authored linear RGB Dye Color * pow(2.0 * LinearDetailTex, 2.2)!
+            dye_lin = lay.get("dye_color_linear")
+            if dye_lin and len(dye_lin) >= 3:
+                tint_rgb = (float(dye_lin[0]), float(dye_lin[1]), float(dye_lin[2]))
+            else:
+                tint_rgb = _layer_fallback_tint_linear(cname, ccat, idx)
+
+            tint_n = nt.nodes.new("ShaderNodeRGB")
+            tint_n.label = f"{c_tag} ({cname}) Dye"
+            tint_n.outputs[0].default_value = (tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0)
+            tint_n.location = (-1380, 760 - idx * 300)
+
+            # CRITICAL: `Shaders_HRZ2/Materials/*_CLR` has `ETexColorSpace = Linear` (`mean = 0.502`) -> load as `Non-Color`!
+            c_img = _load_image(tex_dir, lay.get("color_file", ""), "Non-Color", img_cache)
+            if c_img is not None:
+                tn = nt.nodes.new("ShaderNodeTexImage")
+                tn.image = c_img
+                tn.label = f"{c_tag} {cname} Micro-Detail"
+                tn.location = (-1380, 600 - idx * 300)
+                nt.links.new(uv_tile.outputs["Vector"], tn.inputs["Vector"])
+
+                # Exact DXIL neutral-0.5 micro-detail expansion: pow(2.0 * tex, 2.2) so tex=0.5 -> 1.0!
+                sc2 = nt.nodes.new("ShaderNodeVectorMath")
+                sc2.operation = "SCALE"
+                sc2.inputs["Scale"].default_value = 2.0
+                sc2.location = (-1120, 600 - idx * 300)
+                nt.links.new(tn.outputs["Color"], sc2.inputs[0])
+
+                gam = nt.nodes.new("ShaderNodeGamma")
+                gam.inputs["Gamma"].default_value = 2.2
+                gam.location = (-940, 600 - idx * 300)
+                nt.links.new(sc2.outputs["Vector"], gam.inputs["Color"])
+
+                # Fold micro-AO (`*_CLR_AO.A`) subtly (0.72..1.00) into detail variation for crisp weave/grain depth!
+                mao_mr = nt.nodes.new("ShaderNodeMapRange")
+                mao_mr.clamp = True
+                mao_mr.inputs["From Min"].default_value = 0.0
+                mao_mr.inputs["From Max"].default_value = 1.0
+                mao_mr.inputs["To Min"].default_value = 0.72
+                mao_mr.inputs["To Max"].default_value = 1.0
+                mao_mr.location = (-1120, 480 - idx * 300)
+                nt.links.new(tn.outputs["Alpha"], mao_mr.inputs["Value"])
+
+                det_ao = nt.nodes.new("ShaderNodeVectorMath")
+                det_ao.operation = "SCALE"
+                det_ao.location = (-860, 560 - idx * 300)
+                nt.links.new(gam.outputs["Color"], det_ao.inputs[0])
+                nt.links.new(mao_mr.outputs["Result"], det_ao.inputs["Scale"])
+                layer_micro_tex.append(det_ao.outputs["Vector"])
+
+                tmul = nt.nodes.new("ShaderNodeMix")
+                tmul.data_type = "RGBA"
+                tmul.blend_type = "MULTIPLY"
+                tmul.clamp_result = True
+                tmul.inputs["Factor"].default_value = 1.0
+                tmul.label = f"{c_tag} Final Color"
+                tmul.location = (-720, 660 - idx * 300)
+                nt.links.new(tint_n.outputs[0], tmul.inputs[6])
+                nt.links.new(det_ao.outputs["Vector"], tmul.inputs[7])
+                layer_cols.append(tmul.outputs[2])
+            else:
+                layer_cols.append(tint_n.outputs[0])
+                white_n = nt.nodes.new("ShaderNodeRGB")
+                white_n.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+                white_n.location = (-940, 600 - idx * 300)
+                layer_micro_tex.append(white_n.outputs[0])
+
+            is_met = bool(lay.get("is_metallic", False))
+            layer_mets.append(0.90 if is_met else 0.0)
+
+            # Per-corner 16x Micro-Normal (R, G) AND Per-Pixel Micro-Roughness from `*_NMT_RGH_HGT.B` (Decima GLS)!
+            dn_socks = _get_submat_nrm_rgh(lay.get("normal_file", ""), -2100 - idx * 240)
+            if dn_socks is not None:
+                dn_x, dn_y, dn_gls = dn_socks
+                layer_dnx.append(dn_x)
+                layer_dny.append(dn_y)
+
+                # Convert per-pixel Decima Smoothness (`GLS` in `NMT_RGH_HGT.B`) into physically calibrated PBR Roughness!
+                # Verified pixel stats: Metal_Robotplate GLS=0.86..0.91, Leather_FullGrain GLS=0.21..0.38,
+                # Carbon_Fiber GLS=0.47..0.52, Wool GLS=0.16..0.22, Silk GLS=0.00..0.02!
+                r_mr = nt.nodes.new("ShaderNodeMapRange")
+                r_mr.clamp = True
+                r_mr.label = f"{c_tag} {cname} Roughness"
+                if is_met:
+                    r_mr.inputs["From Min"].default_value = 0.0
+                    r_mr.inputs["From Max"].default_value = 1.0
+                    r_mr.inputs["To Min"].default_value = 0.44
+                    r_mr.inputs["To Max"].default_value = 0.16
+                elif any(k in clow for k in ("shell", "pearl", "bead", "turquoise", "lacquer", "glass", "ceramic")):
+                    r_mr.inputs["From Min"].default_value = 0.0
+                    r_mr.inputs["From Max"].default_value = 1.0
+                    r_mr.inputs["To Min"].default_value = 0.46
+                    r_mr.inputs["To Max"].default_value = 0.18
+                elif any(k in clow for k in ("fullgrain", "finegrain", "fish", "leather")) and "buckskin" not in clow and "suede" not in clow:
+                    r_mr.inputs["From Min"].default_value = 0.12
+                    r_mr.inputs["From Max"].default_value = 0.55
+                    r_mr.inputs["To Min"].default_value = 0.68
+                    r_mr.inputs["To Max"].default_value = 0.34
+                elif any(k in clow for k in ("carbon", "pvc", "rubber", "plastic", "synthetic")):
+                    r_mr.inputs["From Min"].default_value = 0.20
+                    r_mr.inputs["From Max"].default_value = 0.75
+                    r_mr.inputs["To Min"].default_value = 0.64
+                    r_mr.inputs["To Max"].default_value = 0.32
+                elif any(k in clow for k in ("silk", "satin", "buckskin", "suede", "bone", "wood")):
+                    r_mr.inputs["From Min"].default_value = 0.0
+                    r_mr.inputs["From Max"].default_value = 0.50
+                    r_mr.inputs["To Min"].default_value = 0.68
+                    r_mr.inputs["To Max"].default_value = 0.42
+                else:  # wool, cotton, crochet, linen, tassels, rope
+                    r_mr.inputs["From Min"].default_value = 0.0
+                    r_mr.inputs["From Max"].default_value = 0.50
+                    r_mr.inputs["To Min"].default_value = 0.88
+                    r_mr.inputs["To Max"].default_value = 0.66
+                r_mr.location = (-860, -2100 - idx * 140)
+                nt.links.new(dn_gls, r_mr.inputs["Value"])
+                layer_rghs.append(r_mr.outputs["Result"])
+            else:
+                layer_dnx.append(0.5)
+                layer_dny.append(0.5)
+                base_rgh = float(lay.get("roughness", 0.30 if is_met else 0.58))
+                if is_met:
+                    eff_rgh = min(0.36, max(0.18, base_rgh * 0.60))
+                elif any(k in clow for k in ("shell", "pearl", "bead", "turquoise", "lacquer")):
+                    eff_rgh = 0.28
+                elif any(k in clow for k in ("wool", "cotton", "linen", "rope", "tassel")):
+                    eff_rgh = 0.82
+                elif "silk" in clow:
+                    eff_rgh = 0.52
+                elif "leather" in clow and "buckskin" not in clow:
+                    eff_rgh = 0.48
+                else:
+                    eff_rgh = max(0.46, min(0.76, base_rgh))
+                layer_rghs.append(eff_rgh)
+
+    # Pad to 8 corners if fewer than 8 layers were supplied (fallback / building blocks)
+    while len(layer_cols) < 8:
+        src_i = len(layer_cols) % max(1, len(layers))
+        layer_cols.append(layer_cols[src_i])
+        layer_micro_tex.append(layer_micro_tex[src_i])
+        layer_mets.append(layer_mets[src_i])
+        layer_rghs.append(layer_rghs[src_i])
+        layer_dnx.append(layer_dnx[src_i])
+        layer_dny.append(layer_dny[src_i])
+
+    msk_img = _load_image(tex_dir, layered.get("mask_file", ""), "Non-Color", img_cache)
+    t_msk = None
+    if msk_img is not None and len(layers) > 1:
+        t_msk = nt.nodes.new("ShaderNodeTexImage")
+        t_msk.image = msk_img
+        t_msk.label = "HFW 8-Layer MSK (RGB)"
+        t_msk.location = (-1380, -1720)
+        sep_m = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_m.label = "Unpack MSK (R, G, B)"
+        sep_m.location = (-1100, -1720)
+        nt.links.new(t_msk.outputs["Color"], sep_m.inputs["Color"])
+
+        # Sharpen R, G, B cleanly around 0.5 (matching DXIL `fcmp ogt 0.5`) so BC-compressed seams never rainbow-bleed!
+        if not is_bb:
+            def _sharpen_bit(sock, lbl: str, y: float):
+                mr = nt.nodes.new("ShaderNodeMapRange")
+                mr.clamp = True
+                mr.label = f"Sharpen {lbl}"
+                mr.inputs["From Min"].default_value = 0.42
+                mr.inputs["From Max"].default_value = 0.58
+                mr.inputs["To Min"].default_value = 0.0
+                mr.inputs["To Max"].default_value = 1.0
+                mr.location = (-880, y)
+                nt.links.new(sock, mr.inputs["Value"])
+                return mr.outputs["Result"]
+            r_bit = _sharpen_bit(sep_m.outputs["Red"], "MSK.R", -1540)
+            g_bit = _sharpen_bit(sep_m.outputs["Green"], "MSK.G", -1720)
+            b_bit = _sharpen_bit(sep_m.outputs["Blue"], "MSK.B", -1900)
+        else:
+            r_bit = sep_m.outputs["Red"]
+            g_bit = sep_m.outputs["Green"]
+            b_bit = sep_m.outputs["Blue"]
+
+        # Exact DXIL RGB cube corner indexing:
+        #   B=0 plane: (0,0,0)=L0 Black, (1,0,0)=L1 Red,  (0,1,0)=L2 Green, (1,1,0)=L6 Yellow!!
+        #   B=1 plane: (0,0,1)=L3 Blue,  (1,0,1)=L5 Mag,  (0,1,1)=L4 Cyan,  (1,1,1)=L7 White!!
+        def _trilinear_rgba(vals: list[Any], x0: float, y0: float):
+            def _mx(a, b, fac, x, y):
+                m = nt.nodes.new("ShaderNodeMix")
+                m.data_type = "RGBA"
+                m.location = (x, y)
+                nt.links.new(fac, m.inputs["Factor"])
+                nt.links.new(a, m.inputs[6])
+                nt.links.new(b, m.inputs[7])
+                return m.outputs[2]
+            c_g0_b0 = _mx(vals[0], vals[1], r_bit, x0, y0 + 240)  # Black -> Red
+            c_g1_b0 = _mx(vals[2], vals[6], r_bit, x0, y0 + 80)   # Green -> Yellow (L6!)
+            c_g0_b1 = _mx(vals[3], vals[5], r_bit, x0, y0 - 80)   # Blue (L3!) -> Magenta (L5)
+            c_g1_b1 = _mx(vals[4], vals[7], r_bit, x0, y0 - 240)  # Cyan (L4!) -> White (L7)
+            c_b0 = _mx(c_g0_b0, c_g1_b0, g_bit, x0 + 200, y0 + 140)
+            c_b1 = _mx(c_g0_b1, c_g1_b1, g_bit, x0 + 200, y0 - 140)
+            return _mx(c_b0, c_b1, b_bit, x0 + 400, y0)
+
+        def _trilinear_float(vals: list[float], x0: float, y0: float):
+            def _mxf(a, b, fac, x, y):
+                m = nt.nodes.new("ShaderNodeMix")
+                m.data_type = "FLOAT"
+                m.location = (x, y)
+                nt.links.new(fac, m.inputs["Factor"])
+                if isinstance(a, (int, float)):
+                    m.inputs[2].default_value = float(a)
+                else:
+                    nt.links.new(a, m.inputs[2])
+                if isinstance(b, (int, float)):
+                    m.inputs[3].default_value = float(b)
+                else:
+                    nt.links.new(b, m.inputs[3])
+                return m.outputs[0]
+            f_g0_b0 = _mxf(vals[0], vals[1], r_bit, x0, y0 + 180)
+            f_g1_b0 = _mxf(vals[2], vals[6], r_bit, x0, y0 + 60)
+            f_g0_b1 = _mxf(vals[3], vals[5], r_bit, x0, y0 - 60)
+            f_g1_b1 = _mxf(vals[4], vals[7], r_bit, x0, y0 - 180)
+            f_b0 = _mxf(f_g0_b0, f_g1_b0, g_bit, x0 + 180, y0 + 100)
+            f_b1 = _mxf(f_g0_b1, f_g1_b1, g_bit, x0 + 180, y0 - 100)
+            return _mxf(f_b0, f_b1, b_bit, x0 + 360, y0)
+
+        col_sock = _trilinear_rgba(layer_cols, -500, 320)
+        met_sock = _trilinear_float(layer_mets, -500, -340)
+        rgh_sock = _trilinear_float(layer_rghs, -500, -820)
+        micro_nx_sock = _trilinear_float(layer_dnx, -500, -1960) if (not is_bb and nrm_node_cache) else None
+        micro_ny_sock = _trilinear_float(layer_dny, -500, -2420) if (not is_bb and nrm_node_cache) else None
+
+        # Hybrid outfits (e.g. SeykaTorso_NMT painted coral-to-slate scarf + 8-layer crochet cotton / leather / metal):
+        # - `multiply2`: macro `_CLR` has neutral 0.50 linear background (sRGB ~188) -> `clamp(2.0 * macro * dye_detail)`
+        #   preserving dark fish leather / aqua wool / steel clasps while painting the coral scarf gradient on top!
+        # - `replace`: macro `_CLR` is a direct painted albedo trim sheet (`SeykaTrimsUV2_NMT`) -> `macro * micro_detail`!
+        macro_clr_file = layered.get("macro_color_file", "")
+        macro_clr_mode = layered.get("macro_color_mode", "replace")
+        if (not is_bb) and macro_clr_file:
+            mc_img = _load_image(tex_dir, macro_clr_file, "sRGB", img_cache)
+            if mc_img is not None:
+                t_mc = nt.nodes.new("ShaderNodeTexImage")
+                t_mc.image = mc_img
+                t_mc.label = "HFW Painted Macro Albedo"
+                t_mc.location = (-440, 740)
+                if macro_clr_mode == "multiply2":
+                    mc_x2 = nt.nodes.new("ShaderNodeVectorMath")
+                    mc_x2.operation = "SCALE"
+                    mc_x2.inputs["Scale"].default_value = 2.0
+                    mc_x2.label = "Macro Overlay * 2 (0.5 -> 1.0)"
+                    mc_x2.location = (-160, 740)
+                    nt.links.new(t_mc.outputs["Color"], mc_x2.inputs[0])
+                    mc_mul = nt.nodes.new("ShaderNodeMix")
+                    mc_mul.data_type = "RGBA"
+                    mc_mul.blend_type = "MULTIPLY"
+                    mc_mul.clamp_result = True
+                    mc_mul.inputs["Factor"].default_value = 1.0
+                    mc_mul.label = "DXIL 8-Corner Dye * (2x Macro Overlay)"
+                    mc_mul.location = (80, 620)
+                    nt.links.new(col_sock, mc_mul.inputs[6])
+                    nt.links.new(mc_x2.outputs["Vector"], mc_mul.inputs[7])
+                    col_sock = mc_mul.outputs[2]
+                else:
+                    micro_det_sock = _trilinear_rgba(layer_micro_tex, -500, 820)
+                    mc_mul = nt.nodes.new("ShaderNodeMix")
+                    mc_mul.data_type = "RGBA"
+                    mc_mul.blend_type = "MULTIPLY"
+                    mc_mul.clamp_result = True
+                    mc_mul.inputs["Factor"].default_value = 1.0
+                    mc_mul.label = "Macro Painted Albedo * 16x Micro-Detail"
+                    mc_mul.location = (80, 620)
+                    nt.links.new(t_mc.outputs["Color"], mc_mul.inputs[6])
+                    nt.links.new(micro_det_sock, mc_mul.inputs[7])
+                    col_sock = mc_mul.outputs[2]
+
+        nt.links.new(met_sock, bsdf.inputs["Metallic"])
+
+        # Add subtle MISC.G dirt roughness variation (clean worn edges stay sleek while dusty seams roughen!)
+        misc_img = _load_image(tex_dir, layered.get("misc_file", ""), "Non-Color", img_cache) if not is_bb else None
+        if misc_img is not None:
+            t_misc = nt.nodes.new("ShaderNodeTexImage")
+            t_misc.image = misc_img
+            t_misc.label = "HFW 2K MISC (Wear/Dirt/Fuzz)"
+            t_misc.location = (-440, -1180)
+            sep_ms = nt.nodes.new("ShaderNodeSeparateColor")
+            sep_ms.location = (-160, -1180)
+            nt.links.new(t_misc.outputs["Color"], sep_ms.inputs["Color"])
+            dirt_r = nt.nodes.new("ShaderNodeMath")
+            dirt_r.operation = "MULTIPLY_ADD"
+            dirt_r.inputs[1].default_value = 0.16
+            dirt_r.use_clamp = True
+            dirt_r.label = "Roughness + Dirt Contrast"
+            dirt_r.location = (120, -960)
+            nt.links.new(sep_ms.outputs["Green"], dirt_r.inputs[0])
+            nt.links.new(rgh_sock, dirt_r.inputs[2])
+            rgh_sock = dirt_r.outputs["Value"]
+
+        # Subtle cloth velvet/fiber Sheen on non-metallic areas (`(1 - Metallic) * 0.25`)
+        if (not is_bb) and "Sheen Weight" in bsdf.inputs:
+            inv_met = nt.nodes.new("ShaderNodeMath")
+            inv_met.operation = "MULTIPLY_ADD"
+            inv_met.inputs[1].default_value = -0.26
+            inv_met.inputs[2].default_value = 0.26
+            inv_met.use_clamp = True
+            inv_met.label = "Non-Metal Cloth Sheen"
+            inv_met.location = (260, -340)
+            nt.links.new(met_sock, inv_met.inputs[0])
+            nt.links.new(inv_met.outputs["Value"], bsdf.inputs["Sheen Weight"])
+            if "Sheen Roughness" in bsdf.inputs:
+                bsdf.inputs["Sheen Roughness"].default_value = 0.55
+
+        # On building blocks whose MSK Alpha packs Smoothness (Roughness.R), use `1 - Smoothness`!
+        if is_bb and layered.get("mask_has_roughness"):
+            inv_sm = nt.nodes.new("ShaderNodeMath")
+            inv_sm.operation = "SUBTRACT"
+            inv_sm.use_clamp = True
+            inv_sm.inputs[0].default_value = 1.0
+            inv_sm.label = "1 - Smoothness -> Roughness"
+            inv_sm.location = (220, -640)
+            nt.links.new(t_msk.outputs["Alpha"], inv_sm.inputs[1])
+            nt.links.new(inv_sm.outputs["Value"], bsdf.inputs["Roughness"])
+        else:
+            nt.links.new(rgh_sock, bsdf.inputs["Roughness"])
+
+        # Wire Alpha cutout ONLY when this outfit's own unique MSK texture carries an explicit Alpha lane (e.g. TrimsAlpha!)
+        if layered.get("mask_has_alpha"):
+            _configure_blended_material(mat)
+            if hasattr(mat, "blend_method"):
+                try:
+                    mat.blend_method = "HASHED"
+                except Exception:
+                    pass
+            nt.links.new(t_msk.outputs["Alpha"], bsdf.inputs["Alpha"])
+    else:
+        col_sock = layer_cols[0]
+        micro_nx_sock = layer_dnx[0] if (not is_bb and nrm_node_cache and not isinstance(layer_dnx[0], (int, float))) else None
+        micro_ny_sock = layer_dny[0] if (not is_bb and nrm_node_cache and not isinstance(layer_dny[0], (int, float))) else None
+        if isinstance(layer_mets[0], (int, float)):
+            bsdf.inputs["Metallic"].default_value = layer_mets[0]
+        else:
+            nt.links.new(layer_mets[0], bsdf.inputs["Metallic"])
+        if isinstance(layer_rghs[0], (int, float)):
+            bsdf.inputs["Roughness"].default_value = layer_rghs[0]
+        else:
+            nt.links.new(layer_rghs[0], bsdf.inputs["Roughness"])
+
+    # Unique 2K Sculpted Normal + Baked AO + Baked Curvature (`NMT_AO_CRV`: R=NrmX, G=NrmY, B=AO, A=Curvature)
+    nrm_img = _load_image(tex_dir, layered.get("normal_file", ""), "Non-Color", img_cache)
+    if nrm_img is not None:
+        t_nrm = nt.nodes.new("ShaderNodeTexImage")
+        t_nrm.image = nrm_img
+        t_nrm.label = "HFW 2K Sculpted Normal/AO/CRV"
+        t_nrm.location = (-560, -1480)
+        if is_bb and not layered.get("mask_file"):
+            nt.links.new(uv_tile.outputs["Vector"], t_nrm.inputs["Vector"])
+        sep_n = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_n.location = (-280, -1480)
+        nt.links.new(t_nrm.outputs["Color"], sep_n.inputs["Color"])
+
+        nx_in = sep_n.outputs["Red"]
+        ny_in = sep_n.outputs["Green"]
+
+        # Blend per-corner 16x micro-detail normal XY cleanly onto 2K macro normal XY (tangent-space additive UDN!)
+        if micro_nx_sock is not None and micro_ny_sock is not None:
+            def _udn_add(macro_s, micro_s, lbl: str, y: float):
+                off = nt.nodes.new("ShaderNodeMath")
+                off.operation = "MULTIPLY_ADD"
+                off.inputs[1].default_value = 0.85
+                off.inputs[2].default_value = -0.425
+                off.location = (-80, y)
+                nt.links.new(micro_s, off.inputs[0])
+                sm = nt.nodes.new("ShaderNodeMath")
+                sm.operation = "ADD"
+                sm.use_clamp = True
+                sm.label = lbl
+                sm.location = (80, y)
+                nt.links.new(macro_s, sm.inputs[0])
+                nt.links.new(off.outputs["Value"], sm.inputs[1])
+                return sm.outputs["Value"]
+            nx_in = _udn_add(nx_in, micro_nx_sock, "Macro+Micro NrmX", -1420)
+            ny_in = _udn_add(ny_in, micro_ny_sock, "Macro+Micro NrmY", -1620)
+
+        nrm_rec = nt.nodes.new("ShaderNodeGroup")
+        nrm_rec.node_tree = _ensure_normal_reconstruct_z_group()
+        nrm_rec.inputs["Flip Green"].default_value = 0.0
+        nrm_rec.location = (240, -1480)
+        nt.links.new(nx_in, nrm_rec.inputs["Normal X"])
+        nt.links.new(ny_in, nrm_rec.inputs["Normal Y"])
+
+        nrm_map = nt.nodes.new("ShaderNodeNormalMap")
+        nrm_map.location = (440, -1480)
+        nt.links.new(nrm_rec.outputs["Normal RGB"], nrm_map.inputs["Color"])
+        nt.links.new(nrm_map.outputs["Normal"], bsdf.inputs["Normal"])
+
+        npack = layered.get("normal_packing") or {}
+        # Apply 2K Baked Curvature (`NMT_AO_CRV.A`, centered at 0.50!) for crisp convex edge highlights & fold depth!
+        if any(v.startswith("Curvature") for v in npack.values()):
+            crv_mr = nt.nodes.new("ShaderNodeMapRange")
+            crv_mr.clamp = True
+            crv_mr.label = "2K Curvature Edge Contrast"
+            crv_mr.inputs["From Min"].default_value = 0.25
+            crv_mr.inputs["From Max"].default_value = 0.75
+            crv_mr.inputs["To Min"].default_value = 0.78
+            crv_mr.inputs["To Max"].default_value = 1.24
+            crv_mr.location = (120, 120)
+            nt.links.new(t_nrm.outputs["Alpha"], crv_mr.inputs["Value"])
+
+            crv_sc = nt.nodes.new("ShaderNodeVectorMath")
+            crv_sc.operation = "SCALE"
+            crv_sc.label = "Apply 2K Curvature"
+            crv_sc.location = (280, 180)
+            nt.links.new(col_sock, crv_sc.inputs[0])
+            nt.links.new(crv_mr.outputs["Result"], crv_sc.inputs["Scale"])
+            col_sock = crv_sc.outputs["Vector"]
+
+        # Multiply baked 2K AO (Blue lane when packed as NMT_AO_CRV) into blended Base Color!
+        if any(v.startswith("AO") for v in npack.values()):
+            ao_mul = nt.nodes.new("ShaderNodeMix")
+            ao_mul.data_type = "RGBA"
+            ao_mul.blend_type = "MULTIPLY"
+            ao_mul.inputs["Factor"].default_value = 0.88
+            ao_mul.label = "Apply 2K Baked AO"
+            ao_mul.location = (440, 260)
+            nt.links.new(col_sock, ao_mul.inputs[6])
+            nt.links.new(sep_n.outputs["Blue"], ao_mul.inputs[7])
+            col_sock = ao_mul.outputs[2]
+
+    nt.links.new(col_sock, bsdf.inputs["Base Color"])
+    if (not is_bb) and "Sheen Weight" in bsdf.inputs:
+        bsdf.inputs["Sheen Weight"].default_value = 0.20
+        bsdf.inputs["Sheen Roughness"].default_value = 0.55
+    return True
 
 
 def _build_material(
@@ -2376,6 +3370,12 @@ def _build_material(
             tag_lbl = "/".join(sorted(types_present)) or f"Packed_{p_idx}"
             tex_node.label = f"HFW {tag_lbl}"
             tex_node.location = (-960, y_cursor)
+            uv_idx = int(pe.get("uv_index", 0) or 0)
+            if uv_idx > 0:
+                uv_n = nt.nodes.new("ShaderNodeUVMap")
+                uv_n.uv_map = f"UV{uv_idx}"
+                uv_n.location = (-1180, y_cursor)
+                nt.links.new(uv_n.outputs["UV"], tex_node.inputs["Vector"])
 
             # Check if RGB is a direct full Color / Incandescence triplet
             r_t = packing.get("R", "").split(".")[0]
@@ -2391,6 +3391,34 @@ def _build_material(
                 sep.label = f"Unpack {tag_lbl}"
                 sep.location = (-660, y_cursor)
                 nt.links.new(tex_node.outputs["Color"], sep.inputs["Color"])
+                # Handle Decima 2-channel Rock/Landscape Color packing (`R=Color.R, G=Color.G, B=AO.R, A=Curvature.R`)
+                if r_t == "Color" and g_t == "Color" and b_t != "Color" and "Color" not in sockets:
+                    comb_rk = nt.nodes.new("ShaderNodeCombineColor")
+                    comb_rk.label = "Reconstruct Rock Albedo (RG)"
+                    comb_rk.location = (-440, y_cursor + 60)
+                    avg_rg = nt.nodes.new("ShaderNodeMath")
+                    avg_rg.operation = "MULTIPLY_ADD"
+                    avg_rg.inputs[1].default_value = 0.5
+                    avg_rg.location = (-560, y_cursor - 20)
+                    nt.links.new(sep.outputs["Red"], avg_rg.inputs[0])
+                    nt.links.new(sep.outputs["Green"], avg_rg.inputs[2])
+                    avg_rg2 = nt.nodes.new("ShaderNodeMath")
+                    avg_rg2.operation = "MULTIPLY"
+                    avg_rg2.inputs[1].default_value = 0.48
+                    avg_rg2.location = (-460, y_cursor - 20)
+                    nt.links.new(avg_rg.outputs["Value"], avg_rg2.inputs[0])
+                    nt.links.new(sep.outputs["Red"], comb_rk.inputs["Red"])
+                    nt.links.new(sep.outputs["Green"], comb_rk.inputs["Green"])
+                    nt.links.new(avg_rg2.outputs["Value"], comb_rk.inputs["Blue"])
+                    # Tone rock from bright linear mask into natural stone albedo
+                    rk_tint = nt.nodes.new("ShaderNodeMix")
+                    rk_tint.data_type = "RGBA"
+                    rk_tint.blend_type = "MULTIPLY"
+                    rk_tint.inputs["Factor"].default_value = 1.0
+                    rk_tint.inputs[7].default_value = (0.34, 0.30, 0.27, 1.0)
+                    rk_tint.location = (-260, y_cursor + 60)
+                    nt.links.new(comb_rk.outputs["Color"], rk_tint.inputs[6])
+                    sockets["Color"] = rk_tint.outputs[2]
                 for lane, spec in packing.items():
                     parts = spec.split(".")
                     stype = parts[0]
@@ -2465,6 +3493,12 @@ def _build_material(
     if spec_shader and _build_special_material(mat, spec_shader, sockets, tex_dir, img_cache):
         return mat
 
+    # Check if this is an HFW 8-Layer Character Outfit Material (`MSK.RGB` 3-bit corner mask + tiling Leather/Metal/Silk/Carbon)!
+    outfit_layered = mat_meta.get("outfit_layered")
+    if outfit_layered and outfit_layered.get("layers"):
+        if _build_layered_outfit_material(mat, outfit_layered, tex_dir, img_cache):
+            return mat
+
     # Standard Decima Machine/Armor Deferred PBR Shader (`HFW_MachineDetailArray` -> `HFW_DecimaPBR` -> `Principled BSDF`)
     out_node = nt.nodes.new("ShaderNodeOutputMaterial")
     out_node.location = (820, 0)
@@ -2523,10 +3557,11 @@ def _build_material(
                 nt.links.new(sockets["Mask_Alpha"], da_grp.inputs["Mask Alpha"])
             normal_rgb_sock = da_grp.outputs["Normal RGB"]
 
-    # 2b. DXIL-Verified Animated Elemental Sack / Canister / Eye Lens Overlays!
+    # 2b. DXIL-Verified Animated Elemental Sack / Canister / Eye Lens / Plasma Overlays!
     em_overlay = mat_meta.get("emissive_overlay")
     overlay_em_color = None
     overlay_em_strength = None
+    liquid_mask_sock = None
 
     if em_overlay:
         okind = em_overlay.get("kind", "")
@@ -2535,16 +3570,39 @@ def _build_material(
         if okind == "elemental_sack_overlay" and "Mask" in sockets:
             flow_img = _load_image(tex_dir, em_overlay.get("flow_file", ""), "Non-Color", img_cache)
             fluid_img = _load_image(tex_dir, em_overlay.get("fluid_file", ""), "Non-Color", img_cache)
-            t_drv = _add_time_driver_node(nt, (-160, 520), "HFW Sac Flow Time")
+            t_drv = _add_time_driver_node(nt, (-280, 560), "HFW Sac Flow Time")
+            mctrl = nt.nodes.new("ShaderNodeGroup")
+            mctrl.node_tree = _ensure_machine_shader_control_group()
+            mctrl.label = "HFW Machine Shader Control"
+            mctrl.location = (-520, 740)
+
             sac_grp = nt.nodes.new("ShaderNodeGroup")
             sac_grp.node_tree = _ensure_elemental_sack_group(flow_img, fluid_img)
             sac_grp.label = "HFW Animated Elemental Sac (Flow Map)"
-            sac_grp.location = (40, 480)
+            sac_grp.location = (40, 520)
             gc = em_overlay.get("glow_color", [0.14, 0.68, 1.0])
-            sac_grp.inputs["Sac Glow Color"].default_value = (gc[0], gc[1], gc[2], 1.0)
-            sac_grp.inputs["Glow Strength"].default_value = float(em_overlay.get("glow_strength", 6.5))
+            base_sac_str = float(em_overlay.get("glow_strength", 4.2))
             sac_grp.inputs["Flow Speed"].default_value = float(em_overlay.get("flow_speed", 0.35))
             sac_grp.inputs["Flow Strength"].default_value = float(em_overlay.get("flow_strength", 0.14))
+
+            # Preserve per-sac elemental color (e.g. Bilegut Acid + Adhesive) with optional global override!
+            liq_col = nt.nodes.new("ShaderNodeMix")
+            liq_col.data_type = "RGBA"
+            liq_col.label = "Native Sac Color <-> Override"
+            liq_col.inputs[6].default_value = (gc[0], gc[1], gc[2], 1.0)
+            liq_col.location = (-220, 760)
+            nt.links.new(mctrl.outputs["Liquid Override Mix"], liq_col.inputs["Factor"])
+            nt.links.new(mctrl.outputs["Liquid Override Color"], liq_col.inputs[7])
+            nt.links.new(liq_col.outputs[2], sac_grp.inputs["Sac Glow Color"])
+
+            sac_str = nt.nodes.new("ShaderNodeMath")
+            sac_str.operation = "MULTIPLY"
+            sac_str.inputs[0].default_value = base_sac_str
+            sac_str.location = (-180, 620)
+            nt.links.new(mctrl.outputs["Liquid Glow Scale"], sac_str.inputs[1])
+            nt.links.new(sac_str.outputs["Value"], sac_grp.inputs["Glow Strength"])
+            nt.links.new(mctrl.outputs["Animation Speed"], sac_grp.inputs["Animate Speed"])
+
             if color_sock is not None:
                 nt.links.new(color_sock, sac_grp.inputs["Base Color"])
                 color_sock = sac_grp.outputs["Color"]
@@ -2557,19 +3615,41 @@ def _build_material(
             nt.links.new(t_drv.outputs[0], sac_grp.inputs["Time"])
             overlay_em_color = sac_grp.outputs["Emission Color"]
             overlay_em_strength = sac_grp.outputs["Emission Strength"]
+            liquid_mask_sock = sac_grp.outputs["Sac Mask"]
 
         elif okind == "canister_emissive_overlay" and "Mask" in sockets:
             noise_img = _load_image(tex_dir, em_overlay.get("noise_file", ""), "Non-Color", img_cache)
-            t_drv = _add_time_driver_node(nt, (-160, 520), "HFW Canister Pulse Time")
+            t_drv = _add_time_driver_node(nt, (-280, 560), "HFW Canister Pulse Time")
+            mctrl = nt.nodes.new("ShaderNodeGroup")
+            mctrl.node_tree = _ensure_machine_shader_control_group()
+            mctrl.label = "HFW Machine Shader Control"
+            mctrl.location = (-520, 740)
+
             can_grp = nt.nodes.new("ShaderNodeGroup")
             can_grp.node_tree = _ensure_canister_glow_group(noise_img)
             can_grp.label = "HFW Animated Elemental Canister Glow"
-            can_grp.location = (40, 480)
+            can_grp.location = (40, 520)
             gc = em_overlay.get("glow_color", [0.52, 0.70, 0.10])
-            can_grp.inputs["Glow Color"].default_value = (gc[0], gc[1], gc[2], 1.0)
-            can_grp.inputs["Glow Strength"].default_value = float(em_overlay.get("glow_strength", 5.5))
+            base_can_str = float(em_overlay.get("glow_strength", 5.5))
             can_grp.inputs["Pulse Speed"].default_value = float(em_overlay.get("pulse_speed", 8.0))
             can_grp.inputs["Is Fluid Body"].default_value = 1.0 if em_overlay.get("is_fluid_body") else 0.0
+
+            liq_col = nt.nodes.new("ShaderNodeMix")
+            liq_col.data_type = "RGBA"
+            liq_col.inputs[6].default_value = (gc[0], gc[1], gc[2], 1.0)
+            liq_col.location = (-220, 760)
+            nt.links.new(mctrl.outputs["Liquid Override Mix"], liq_col.inputs["Factor"])
+            nt.links.new(mctrl.outputs["Liquid Override Color"], liq_col.inputs[7])
+            nt.links.new(liq_col.outputs[2], can_grp.inputs["Glow Color"])
+
+            can_str = nt.nodes.new("ShaderNodeMath")
+            can_str.operation = "MULTIPLY"
+            can_str.inputs[0].default_value = base_can_str
+            can_str.location = (-180, 620)
+            nt.links.new(mctrl.outputs["Liquid Glow Scale"], can_str.inputs[1])
+            nt.links.new(can_str.outputs["Value"], can_grp.inputs["Glow Strength"])
+            nt.links.new(mctrl.outputs["Animation Speed"], can_grp.inputs["Animate Speed"])
+
             if color_sock is not None:
                 nt.links.new(color_sock, can_grp.inputs["Base Color"])
                 color_sock = can_grp.outputs["Color"]
@@ -2577,20 +3657,31 @@ def _build_material(
             nt.links.new(t_drv.outputs[0], can_grp.inputs["Time"])
             overlay_em_color = can_grp.outputs["Emission Color"]
             overlay_em_strength = can_grp.outputs["Emission Strength"]
+            liquid_mask_sock = can_grp.outputs["Fluid Mask"]
 
         elif okind == "machine_eye_lens_overlay":
             iris_img = _load_image(tex_dir, em_overlay.get("iris_file", ""), "Non-Color", img_cache)
-            t_drv = _add_time_driver_node(nt, (-160, 520), "HFW Eye Iris Time")
+            t_drv = _add_time_driver_node(nt, (-280, 560), "HFW Eye Iris Time")
+            mctrl = nt.nodes.new("ShaderNodeGroup")
+            mctrl.node_tree = _ensure_machine_shader_control_group()
+            mctrl.label = "HFW Machine Shader Control"
+            mctrl.location = (-520, 740)
+
             eye_grp = nt.nodes.new("ShaderNodeGroup")
             eye_grp.node_tree = _ensure_eye_lens_group(iris_img)
             eye_grp.label = "HFW Machine Eye Iris Optics"
-            eye_grp.location = (40, 480)
-            cc = em_overlay.get("calm_color", [0.04, 0.56, 1.0])
-            ac = em_overlay.get("alert_color", [1.0, 0.10, 0.02])
-            eye_grp.inputs["Calm Color"].default_value = (cc[0], cc[1], cc[2], 1.0)
-            eye_grp.inputs["Alert Color"].default_value = (ac[0], ac[1], ac[2], 1.0)
-            eye_grp.inputs["Alert State"].default_value = float(em_overlay.get("alert_state", 0.0))
-            eye_grp.inputs["Glow Strength"].default_value = float(em_overlay.get("glow_strength", 9.0))
+            eye_grp.location = (40, 520)
+            base_eye_str = float(em_overlay.get("glow_strength", 9.0))
+            nt.links.new(mctrl.outputs["Eye Color"], eye_grp.inputs["Calm Color"])
+            nt.links.new(mctrl.outputs["Eye Alert Color"], eye_grp.inputs["Alert Color"])
+            nt.links.new(mctrl.outputs["Eye Alert State"], eye_grp.inputs["Alert State"])
+            nt.links.new(mctrl.outputs["Animation Speed"], eye_grp.inputs["Animate Speed"])
+            eye_str = nt.nodes.new("ShaderNodeMath")
+            eye_str.operation = "MULTIPLY"
+            eye_str.inputs[0].default_value = base_eye_str
+            eye_str.location = (-180, 620)
+            nt.links.new(mctrl.outputs["Eye Glow Scale"], eye_str.inputs[1])
+            nt.links.new(eye_str.outputs["Value"], eye_grp.inputs["Glow Strength"])
             nt.links.new(t_drv.outputs[0], eye_grp.inputs["Time"])
             overlay_em_color = eye_grp.outputs["Emission Color"]
             overlay_em_strength = eye_grp.outputs["Emission Strength"]
@@ -2602,15 +3693,18 @@ def _build_material(
             pctrl.node_tree = _ensure_plasma_charge_control_group()
             pctrl.label = "Slaughterspine Plasma Charge"
             pctrl.location = (-260, 420)
+            mctrl = nt.nodes.new("ShaderNodeGroup")
+            mctrl.node_tree = _ensure_machine_shader_control_group()
+            mctrl.label = "HFW Machine Shader Control"
+            mctrl.location = (-520, 740)
             pc_grp = nt.nodes.new("ShaderNodeGroup")
             pc_grp.node_tree = _ensure_plasma_charge_group(noise_img)
             pc_grp.label = "HFW Slaughterspine Plasma Charge-Up (DXIL)"
             pc_grp.location = (40, 480)
-            pc = em_overlay.get("plasma_color", [0.46, 0.05, 1.0])
-            ic = em_overlay.get("idle_led_color", [0.85, 0.18, 0.02])
-            pc_grp.inputs["Plasma Color"].default_value = (pc[0], pc[1], pc[2], 1.0)
-            pc_grp.inputs["Idle Conduit Color"].default_value = (ic[0], ic[1], ic[2], 1.0)
             pc_grp.inputs["Glow Strength"].default_value = float(em_overlay.get("glow_strength", 4.2))
+            nt.links.new(mctrl.outputs["Plasma Color"], pc_grp.inputs["Plasma Color"])
+            nt.links.new(mctrl.outputs["Muscle Color"], pc_grp.inputs["Idle Conduit Color"])
+            nt.links.new(mctrl.outputs["Animation Speed"], pc_grp.inputs["Animate Speed"])
             if "Mask" in sockets:
                 nt.links.new(sockets["Mask"], pc_grp.inputs["Mask"])
             if "Mask_Alpha" in sockets:
@@ -2622,32 +3716,243 @@ def _build_material(
             overlay_em_color = pc_grp.outputs["Emission Color"]
             overlay_em_strength = pc_grp.outputs["Emission Strength"]
 
+    # 2c. Exact DXIL Human Skin Tone LUT Reconstruction (`AloyHead 48346:288` L855-912 + L2456-2464)!
+    #     Guerrilla stores human `Head_CLR` / `Female_Aloy_CLR` as `0.5`-centered neutralized variation maps
+    #     (`mean_srgb ≈ 0.50`) and multiplies by `2.0 * SkinLUT_srgb` BEFORE `pow(..., 2.2)` -> in linear PBR
+    #     space, `pow(2.0 * SkinLUT_srgb * Head_CLR_srgb, 2.2) == 4.5948 * SkinTone_linear * Head_CLR_linear`!
+    sprof = mat_meta.get("surface_profile", "pbr")
+    char_ctrl_node = None
+    if sprof == "skin" and mat_meta.get("uses_skin_lut") and color_sock is not None:
+        char_ctrl_node = nt.nodes.new("ShaderNodeGroup")
+        char_ctrl_node.node_tree = _ensure_character_control_group(
+            {"skin_tone_linear": mat_meta.get("skin_tone_linear")} if mat_meta.get("skin_tone_linear") else None
+        )
+        char_ctrl_node.label = "HFW Character Skin Control (570:0 LUT)"
+        char_ctrl_node.location = (-440, 520)
+
+        # Expand 0.5-centered sRGB skin texture (linear 0.2176 -> 1.000) via exact `2.0^2.2 = 4.5948`!
+        sk_exp = nt.nodes.new("ShaderNodeVectorMath")
+        sk_exp.operation = "SCALE"
+        sk_exp.inputs["Scale"].default_value = 4.5948
+        sk_exp.label = "Neutral-0.5 Skin Expand (2^2.2)"
+        sk_exp.location = (-220, 340)
+        nt.links.new(color_sock, sk_exp.inputs[0])
+
+        sk_br = nt.nodes.new("ShaderNodeVectorMath")
+        sk_br.operation = "SCALE"
+        sk_br.label = "Apply Skin Brightness"
+        sk_br.location = (-60, 420)
+        nt.links.new(char_ctrl_node.outputs["Skin Tone"], sk_br.inputs[0])
+        nt.links.new(char_ctrl_node.outputs["Skin Brightness"], sk_br.inputs["Scale"])
+
+        sk_mul = nt.nodes.new("ShaderNodeMix")
+        sk_mul.data_type = "RGBA"
+        sk_mul.blend_type = "MULTIPLY"
+        sk_mul.clamp_result = True
+        sk_mul.inputs["Factor"].default_value = 1.0
+        sk_mul.label = "HFW DXIL Skin Albedo (SkinTone * 4.595 * Tex)"
+        sk_mul.location = (20, 360)
+        nt.links.new(sk_br.outputs["Vector"], sk_mul.inputs[6])
+        nt.links.new(sk_exp.outputs["Vector"], sk_mul.inputs[7])
+        color_sock = sk_mul.outputs[2]
+    elif sprof in ("hair", "hair_face") and color_sock is None:
+        # Guerrilla non-Aloy hair cards (e.g. Seyka `QuenHair_Alpha`, Companion/NPC hair, brows/lashes) bind
+        # `382:0` Hair LUT with NO RGB Color map -> drive cleanly from `HFW_CharacterControl.Hair Color` + strand ID!
+        char_ctrl_node = nt.nodes.new("ShaderNodeGroup")
+        hc_init = {"hair_color_linear": mat_meta.get("hair_color_linear")} if mat_meta.get("hair_color_linear") else None
+        char_ctrl_node.node_tree = _ensure_character_control_group(hc_init)
+        char_ctrl_node.label = "HFW Character Hair Control (382:0 LUT)"
+        char_ctrl_node.location = (-440, 480)
+        hair_col_sock = char_ctrl_node.outputs["Hair Color"]
+        if "Mask_Alpha" in sockets:
+            # Subtle per-strand root/ID luminance variation (0.76..1.24x) from `*_ID.png`
+            id_rng = nt.nodes.new("ShaderNodeMapRange")
+            id_rng.clamp = True
+            id_rng.inputs["From Min"].default_value = 0.0
+            id_rng.inputs["From Max"].default_value = 1.0
+            id_rng.inputs["To Min"].default_value = 0.76
+            id_rng.inputs["To Max"].default_value = 1.24
+            id_rng.label = "Hair Strand Variation"
+            id_rng.location = (-240, 340)
+            nt.links.new(sockets["Mask_Alpha"], id_rng.inputs["Value"])
+
+            h_var = nt.nodes.new("ShaderNodeVectorMath")
+            h_var.operation = "SCALE"
+            h_var.label = "Modulate Hair Strands"
+            h_var.location = (-40, 420)
+            nt.links.new(hair_col_sock, h_var.inputs[0])
+            nt.links.new(id_rng.outputs["Result"], h_var.inputs["Scale"])
+            color_sock = h_var.outputs["Vector"]
+        else:
+            color_sock = hair_col_sock
+    elif sprof in ("rock_volcanic", "rock_tint") and color_sock is not None:
+        # HFW landscape rock `_TNT` textures are 2-channel Linear RG Tint/Blend maps (`B == 0`!) —
+        # NEVER feed raw RG into Base Color (which renders neon green/orange!). Reconstruct authentic
+        # volcanic basalt or weathered sandstone/granite from Red (macro shade) + Green (ash/weathering blend)!
+        sep_tnt = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_tnt.label = "Unpack Rock _TNT (R=Shade, G=Weathering)"
+        sep_tnt.location = (-360, 440)
+        nt.links.new(color_sock, sep_tnt.inputs["Color"])
+
+        if sprof == "rock_volcanic":
+            c_dark = (0.022, 0.021, 0.024, 1.0)    # Deep cooled volcanic basalt charcoal
+            c_mid = (0.072, 0.068, 0.066, 1.0)     # Weathered obsidian / grey lava ridge
+            c_dust = (0.135, 0.115, 0.098, 1.0)    # Warm volcanic ash / mineral dust
+            dust_w = 0.42
+        else:
+            c_dark = (0.085, 0.070, 0.058, 1.0)    # Shadowed canyon/cliff stone
+            c_mid = (0.245, 0.195, 0.155, 1.0)     # Weathered desert sandstone / granite
+            c_dust = (0.175, 0.160, 0.118, 1.0)    # Muted dusty lichen / ochre mineral
+            dust_w = 0.35
+
+        m_rock = nt.nodes.new("ShaderNodeMix")
+        m_rock.data_type = "RGBA"
+        m_rock.label = "Rock Macro Shade (TNT.R)"
+        m_rock.inputs[6].default_value = c_dark
+        m_rock.inputs[7].default_value = c_mid
+        m_rock.location = (-160, 480)
+        nt.links.new(sep_tnt.outputs["Red"], m_rock.inputs["Factor"])
+
+        g_scl = nt.nodes.new("ShaderNodeMath")
+        g_scl.operation = "MULTIPLY"
+        g_scl.inputs[1].default_value = dust_w
+        g_scl.use_clamp = True
+        g_scl.location = (-160, 300)
+        nt.links.new(sep_tnt.outputs["Green"], g_scl.inputs[0])
+
+        m_dust = nt.nodes.new("ShaderNodeMix")
+        m_dust.data_type = "RGBA"
+        m_dust.label = "Rock Weathering Blend (TNT.G)"
+        m_dust.inputs[7].default_value = c_dust
+        m_dust.location = (20, 440)
+        nt.links.new(g_scl.outputs["Value"], m_dust.inputs["Factor"])
+        nt.links.new(m_rock.outputs[2], m_dust.inputs[6])
+        color_sock = m_dust.outputs[2]
+
     # 3. Exact DXIL-verified Decima PBR Conversion (`HFW_DecimaPBR`):
     #    - Inverts Decima Smoothness -> true PBR Roughness (fixes plastic shine on matte paint + matte edges on bare metal!)
-    #    - Converts Decima Specular/Reflectance (CLR + RFL^2 + normalized chroma) -> Blender Metallic + Base Color
-    #      so worn bare metal edges (CLR=black, RFL=0.84) render as gleaming reflective silver/steel instead of black lines!
+    #    - Converts Decima Specular/Reflectance -> Blender Metallic + Base Color ONLY on potentially metallic surfaces
+    #      (NEVER on Hair / Skin / Foliage / Landscape Rock, where `Reflectance` is hair sheen/scatter — e.g. Aloy's
+    #      `181:1.R` jumps to 0.75-1.0 at the hair tips, which must stay dielectric hair sheen, NOT copper metal!)
+    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "snow", "rock_volcanic", "rock_tint")
+    if sprof in ("rock_volcanic", "rock_tint"):
+        # Per DXIL `8490:1` L1020 (`0x3FD99999A0000000 = 0.40` max rock smoothness): remap `_LUM` / macro Smoothness
+        # into realistic dry basalt/stone Smoothness (`0.08..0.34` -> PBR Roughness `0.66..0.92`, ZERO wet plastic shine!)
+        if smooth_sock is not None:
+            rk_sm = nt.nodes.new("ShaderNodeMapRange")
+            rk_sm.clamp = True
+            rk_sm.label = "DXIL Dry Rock Smoothness (0.08..0.34)"
+            rk_sm.inputs["From Min"].default_value = 0.0
+            rk_sm.inputs["From Max"].default_value = 1.0
+            rk_sm.inputs["To Min"].default_value = 0.08
+            rk_sm.inputs["To Max"].default_value = 0.34 if sprof == "rock_volcanic" else 0.28
+            rk_sm.location = (-20, 60)
+            nt.links.new(smooth_sock, rk_sm.inputs["Value"])
+            smooth_sock = rk_sm.outputs["Result"]
+        # Blend 2K standalone tiling volcanic/stone detail normal (`5211:1` etc.) at 8x UV scale onto 4K macro normal!
+        ad_nfile = mat_meta.get("asset_detail_normal_file", "")
+        if ad_nfile and normal_rgb_sock is not None:
+            ad_img = _load_image(tex_dir, ad_nfile, "Non-Color", img_cache)
+            if ad_img is not None:
+                tc_rk = nt.nodes.new("ShaderNodeTexCoord")
+                tc_rk.location = (-960, -820)
+                uv_rk = nt.nodes.new("ShaderNodeVectorMath")
+                uv_rk.operation = "SCALE"
+                uv_rk.inputs["Scale"].default_value = 8.0
+                uv_rk.label = "Rock Micro-Detail Tile (8x)"
+                uv_rk.location = (-740, -820)
+                nt.links.new(tc_rk.outputs["UV"], uv_rk.inputs[0])
+                t_ad = nt.nodes.new("ShaderNodeTexImage")
+                t_ad.image = ad_img
+                t_ad.label = "HFW 2K Rock Detail Normal"
+                t_ad.location = (-520, -820)
+                nt.links.new(uv_rk.outputs["Vector"], t_ad.inputs["Vector"])
+                sep_ad = nt.nodes.new("ShaderNodeSeparateColor")
+                sep_ad.location = (-240, -820)
+                nt.links.new(t_ad.outputs["Color"], sep_ad.inputs["Color"])
+                if "Normal.R" in sockets and "Normal.G" in sockets:
+                    # Exact tangent-space UDN detail blend (`macro + (detail - 0.5) * 0.65`)
+                    def _rk_udn(mac_s, det_s, y: float):
+                        d_off = nt.nodes.new("ShaderNodeMath")
+                        d_off.operation = "MULTIPLY_ADD"
+                        d_off.inputs[1].default_value = 0.65
+                        d_off.inputs[2].default_value = -0.325
+                        d_off.location = (-60, y)
+                        nt.links.new(det_s, d_off.inputs[0])
+                        d_add = nt.nodes.new("ShaderNodeMath")
+                        d_add.operation = "ADD"
+                        d_add.use_clamp = True
+                        d_add.location = (80, y)
+                        nt.links.new(mac_s, d_add.inputs[0])
+                        nt.links.new(d_off.outputs["Value"], d_add.inputs[1])
+                        return d_add.outputs["Value"]
+                    rk_nx = _rk_udn(sockets["Normal.R"], sep_ad.outputs["Red"], -740)
+                    rk_ny = _rk_udn(sockets["Normal.G"], sep_ad.outputs["Green"], -920)
+                    rk_nrec = nt.nodes.new("ShaderNodeGroup")
+                    rk_nrec.node_tree = _ensure_normal_reconstruct_z_group()
+                    rk_nrec.location = (220, -820)
+                    nt.links.new(rk_nx, rk_nrec.inputs["Normal X"])
+                    nt.links.new(rk_ny, rk_nrec.inputs["Normal Y"])
+                    normal_rgb_sock = rk_nrec.outputs["Normal RGB"]
+                # Subtle micro-crevice height contrast (`t_ad.Alpha` 0.80..1.18) on rock albedo
+                if color_sock is not None:
+                    h_mr = nt.nodes.new("ShaderNodeMapRange")
+                    h_mr.clamp = True
+                    h_mr.inputs["From Min"].default_value = 0.15
+                    h_mr.inputs["From Max"].default_value = 0.85
+                    h_mr.inputs["To Min"].default_value = 0.78
+                    h_mr.inputs["To Max"].default_value = 1.22
+                    h_mr.location = (-60, 260)
+                    nt.links.new(t_ad.outputs["Alpha"], h_mr.inputs["Value"])
+                    h_sc = nt.nodes.new("ShaderNodeVectorMath")
+                    h_sc.operation = "SCALE"
+                    h_sc.location = (80, 300)
+                    nt.links.new(color_sock, h_sc.inputs[0])
+                    nt.links.new(h_mr.outputs["Result"], h_sc.inputs["Scale"])
+                    color_sock = h_sc.outputs["Vector"]
+    elif sprof == "hair" and smooth_sock is not None:
+        # Calibrate Hair smoothness (`181:1.G`) to natural silky hair (`Smoothness 0.44..0.62` -> Roughness `0.38..0.56`)!
+        hr_sm = nt.nodes.new("ShaderNodeMapRange")
+        hr_sm.clamp = True
+        hr_sm.label = "Natural Hair Smoothness"
+        hr_sm.inputs["From Min"].default_value = 0.0
+        hr_sm.inputs["From Max"].default_value = 1.0
+        hr_sm.inputs["To Min"].default_value = 0.44
+        hr_sm.inputs["To Max"].default_value = 0.62
+        hr_sm.location = (-20, 60)
+        nt.links.new(smooth_sock, hr_sm.inputs["Value"])
+        smooth_sock = hr_sm.outputs["Result"]
+
     if color_sock is not None or smooth_sock is not None or rfl_sock is not None:
         pbr_grp = nt.nodes.new("ShaderNodeGroup")
         pbr_grp.node_tree = _ensure_decima_pbr_node_group()
         pbr_grp.label = "HFW Decima PBR (Smoothness & F0 -> Metallic)"
-        pbr_grp.location = (160, 220)
+        pbr_grp.location = (180, 220)
         if color_sock is not None:
             nt.links.new(color_sock, pbr_grp.inputs["Color"])
+        elif sprof == "snow":
+            pbr_grp.inputs["Color"].default_value = (0.78, 0.84, 0.92, 1.0)
         elif "eye" in mname.lower():
             # Outer eye glass lens (`5704:0`) has no Color texture — dark glossy camera glass!
             pbr_grp.inputs["Color"].default_value = (0.015, 0.018, 0.024, 1.0)
         if smooth_sock is not None:
             nt.links.new(smooth_sock, pbr_grp.inputs["Smoothness"])
-        if rfl_sock is not None:
+        if rfl_sock is not None and sprof not in _DIELECTRIC_PROFILES:
             nt.links.new(rfl_sock, pbr_grp.inputs["Reflectance"])
         if ao_sock is not None:
             nt.links.new(ao_sock, pbr_grp.inputs["AO"])
 
         nt.links.new(pbr_grp.outputs["Base Color"], bsdf.inputs["Base Color"])
-        nt.links.new(pbr_grp.outputs["Metallic"], bsdf.inputs["Metallic"])
+        if sprof in _DIELECTRIC_PROFILES:
+            bsdf.inputs["Metallic"].default_value = 0.0
+        else:
+            nt.links.new(pbr_grp.outputs["Metallic"], bsdf.inputs["Metallic"])
         nt.links.new(pbr_grp.outputs["Roughness"], bsdf.inputs["Roughness"])
         if "Specular IOR Level" in bsdf.inputs:
-            nt.links.new(pbr_grp.outputs["Specular IOR Level"], bsdf.inputs["Specular IOR Level"])
+            if sprof in _DIELECTRIC_PROFILES:
+                bsdf.inputs["Specular IOR Level"].default_value = 0.45 if sprof == "hair" else (0.35 if sprof in ("rock_volcanic", "rock_tint") else 0.50)
+            else:
+                nt.links.new(pbr_grp.outputs["Specular IOR Level"], bsdf.inputs["Specular IOR Level"])
 
     # 4. Wire final Normal Map
     if normal_rgb_sock is not None:
@@ -2702,9 +4007,196 @@ def _build_material(
         if "Emission Strength" in bsdf.inputs:
             nt.links.new(st_m.outputs["Value"], bsdf.inputs["Emission Strength"])
 
-    # 6. Wire Alpha cutout (only explicit Alpha, never Mask_Alpha)
-    if "Alpha" in sockets:
+    # 5b. Physical Wet Membrane Coat & Subsurface Scatter ONLY on Liquid Sac / Canister Fluid Regions!
+    if liquid_mask_sock is not None:
+        if "Coat Weight" in bsdf.inputs:
+            coat_m = nt.nodes.new("ShaderNodeMath")
+            coat_m.operation = "MULTIPLY"
+            coat_m.inputs[1].default_value = 0.85
+            coat_m.location = (280, 120)
+            nt.links.new(liquid_mask_sock, coat_m.inputs[0])
+            nt.links.new(coat_m.outputs["Value"], bsdf.inputs["Coat Weight"])
+            if "Coat Roughness" in bsdf.inputs:
+                bsdf.inputs["Coat Roughness"].default_value = 0.05
+        if "Subsurface Weight" in bsdf.inputs:
+            sss_m = nt.nodes.new("ShaderNodeMath")
+            sss_m.operation = "MULTIPLY"
+            sss_m.inputs[1].default_value = 0.42
+            sss_m.location = (280, -20)
+            nt.links.new(liquid_mask_sock, sss_m.inputs[0])
+            nt.links.new(sss_m.outputs["Value"], bsdf.inputs["Subsurface Weight"])
+            if "Subsurface Scale" in bsdf.inputs:
+                bsdf.inputs["Subsurface Scale"].default_value = 0.04
+
+    # 6. Wire Alpha cutout ONLY when material genuinely uses alpha transparency (never on opaque skin/cloth/body!)
+    allow_alpha = bool(mat_meta.get("allow_alpha_cutout", True))
+    sprof = mat_meta.get("surface_profile", "pbr")
+    if allow_alpha and "Alpha" in sockets and sprof not in ("skin", "eye", "teeth"):
         nt.links.new(sockets["Alpha"], bsdf.inputs["Alpha"])
+
+    # 7. Character & General Asset PBR Surface Profile refinements (Skin SSS, Hair, Brows/Lashes, Eyes, Foliage, Cloth, Glass)
+    if sprof == "peach_fuzz":
+        # Invisible/ultra-subtle facial peach-fuzz shell (never blocks face skin with solid white!)
+        _configure_blended_material(mat)
+        nt.nodes.clear()
+        out_pf = nt.nodes.new("ShaderNodeOutputMaterial")
+        out_pf.location = (320, 0)
+        tr_pf = nt.nodes.new("ShaderNodeBsdfTransparent")
+        tr_pf.location = (60, 0)
+        nt.links.new(tr_pf.outputs["BSDF"], out_pf.inputs["Surface"])
+        return mat
+    elif sprof == "hair_face":
+        # Eyebrow, Eyelash & Facial Hair cards: hashed alpha cutout + dark auburn/brown strand tint!
+        _configure_blended_material(mat)
+        if hasattr(mat, "blend_method"):
+            try:
+                mat.blend_method = "HASHED"
+            except Exception:
+                pass
+        if color_sock is None:
+            bsdf.inputs["Base Color"].default_value = (0.14, 0.075, 0.045, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.52
+        if "Alpha" in sockets:
+            nt.links.new(sockets["Alpha"], bsdf.inputs["Alpha"])
+        elif "Mask_Alpha" in sockets:
+            nt.links.new(sockets["Mask_Alpha"], bsdf.inputs["Alpha"])
+    elif sprof == "skin":
+        if "Subsurface Weight" in bsdf.inputs:
+            if char_ctrl_node is not None:
+                nt.links.new(char_ctrl_node.outputs["Subsurface Weight"], bsdf.inputs["Subsurface Weight"])
+            else:
+                bsdf.inputs["Subsurface Weight"].default_value = 0.14
+        if "Subsurface Scale" in bsdf.inputs:
+            bsdf.inputs["Subsurface Scale"].default_value = 0.006
+        if "Subsurface Radius" in bsdf.inputs:
+            bsdf.inputs["Subsurface Radius"].default_value = (1.0, 0.35, 0.18)
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 0.05
+            bsdf.inputs["Coat Roughness"].default_value = 0.42
+    elif sprof == "snow":
+        if "Subsurface Weight" in bsdf.inputs:
+            bsdf.inputs["Subsurface Weight"].default_value = 0.25
+        if "Subsurface Scale" in bsdf.inputs:
+            bsdf.inputs["Subsurface Scale"].default_value = 0.03
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 0.15
+            bsdf.inputs["Coat Roughness"].default_value = 0.22
+    elif sprof == "hair":
+        _configure_blended_material(mat)
+        if hasattr(mat, "blend_method"):
+            try:
+                mat.blend_method = "HASHED"
+            except Exception:
+                pass
+        if color_sock is None:
+            # NPC hair cards whose tint lives in a shader constant (e.g. Seyka's dark ponytail)
+            bsdf.inputs["Base Color"].default_value = (0.045, 0.032, 0.025, 1.0)
+        if "Alpha" not in sockets and "Mask_Alpha" in sockets:
+            nt.links.new(sockets["Mask_Alpha"], bsdf.inputs["Alpha"])
+        if "Anisotropic" in bsdf.inputs:
+            bsdf.inputs["Anisotropic"].default_value = 0.65
+        if "Sheen Weight" in bsdf.inputs:
+            bsdf.inputs["Sheen Weight"].default_value = 0.22
+        if "Coat Weight" in bsdf.inputs:
+            # Subtle dielectric hair specular sheen driven by `181:1.R` (NOT Metallic copper!)
+            if rfl_sock is not None:
+                hc_m = nt.nodes.new("ShaderNodeMath")
+                hc_m.operation = "MULTIPLY"
+                hc_m.inputs[1].default_value = 0.16
+                hc_m.use_clamp = True
+                hc_m.location = (260, -140)
+                nt.links.new(rfl_sock, hc_m.inputs[0])
+                nt.links.new(hc_m.outputs["Value"], bsdf.inputs["Coat Weight"])
+            else:
+                bsdf.inputs["Coat Weight"].default_value = 0.10
+            if "Coat Roughness" in bsdf.inputs:
+                bsdf.inputs["Coat Roughness"].default_value = 0.36
+        if smooth_sock is None:
+            bsdf.inputs["Roughness"].default_value = 0.46
+    elif sprof == "eye":
+        # Human eyeball: dark crisp iris & pupil + clean sclera + wet glossy clearcoat!
+        bsdf.inputs["Roughness"].default_value = 0.04
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 1.0
+            bsdf.inputs["Coat Roughness"].default_value = 0.02
+        if "IOR" in bsdf.inputs:
+            bsdf.inputs["IOR"].default_value = 1.42
+        # Darken neutral grayscale Eyes_NMT iris slightly via Mask so irises aren't washed out
+        if color_sock is not None and "Mask" in sockets:
+            iris_col = nt.nodes.new("ShaderNodeRGB")
+            iris_col.label = "Character Iris Tint"
+            iris_col.outputs[0].default_value = (0.16, 0.28, 0.14, 1.0)
+            iris_col.location = (180, 420)
+            iris_mx = nt.nodes.new("ShaderNodeMix")
+            iris_mx.data_type = "RGBA"
+            iris_mx.blend_type = "MULTIPLY"
+            iris_mx.label = "Iris Tint (Masked)"
+            iris_mx.location = (340, 320)
+            nt.links.new(sockets["Mask"], iris_mx.inputs["Factor"])
+            # Intercept BSDF Base Color cleanly
+            for lnk in list(bsdf.inputs["Base Color"].links):
+                nt.links.new(lnk.from_socket, iris_mx.inputs[6])
+                nt.links.remove(lnk)
+            nt.links.new(iris_col.outputs[0], iris_mx.inputs[7])
+            nt.links.new(iris_mx.outputs[2], bsdf.inputs["Base Color"])
+    elif sprof == "eye_wet":
+        # Crystal-clear physical wet cornea / tearline shell: pure Transparent + Fresnel Glossy catchlights (ZERO milky veil!)
+        _configure_blended_material(mat)
+        nt.nodes.clear()
+        out_ew = nt.nodes.new("ShaderNodeOutputMaterial")
+        out_ew.location = (560, 0)
+        tr_ew = nt.nodes.new("ShaderNodeBsdfTransparent")
+        tr_ew.location = (80, 120)
+        gl_ew = nt.nodes.new("ShaderNodeBsdfGlossy")
+        gl_ew.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        gl_ew.inputs["Roughness"].default_value = 0.02
+        gl_ew.location = (80, -80)
+        fr_ew = nt.nodes.new("ShaderNodeFresnel")
+        fr_ew.inputs["IOR"].default_value = 1.38
+        fr_ew.location = (-160, 220)
+        sc_ew = nt.nodes.new("ShaderNodeMath")
+        sc_ew.operation = "MULTIPLY"
+        sc_ew.inputs[1].default_value = 0.22
+        sc_ew.location = (80, 240)
+        nt.links.new(fr_ew.outputs["Fac"], sc_ew.inputs[0])
+        mx_ew = nt.nodes.new("ShaderNodeMixShader")
+        mx_ew.location = (340, 20)
+        nt.links.new(sc_ew.outputs["Value"], mx_ew.inputs["Fac"])
+        nt.links.new(tr_ew.outputs["BSDF"], mx_ew.inputs[1])
+        nt.links.new(gl_ew.outputs["BSDF"], mx_ew.inputs[2])
+        nt.links.new(mx_ew.outputs["Shader"], out_ew.inputs["Surface"])
+        return mat
+    elif sprof == "teeth":
+        bsdf.inputs["Roughness"].default_value = 0.18
+        if "Coat Weight" in bsdf.inputs:
+            bsdf.inputs["Coat Weight"].default_value = 0.65
+            bsdf.inputs["Coat Roughness"].default_value = 0.08
+    elif sprof == "foliage":
+        if "Alpha" in sockets or "Mask_Alpha" in sockets:
+            _configure_blended_material(mat)
+            if hasattr(mat, "blend_method"):
+                try:
+                    mat.blend_method = "CLIP"
+                except Exception:
+                    pass
+            if "Alpha" not in sockets and "Mask_Alpha" in sockets:
+                nt.links.new(sockets["Mask_Alpha"], bsdf.inputs["Alpha"])
+        if "Subsurface Weight" in bsdf.inputs:
+            bsdf.inputs["Subsurface Weight"].default_value = 0.35
+        if "Subsurface Scale" in bsdf.inputs:
+            bsdf.inputs["Subsurface Scale"].default_value = 0.02
+    elif sprof == "cloth":
+        if "Sheen Weight" in bsdf.inputs:
+            bsdf.inputs["Sheen Weight"].default_value = 0.45
+            bsdf.inputs["Sheen Roughness"].default_value = 0.60
+    elif sprof == "glass":
+        _configure_blended_material(mat)
+        if "Transmission Weight" in bsdf.inputs:
+            bsdf.inputs["Transmission Weight"].default_value = 0.85
+        if "IOR" in bsdf.inputs:
+            bsdf.inputs["IOR"].default_value = 1.45
+        if "Alpha" not in sockets:
+            bsdf.inputs["Alpha"].default_value = 0.25
 
     return mat
 
@@ -2715,7 +4207,14 @@ def _build_armature(
     helpers: list[dict[str, Any]],
     root_coll: bpy.types.Collection,
 ) -> tuple[bpy.types.Object, list[str], dict[str, str]]:
-    """Build a unified Blender Armature with Skeleton joints + Helper bones in a dedicated Bone Collection."""
+    """Build a unified Blender Armature (or Root Empty for pure static assets with 0 joints) with clean Bone Collections."""
+    if not joints and not helpers:
+        root_empty = bpy.data.objects.new(f"{name}_Root", None)
+        root_empty.empty_display_type = "PLAIN_AXES"
+        root_empty.empty_display_size = 0.25
+        root_coll.objects.link(root_empty)
+        return root_empty, [], {}
+
     arm_data = bpy.data.armatures.new(f"{name}_Armature")
     arm_obj = bpy.data.objects.new(f"{name}_Armature", arm_data)
     root_coll.objects.link(arm_obj)
@@ -2734,7 +4233,18 @@ def _build_armature(
     edit_joint_bones: list[bpy.types.EditBone] = []
     joint_world_mats: list[Matrix] = [_mat4(j["world_matrix"]) for j in joints]
 
-    main_bcoll = arm_data.collections.new("Skeleton")
+    has_facial_bones = any(j["name"].startswith("FACIAL_") for j in joints)
+    has_cloth_bones = any(
+        any(k in j["name"].lower() for k in ("_pbd_", "_jbd", "cloth", "skirt", "rope", "strap", "hair", "braid", "tassel", "flap"))
+        for j in joints
+    )
+    main_bcoll = arm_data.collections.new("Body" if has_facial_bones else "Skeleton")
+    face_bcoll = arm_data.collections.new("Face") if has_facial_bones else None
+    if face_bcoll is not None:
+        face_bcoll.is_visible = False  # Collapsible clean Face rig collection!
+    cloth_bcoll = arm_data.collections.new("Cloth_Hair") if has_cloth_bones else None
+    if cloth_bcoll is not None:
+        cloth_bcoll.is_visible = False
     helper_bcoll = arm_data.collections.new("Helpers")
     helper_bcoll.is_visible = False
 
@@ -2746,12 +4256,15 @@ def _build_armature(
         eb.head = head
 
         kids = children_of.get(idx, [])
-        bone_len = 0.15
+        is_face = j["name"].startswith("FACIAL_")
+        bone_len = 0.025 if is_face else 0.12
         if kids:
             dists = [(joint_world_mats[k].to_translation() - head).length for k in kids]
-            valid = [d for d in dists if d > 0.01]
+            valid = [d for d in dists if d > 0.005]
             if valid:
-                bone_len = max(0.05, min(0.5, sum(valid) / len(valid)))
+                min_l = 0.015 if is_face else 0.04
+                max_l = 0.06 if is_face else 0.45
+                bone_len = max(min_l, min(max_l, sum(valid) / len(valid)))
 
         y_axis = wmat.to_3x3() @ Vector((0.0, 1.0, 0.0))
         if y_axis.length < 1e-6:
@@ -2762,7 +4275,13 @@ def _build_armature(
         eb.matrix = Matrix.Translation(head) @ wmat.to_3x3().normalized().to_4x4()
         eb.length = bone_len
 
-        main_bcoll.assign(eb)
+        jlow = j["name"].lower()
+        if face_bcoll is not None and is_face:
+            face_bcoll.assign(eb)
+        elif cloth_bcoll is not None and any(k in jlow for k in ("_pbd_", "_jbd", "cloth", "skirt", "rope", "strap", "hair", "braid", "tassel", "flap")):
+            cloth_bcoll.assign(eb)
+        else:
+            main_bcoll.assign(eb)
         joint_names.append(eb.name)
         edit_joint_bones.append(eb)
 
@@ -2886,9 +4405,15 @@ def _build_part_mesh_object(
             if ukey in npz:
                 # Decima UVs are ALREADY V-up (0 = bottom, 1 = top), matching Blender UV space directly!
                 uv = npz[ukey].copy()
+                # Guard against dead all-zero UV1 slots (e.g. SeykaTrimsUV2 primitives): mirror UV0 cleanly!
+                if u_i >= 1 and float(np.ptp(uv)) < 1e-5 and f"{key}_uv0" in npz:
+                    uv = npz[f"{key}_uv0"].copy()
                 all_uvs[u_i].append(uv)
             else:
-                all_uvs[u_i].append(np.zeros((n_verts, 2), dtype=np.float32))
+                if u_i >= 1 and f"{key}_uv0" in npz:
+                    all_uvs[u_i].append(npz[f"{key}_uv0"].copy())
+                else:
+                    all_uvs[u_i].append(np.zeros((n_verts, 2), dtype=np.float32))
 
         if has_any_weights:
             bikey = f"{key}_bi"
@@ -2966,7 +4491,7 @@ def _build_part_mesh_object(
     obj["hfw_source_kind"] = part_meta["source_kind"]
     target_coll.objects.link(obj)
 
-    if part_meta["is_skinned"]:
+    if part_meta["is_skinned"] and arm_obj.type == "ARMATURE":
         obj.parent = arm_obj
         mod = obj.modifiers.new(name="Armature", type="ARMATURE")
         mod.object = arm_obj
@@ -3013,7 +4538,7 @@ def _build_part_mesh_object(
             if 0 <= pidx < len(joint_names):
                 target_bone_name = joint_names[pidx]
 
-        if target_bone_name is not None:
+        if target_bone_name is not None and arm_obj.type == "ARMATURE":
             obj.parent = arm_obj
             obj.parent_type = "BONE"
             obj.parent_bone = target_bone_name
@@ -3045,17 +4570,32 @@ def import_bundle_into_scene(
 
     disp = manifest["display_name"]
     variant = manifest.get("variant_label", "")
+    asset_kind = manifest.get("asset_kind", "machine")
+    shader_controls = manifest.get("shader_controls") or {}
     root_name = f"HFW_{disp}"
     root_coll = _get_or_create_collection(root_name, bpy.context.scene.collection)
 
-    sub_colls = {
-        "Body": _get_or_create_collection(f"{disp}_Body", root_coll),
-        "Plates_Intact": _get_or_create_collection(f"{disp}_Plates_Intact", root_coll),
-        "Weapons_And_Components": _get_or_create_collection(f"{disp}_Weapons_And_Components", root_coll),
-        "Plates_Broken_States": _get_or_create_collection(f"{disp}_Plates_Broken_States", root_coll),
-        "Focus_Overlay": _get_or_create_collection(f"{disp}_Focus_Overlay", root_coll),
-        "Unattached_Misc": _get_or_create_collection(f"{disp}_Unattached_Misc", root_coll),
-    }
+    # Create standard sub-collections dynamically for machines, characters, and general assets!
+    sub_colls: dict[str, bpy.types.Collection] = {}
+    default_coll_keys = (
+        ("Body", "Plates_Intact", "Weapons_And_Components", "Plates_Broken_States", "Focus_Overlay", "Unattached_Misc")
+        if asset_kind == "machine"
+        else ("Body", "Head_Face", "Hair", "Outfit", "Accessories")
+        if asset_kind == "character"
+        else ("Assets",)
+    )
+    for ckey in default_coll_keys:
+        sub_colls[ckey] = _get_or_create_collection(f"{disp}_{ckey}", root_coll)
+    for pmeta in manifest["parts"]:
+        ckey = pmeta.get("collection", "Body")
+        if ckey and ckey not in sub_colls:
+            sub_colls[ckey] = _get_or_create_collection(f"{disp}_{ckey}", root_coll)
+
+    # Pre-initialize shared shader control node groups BEFORE building materials!
+    if asset_kind == "machine":
+        _ensure_machine_shader_control_group(shader_controls)
+    elif asset_kind == "character":
+        _ensure_character_control_group(shader_controls)
 
     img_cache: dict[str, bpy.types.Image] = {}
     mat_map: dict[str, bpy.types.Material] = {}
@@ -3068,6 +4608,9 @@ def import_bundle_into_scene(
     arm_obj["hfw_entity_id"] = manifest["entity_id"]
     arm_obj["hfw_codename"] = manifest["codename"]
     arm_obj["hfw_variant"] = variant
+    arm_obj["hfw_asset_kind"] = asset_kind
+    if shader_controls:
+        arm_obj["hfw_variant_profile"] = str(shader_controls.get("profile", "standard"))
 
     # If this is a Plasma-charging machine (Slaughterspine!), expose a single live `hfw_plasma_charge` slider (0..1)
     # on the Armature driving `HFW_PlasmaChargeControl` across every PlasmaSpike, PlasmaCharger, PlasmaCore, Body & Muscle!
@@ -3129,8 +4672,9 @@ def import_bundle_into_scene(
             _hide_layer_collection(child, target_name)
 
     for hidden_key in ("Plates_Broken_States", "Focus_Overlay", "Unattached_Misc"):
-        _hide_layer_collection(bpy.context.view_layer.layer_collection, sub_colls[hidden_key].name)
-        sub_colls[hidden_key].hide_render = True
+        if hidden_key in sub_colls:
+            _hide_layer_collection(bpy.context.view_layer.layer_collection, sub_colls[hidden_key].name)
+            sub_colls[hidden_key].hide_render = True
 
     # Ensure Cycles never hits a transparent-bounce blackout when viewing overlapping optical muscle fibers!
     if hasattr(bpy.context.scene, "cycles") and hasattr(bpy.context.scene.cycles, "transparent_max_bounces"):

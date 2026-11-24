@@ -1,5 +1,10 @@
-"""Extraction & assembly modules: textures, skeletons, meshes, materials, machines, and audio."""
+"""Extraction & assembly modules: textures, skeletons, meshes, materials, machines, characters, assets, and audio."""
 
+from hfw_toolkit.extract.asset_assembler import (
+    DevAssetRecord,
+    assemble_general_asset,
+    discover_dev_directory_assets,
+)
 from hfw_toolkit.extract.audio import (
     SPOKEN_LANGUAGES,
     SPOKEN_LANGUAGE_LABELS,
@@ -25,6 +30,16 @@ from hfw_toolkit.extract.audio import (
     load_all_voice_names,
     render_music_cue_mix,
     write_audio_file,
+)
+from hfw_toolkit.extract.character_assembler import (
+    ALOY_FACIAL_COMPONENT_ID,
+    ALOY_HAIR_RESOURCE_ID,
+    CharacterOutfitRecord,
+    CharacterRecord,
+    assemble_character,
+    decode_hair_skinned_meshes,
+    discover_all_characters,
+    resolve_character_prompt,
 )
 from hfw_toolkit.extract.machine_assembler import (
     AssembledPart,
@@ -52,12 +67,17 @@ from hfw_toolkit.extract.textures import (
 )
 
 __all__ = [
+    "ALOY_FACIAL_COMPONENT_ID",
+    "ALOY_HAIR_RESOURCE_ID",
     "AssembledPart",
     "AudioItemInfo",
+    "CharacterOutfitRecord",
+    "CharacterRecord",
     "DecodedAudio",
     "DecodedMesh",
     "DecodedPrimitive",
     "DecodedTexture",
+    "DevAssetRecord",
     "HelperInfo",
     "JointInfo",
     "MachineAssembly",
@@ -75,17 +95,22 @@ __all__ = [
     "UnpackedTextureSet",
     "VariableBindingInfo",
     "WAVE_ENCODING_NAMES",
+    "assemble_character",
+    "assemble_general_asset",
     "assemble_machine",
     "classify_audio_group_dev_folder",
     "clean_entrypoint_name",
     "decode_audio_bytes",
     "decode_audio_object",
+    "decode_hair_skinned_meshes",
     "decode_mesh_hierarchy",
     "decode_packing_info",
     "decode_texture",
     "decode_texture_binding_packing",
     "detect_digital_extras_ost",
     "detect_installed_languages",
+    "discover_all_characters",
+    "discover_dev_directory_assets",
     "discover_music_cues",
     "discover_machine_variants",
     "encode_audio_bytes",
@@ -101,6 +126,7 @@ __all__ = [
     "reconstruct_normal_map",
     "render_channel_image",
     "render_music_cue_mix",
+    "resolve_character_prompt",
     "resolve_machine_entity_id",
     "save_unpacked_texture_set",
     "unpack_texture_set",

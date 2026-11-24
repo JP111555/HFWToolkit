@@ -22,9 +22,11 @@
   <div class="layout">
     <!-- LEFT SIDEBAR -->
     <aside class="sidebar">
-      <div class="nav-modes">
+      <div class="nav-modes" style="flex-wrap:wrap;">
         <button class="mode-btn active" data-mode="machines">Machines</button>
-        <button class="mode-btn" data-mode="audio">Audio &amp; Music</button>
+        <button class="mode-btn" data-mode="characters">Characters</button>
+        <button class="mode-btn" data-mode="assets">Asset Catalog</button>
+        <button class="mode-btn" data-mode="audio">Audio</button>
         <button class="mode-btn" data-mode="texturesets">TextureSets</button>
         <button class="mode-btn" data-mode="diff">Diff</button>
       </div>
@@ -35,6 +37,30 @@
           <input id="machine-search" type="text" placeholder="Search Slitherfang, Clawstrider, Slaughterspine..." />
         </div>
         <div class="list-scroll" id="machine-list"></div>
+      </div>
+
+      <!-- Mode 1b: Characters & Outfits -->
+      <div class="sidebar-pane hidden" id="pane-characters">
+        <div class="au-kind-tabs">
+          <button class="ch-kind-btn active" data-chkind="main">Main Cast</button>
+          <button class="ch-kind-btn" data-chkind="all">All (1,200)</button>
+          <button class="ch-kind-btn" data-chkind="npc">Tribal NPCs</button>
+        </div>
+        <div class="search-box compact">
+          <input id="ch-search" type="text" placeholder="Filter Aloy, Seyka, Erend, Tenakth, Carja..." />
+        </div>
+        <div class="list-scroll" id="ch-list"></div>
+      </div>
+
+      <!-- Mode 1c: Guerrilla Dev-Directory Asset Catalog -->
+      <div class="sidebar-pane hidden" id="pane-assets">
+        <div class="search-box compact">
+          <input id="as-search" type="text" placeholder="Search 1,454 dev-dir assets (Bow, Pine, Ruins, Boar...)" />
+        </div>
+        <div class="search-box compact" style="padding-top:0;">
+          <select id="as-cat-filter" style="width:100%;"><option value="">All Categories (Guerrilla Tree)</option></select>
+        </div>
+        <div class="list-scroll" id="as-list"></div>
       </div>
 
       <!-- Mode 2: Audio & Music Explorer -->
@@ -124,6 +150,8 @@
           <button class="pill-btn" data-quick="Slitherfang">Inspect Slitherfang</button>
           <button class="pill-btn" data-quick="Clawstrider">Inspect Clawstrider</button>
           <button class="pill-btn" data-quick="Slaughterspine">Inspect Slaughterspine</button>
+          <button class="pill-btn" id="btn-quick-chars">👤 Import Characters &amp; Outfits</button>
+          <button class="pill-btn" id="btn-quick-assets">📁 Browse Dev Asset Catalog</button>
           <button class="pill-btn" id="btn-quick-audio">🎵 Browse Music, SFX &amp; Voicelines</button>
         </div>
       </div>
@@ -165,6 +193,92 @@
 
       <!-- Material Diff View -->
       <div class="hidden" id="ws-diff"></div>
+
+      <!-- Characters & Outfits Prompt Studio -->
+      <div class="hidden" id="ws-characters">
+        <div class="au-wrap">
+          <div class="kpi-bar" id="ch-kpi-bar"></div>
+          <div class="card">
+            <h2 style="margin:0 0 6px;">Natural-Language Character Prompt Studio</h2>
+            <p class="hint" style="margin:0 0 10px;">Type any Horizon Forbidden West character, outfit, tribe, gender, or modifier — e.g. <code>Aloy Carja Blazon no headgear</code>, <code>Aloy Quen Commander</code>, <code>Seyka</code>, <code>Erend</code>, or <code>Tenakth female warrior</code>. Automatically assembles body, outfit, head, braided hair, 8-layer materials, and ONE unified poseable rig for Blender &amp; Unreal Engine 5.</p>
+            <div class="au-controls-row">
+              <input id="ch-prompt-input" type="text" placeholder="Aloy Carja Blazon no headgear" style="flex:1;min-width:260px;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#f8fafc;font-size:14px;" />
+              <button class="btn-primary" id="ch-btn-resolve">Resolve Prompt</button>
+              <button class="btn-primary" id="ch-btn-export-blend">Export Ready .blend</button>
+              <button class="btn-ghost" id="ch-btn-export-ue5">Export UE5 Rig + Shaders</button>
+            </div>
+            <div class="quick-picks" style="margin-top:10px;justify-content:flex-start;">
+              <button class="pill-btn ch-chip" data-chprompt="Aloy">Aloy (Nora Anointed)</button>
+              <button class="pill-btn ch-chip" data-chprompt="Aloy Carja Blazon no headgear">Aloy Carja Blazon (No Headgear)</button>
+              <button class="pill-btn ch-chip" data-chprompt="Aloy Quen Commander">Aloy Quen Commander (DLC)</button>
+              <button class="pill-btn ch-chip" data-chprompt="Seyka">Seyka</button>
+              <button class="pill-btn ch-chip" data-chprompt="Erend">Erend</button>
+              <button class="pill-btn ch-chip" data-chprompt="Kotallo">Kotallo</button>
+              <button class="pill-btn ch-chip" data-chprompt="Tenakth female warrior">Tenakth Female Warrior</button>
+            </div>
+            <div id="ch-resolve-box" class="export-status hidden" style="margin-top:10px;"></div>
+            <div id="ch-export-status" class="export-status hidden" style="margin-top:8px;"></div>
+          </div>
+
+          <div class="card" id="ch-detail-card">
+            <h3 id="ch-detail-title" style="margin:0 0 8px;">Select a Character or Enter a Prompt Above</h3>
+            <div id="ch-detail-meta" class="hint" style="margin-bottom:10px;"></div>
+            <div class="au-controls-row" style="flex-wrap:wrap;gap:12px;">
+              <label class="au-field" style="min-width:240px;flex:1;">
+                <span>Outfit / Costume Variation</span>
+                <select id="ch-outfit-select"><option value="">Default Appearance</option></select>
+              </label>
+              <label class="au-field" style="min-width:220px;flex:1;">
+                <span>Modular Head Swap (211 Heads)</span>
+                <select id="ch-head-select"><option value="">Default Character Head</option></select>
+              </label>
+              <label class="au-field" style="min-width:130px;">
+                <span>Hair LOD</span>
+                <select id="ch-hair-lod">
+                  <option value="0">LOD 0 (Ultra)</option>
+                  <option value="1">LOD 1 (High)</option>
+                  <option value="2" selected>LOD 2 (Balanced)</option>
+                  <option value="3">LOD 3 (Light)</option>
+                </select>
+              </label>
+            </div>
+            <div class="au-controls-row" style="margin-top:10px;flex-wrap:wrap;gap:14px;">
+              <label class="chk-inline"><input type="checkbox" id="ch-chk-headgear" checked /> Show Headgear</label>
+              <label class="chk-inline"><input type="checkbox" id="ch-chk-hair" checked /> Include Braided Hair</label>
+              <label class="chk-inline"><input type="checkbox" id="ch-chk-pack" /> Pack Textures Into .blend</label>
+              <button class="btn-primary" id="ch-btn-export-sel-blend">Export Selected .blend</button>
+              <button class="btn-ghost" id="ch-btn-export-sel-ue5">Export Selected UE5 FBX + Script</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Guerrilla Developer-Directory Asset Catalog -->
+      <div class="hidden" id="ws-assets">
+        <div class="au-wrap">
+          <div class="kpi-bar" id="as-kpi-bar"></div>
+          <div class="card">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+              <div>
+                <h2 style="margin:0;">Guerrilla Developer-Directory Asset Catalog</h2>
+                <div class="hint">Mirrors Guerrilla's original <code>work:Models/...</code> &amp; <code>DLC/models/...</code> folder tree across Weapons, Animals, Ruins, Eco Trees &amp; Props.</div>
+              </div>
+              <div id="as-breadcrumbs" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
+            </div>
+            <div id="as-tree-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-top:14px;"></div>
+          </div>
+          <div class="card hidden" id="as-detail-card">
+            <h3 id="as-detail-title" style="margin:0 0 6px;">Asset</h3>
+            <div id="as-detail-meta" class="hint" style="margin-bottom:12px;"></div>
+            <div class="au-controls-row" style="flex-wrap:wrap;gap:10px;">
+              <label class="chk-inline"><input type="checkbox" id="as-chk-pack" /> Pack Textures Into .blend</label>
+              <button class="btn-primary" id="as-btn-export-blend">Export Ready .blend (Preserve Dev Folder)</button>
+              <button class="btn-ghost" id="as-btn-export-ue5">Export UE5 FBX + Shaders</button>
+            </div>
+            <div id="as-export-status" class="export-status hidden" style="margin-top:10px;"></div>
+          </div>
+        </div>
+      </div>
 
       <!-- Audio, Music, SFX & Voicelines Studio View -->
       <div class="hidden" id="ws-audio">
@@ -290,6 +404,7 @@
   <script src="/static/shader_graph.js"></script>
   <script src="/static/texture_lab.js"></script>
   <script src="/static/audio_lab.js"></script>
+  <script src="/static/assets_lab.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

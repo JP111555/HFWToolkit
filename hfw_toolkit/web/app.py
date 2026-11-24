@@ -26,6 +26,8 @@ from hfw_toolkit.extract import (
     SUPPORTED_OUTPUT_FORMATS,
     AudioItemInfo,
     MachineAssembly,
+    assemble_character,
+    assemble_general_asset,
     assemble_machine,
     decode_audio_object,
     decode_texture,
@@ -37,6 +39,7 @@ from hfw_toolkit.extract import (
     has_pyav,
     render_channel_image,
     render_music_cue_mix,
+    resolve_character_prompt,
     resolve_machine_entity_id,
     unpack_texture_set,
 )
@@ -96,6 +99,30 @@ class AudioIndexRequest(BaseModel):
 
 class OpenAudioFolderRequest(BaseModel):
     path: str | None = None
+
+
+class ExportCharacterRequest(BaseModel):
+    prompt: str = ""
+    char_id: str = ""
+    outfit_id: str = ""
+    facial_override: str = ""
+    headgear: bool = True
+    include_hair: bool = True
+    hair_lod: int = 2
+    lod_index: int = 0
+    unpack_textures: bool = False
+    pack_textures: bool = False
+    export_fbx: bool = False
+    max_texture_size: int | None = None
+
+
+class ExportDevAssetRequest(BaseModel):
+    asset: str  # dev_path or resource_id
+    lod_index: int = 0
+    unpack_textures: bool = False
+    pack_textures: bool = False
+    export_fbx: bool = False
+    max_texture_size: int | None = None
 
 
 class ToolkitServerState:
@@ -994,5 +1021,224 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
         if hasattr(os, "startfile"):
             os.startfile(str(target))
         return {"status": "opened_folder", "path": str(target)}
+
+    # ------------------------------------------------------------------
+    # Characters, Outfits, Prompt Resolver & Guerrilla Dev-Directory Asset Catalog
+    # ------------------------------------------------------------------
+
+    def _ensure_chars_assets_indexed() -> None:
+        with state._db_lock:
+            if not state.catalog.is_characters_assets_built():
+                state.catalog.index_characters_and_assets(state.game)
+
+    @app.post("/api/index/characters-assets")
+    def api_index_chars_assets():
+        with state._db_lock:
+            res = state.catalog.index_characters_and_assets(state.game)
+        return {"status": "ok", "counts": res}
+
+    @app.get("/api/characters")
+    def api_characters(
+        q: str = "",
+        kind: str = "",
+        tribe: str = "",
+        gender: str = "",
+        limit: int = 200,
+    ):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            items = state.catalog.list_characters(query=q, kind=kind, tribe=tribe, gender=gender, limit=limit)
+            st = state.catalog.stats()
+        return {
+            "items": items,
+            "counts": {
+                "characters": st.get("characters", 0),
+                "outfits": st.get("character_outfits", 0),
+                "heads": st.get("character_heads", 0),
+            },
+        }
+
+    @app.get("/api/characters/resolve")
+    def api_characters_resolve(prompt: str = Query(..., min_length=1)):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            res = resolve_character_prompt(state.catalog, prompt)
+        return res
+
+    @app.get("/api/characters/{char_id}/outfits")
+    def api_character_outfits(char_id: str, q: str = "", limit: int = 120):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            items = state.catalog.list_character_outfits(char_id=char_id, query=q, limit=limit)
+        return {"char_id": char_id, "items": items}
+
+    @app.get("/api/characters/heads")
+    def api_character_heads(q: str = "", gender: str = "", limit: int = 250):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            items = state.catalog.list_character_heads(query=q, gender=gender, limit=limit)
+        return {"items": items}
+
+    @app.post("/api/characters/export")
+    def api_export_character(req: ExportCharacterRequest):
+        import re as _re
+
+        job_id = f"char_{int(time.time() * 1000)}"
+        state.export_jobs[job_id] = {"status": "running", "message": "Assembling character segments & unified rig...", "output_blend": None}
+
+        def _worker() -> None:
+            try:
+                _ensure_chars_assets_indexed()
+                use_prompt = bool(req.prompt and req.prompt.strip() and not req.char_id)
+                asm = assemble_character(
+                    state.game,
+                    catalog=state.catalog,
+                    char_id=req.char_id or None,
+                    outfit_id=req.outfit_id or None,
+                    prompt=req.prompt.strip() if use_prompt else None,
+                    headgear=None if use_prompt else req.headgear,
+                    include_hair=None if use_prompt else req.include_hair,
+                    hair_lod=req.hair_lod,
+                    facial_id=req.facial_override or None,
+                    lod_index=req.lod_index,
+                )
+                safe_n = _re.sub(r"[^A-Za-z0-9_\-.]+", "_", f"{asm.display_name}_{asm.variant_label}").strip("_")[:64] or "Character"
+                base_dir = state.config.exports_dir / "Characters"
+                base_dir.mkdir(parents=True, exist_ok=True)
+                out_blend = base_dir / f"{safe_n}.blend"
+                bdir = base_dir / (f"{safe_n}_UE5" if req.export_fbx else f"{safe_n}_bundle")
+                fbx_out = (bdir / f"{safe_n}.fbx") if req.export_fbx else None
+
+                state.export_jobs[job_id]["message"] = (
+                    f"Exporting {asm.display_name} ({asm.variant_label}) textures & {len(asm.materials)} character materials..."
+                )
+                export_assembly_bundle(
+                    state.game,
+                    asm,
+                    bdir,
+                    max_texture_size=req.max_texture_size,
+                    unpack_textures=req.unpack_textures,
+                    asset_kind="character",
+                )
+                state.export_jobs[job_id]["message"] = f"Building unified rig {out_blend.name}{' + UE5 FBX' if req.export_fbx else ''} in Blender..."
+                build_blend_headless(
+                    bdir,
+                    out_blend,
+                    config=state.config,
+                    pack_textures=req.pack_textures,
+                    enable_detail_nodes=False,
+                    export_fbx=fbx_out,
+                )
+                state.export_jobs[job_id] = {
+                    "status": "done",
+                    "message": (
+                        f"Exported UE5 Rigged Character -> {bdir / 'ue5_import_character.py'}"
+                        if req.export_fbx
+                        else f"Exported {out_blend.name} ({len(asm.skeleton.joints)} unified joints, {len(asm.parts)} segments, {len(asm.materials)} materials)"
+                    ),
+                    "output_blend": str(out_blend),
+                    "bundle_dir": str(bdir),
+                    "ue5_script": str(bdir / "ue5_import_character.py"),
+                    "fbx_path": str(fbx_out) if fbx_out else None,
+                }
+            except Exception as exc:
+                state.export_jobs[job_id] = {"status": "error", "message": str(exc), "output_blend": None}
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"job_id": job_id}
+
+    @app.get("/api/assets/categories")
+    def api_asset_categories():
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            cats = state.catalog.list_dev_asset_categories()
+            st = state.catalog.stats()
+        return {"categories": cats, "total": st.get("dev_assets", 0)}
+
+    @app.get("/api/assets/tree")
+    def api_asset_tree(dir: str = ""):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            tree = state.catalog.list_dev_tree_children(dir)
+        return tree
+
+    @app.get("/api/assets/search")
+    def api_asset_search(q: str = "", category: str = "", dir: str = "", limit: int = 160):
+        _ensure_chars_assets_indexed()
+        with state._db_lock:
+            items = state.catalog.search_dev_assets(query=q, category=category, dir_prefix=dir, limit=limit)
+        return {"items": items}
+
+    @app.post("/api/assets/export")
+    def api_export_dev_asset(req: ExportDevAssetRequest):
+        import re as _re
+
+        job_id = f"asset_{int(time.time() * 1000)}"
+        state.export_jobs[job_id] = {"status": "running", "message": f"Assembling asset {req.asset}...", "output_blend": None}
+
+        def _worker() -> None:
+            try:
+                _ensure_chars_assets_indexed()
+                with state._db_lock:
+                    row = state.catalog.get_dev_asset(req.asset)
+                if row is not None:
+                    res_id = row["resource_id"]
+                    disp = row["display_name"]
+                    dev_p = row["dev_path"]
+                    cat_name = row["category"]
+                else:
+                    res_id, disp, dev_p, cat_name = req.asset, "", "", "props"
+
+                asm = assemble_general_asset(
+                    state.game,
+                    res_id,
+                    display_name=disp,
+                    dev_path=dev_p,
+                    category=cat_name,
+                    lod_index=req.lod_index,
+                )
+                safe_n = _re.sub(r"[^A-Za-z0-9_\-.]+", "_", asm.display_name).strip("_")[:64] or "Asset"
+                # Preserve Guerrilla's original developer folder layout under exports/Assets/<dev_path>!
+                rel_parts = [p for p in dev_p.replace("\\", "/").split("/") if p] if dev_p else [safe_n]
+                asset_dir = state.config.exports_dir / "Assets" / Path(*rel_parts)
+                asset_dir.mkdir(parents=True, exist_ok=True)
+                out_blend = asset_dir / f"{safe_n}.blend"
+                bdir = asset_dir / (f"{safe_n}_UE5" if req.export_fbx else f"{safe_n}_bundle")
+                fbx_out = (bdir / f"{safe_n}.fbx") if req.export_fbx else None
+
+                state.export_jobs[job_id]["message"] = f"Exporting {asm.display_name} ({len(asm.parts)} meshes, {len(asm.materials)} materials)..."
+                export_assembly_bundle(
+                    state.game,
+                    asm,
+                    bdir,
+                    max_texture_size=req.max_texture_size,
+                    unpack_textures=req.unpack_textures,
+                    asset_kind="asset",
+                )
+                state.export_jobs[job_id]["message"] = f"Building {out_blend.name}{' + UE5 FBX' if req.export_fbx else ''} in Blender..."
+                build_blend_headless(
+                    bdir,
+                    out_blend,
+                    config=state.config,
+                    pack_textures=req.pack_textures,
+                    export_fbx=fbx_out,
+                )
+                state.export_jobs[job_id] = {
+                    "status": "done",
+                    "message": (
+                        f"Exported UE5 Asset -> {bdir / 'ue5_import_asset.py'}"
+                        if req.export_fbx
+                        else f"Exported {out_blend.name} ({'Rigged' if asm.skeleton.joints else 'Static'}, {len(asm.parts)} parts, {len(asm.materials)} materials)"
+                    ),
+                    "output_blend": str(out_blend),
+                    "bundle_dir": str(bdir),
+                    "ue5_script": str(bdir / "ue5_import_asset.py"),
+                    "fbx_path": str(fbx_out) if fbx_out else None,
+                }
+            except Exception as exc:
+                state.export_jobs[job_id] = {"status": "error", "message": str(exc), "output_blend": None}
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"job_id": job_id}
 
     return app

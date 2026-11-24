@@ -31,10 +31,10 @@
       $("#topbar-stats").innerHTML = `
         <span>HFW: <strong>${verLbl}</strong></span>
         <span>Machines: <strong>${st.catalog.machines}</strong></span>
+        <span>Chars: <strong>${(st.catalog.characters || 0).toLocaleString()}</strong></span>
+        <span>Dev Assets: <strong>${(st.catalog.dev_assets || 0).toLocaleString()}</strong></span>
         <span>Music: <strong>${(st.catalog.music_cues || 0).toLocaleString()}</strong></span>
-        <span>TextureSets: <strong>${st.catalog.texture_sets.toLocaleString()}</strong></span>
         <span>Shaders: <strong>${st.catalog.shaders.toLocaleString()}</strong></span>
-        <span>DXC: <strong>${st.dxcompiler_available ? "Ready" : "Missing"}</strong></span>
         <span>Blender: <strong>${st.blender_available ? "Ready" : "Missing"}</strong></span>
       `;
       if (st.diagnose && !st.diagnose.ready) {
@@ -512,8 +512,9 @@
   }
 
   function showWorkspacePane(id) {
-    ["ws-empty", "ws-material", "ws-textureset", "ws-diff", "ws-audio"].forEach((pid) => {
-      $("#" + pid).classList.toggle("hidden", pid !== id);
+    ["ws-empty", "ws-material", "ws-textureset", "ws-diff", "ws-audio", "ws-characters", "ws-assets"].forEach((pid) => {
+      const el = $("#" + pid);
+      if (el) el.classList.toggle("hidden", pid !== id);
     });
   }
 
@@ -525,13 +526,22 @@
 
   function switchSidebarMode(mode) {
     $$(".mode-btn").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
-    ["machines", "audio", "texturesets", "diff"].forEach((m) => $("#pane-" + m).classList.toggle("hidden", m !== mode));
-    const isAudio = mode === "audio";
-    document.querySelector(".layout").classList.toggle("audio-wide", isAudio);
-    if (isAudio) {
+    ["machines", "characters", "assets", "audio", "texturesets", "diff"].forEach((m) => {
+      const el = $("#pane-" + m);
+      if (el) el.classList.toggle("hidden", m !== mode);
+    });
+    const isWide = mode === "audio" || mode === "characters" || mode === "assets";
+    document.querySelector(".layout").classList.toggle("audio-wide", isWide);
+    if (mode === "audio") {
       showWorkspacePane("ws-audio");
       if (window.HFWAudioLab) window.HFWAudioLab.init();
-    } else if (!$("#ws-audio").classList.contains("hidden")) {
+    } else if (mode === "characters") {
+      showWorkspacePane("ws-characters");
+      if (window.HFWAssetsLab) window.HFWAssetsLab.initCharacters();
+    } else if (mode === "assets") {
+      showWorkspacePane("ws-assets");
+      if (window.HFWAssetsLab) window.HFWAssetsLab.initAssets();
+    } else {
       showWorkspacePane(currentReport ? "ws-material" : "ws-empty");
     }
     if (mode === "texturesets" && !$("#ts-list").children.length) loadTextureSets("");
@@ -583,6 +593,12 @@
 
   if ($("#btn-quick-audio")) {
     $("#btn-quick-audio").addEventListener("click", () => switchSidebarMode("audio"));
+  }
+  if ($("#btn-quick-chars")) {
+    $("#btn-quick-chars").addEventListener("click", () => switchSidebarMode("characters"));
+  }
+  if ($("#btn-quick-assets")) {
+    $("#btn-quick-assets").addEventListener("click", () => switchSidebarMode("assets"));
   }
 
   async function runMachineExport(exportFbx) {

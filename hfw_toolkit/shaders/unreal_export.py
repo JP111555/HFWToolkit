@@ -633,7 +633,11 @@ def generate_ue5_machine_script(
     """
     disp = manifest.get("display_name", "HFWMachine")
     safe_mach = _ue_safe(disp)
-    dest_root = f"/Game/HFW/{safe_mach}"
+    asset_kind = manifest.get("asset_kind", "machine")
+    is_skeletal = bool(manifest.get("joints"))
+    shader_controls = manifest.get("shader_controls") or {}
+    sub_folder = {"character": "Characters", "asset": "Assets"}.get(asset_kind, "Machines")
+    dest_root = f"/Game/HFW/{sub_folder}/{safe_mach}" if asset_kind != "machine" else f"/Game/HFW/{safe_mach}"
     fbx_name = fbx_filename or f"{safe_mach}.fbx"
 
     # Embed compact material descriptors straight from assembly.json
@@ -652,27 +656,39 @@ def generate_ue5_machine_script(
             "emissive_strength": mmeta.get("emissive_strength", 0.0),
             "special_shader": mmeta.get("special_shader"),
             "emissive_overlay": mmeta.get("emissive_overlay"),
+            "surface_profile": mmeta.get("surface_profile", "pbr"),
+            "outfit_layered": mmeta.get("outfit_layered"),
+            "uses_skin_lut": bool(mmeta.get("uses_skin_lut", False)),
+            "skin_tone_linear": mmeta.get("skin_tone_linear"),
+            "uses_hair_lut": bool(mmeta.get("uses_hair_lut", False)),
+            "hair_color_linear": mmeta.get("hair_color_linear"),
+            "asset_detail_normal_file": mmeta.get("asset_detail_normal_file", ""),
+            "uv_index": int(mmeta.get("uv_index", 0)),
             "tags": mmeta.get("tags", []),
         }
 
     mats_json_str = json.dumps(mat_entries, indent=2)
+    controls_json_str = json.dumps(shader_controls, indent=2)
     bundle_abs = str(Path(bundle_dir).resolve())
 
-    return f'''"""Auto-generated Unreal Engine 5 Full Machine Rig & Animated Shader Importer for {disp}.
+    return f'''"""Auto-generated Unreal Engine 5 Rig/Asset & Animated Shader Importer for {disp}.
 
-Imported automatically by HFWToolkit (`{manifest.get("entity_id", "")}`, `{manifest.get("variant_label", "")}`):
-  - Rigged SkeletalMesh + Skeleton + Bone-Parented Armor Plates + ChildEntity Weapons (`{fbx_name}`)
+Imported automatically by HFWToolkit (`{manifest.get("entity_id", "")}`, `{manifest.get("variant_label", "")}`, kind=`{asset_kind}`):
+  - {"Rigged SkeletalMesh + Skeleton" if is_skeletal else "StaticMesh"} (`{fbx_name}`)
+  - Shared `MPC_HFW_MachineControl` Material Parameter Collection for 1-click Muscle / Eye / Liquid / Plasma / Speed control
   - ALL {len(mat_entries)} Decima PBR & DXIL-Verified Animated Shaders:
       * Decima Smoothness -> UE5 Roughness (`OneMinus`) + Worn-Metal Edge Recovery (`F0 = RFL^2`)
-      * Animated Elemental Sacks (Dual-Phase Flow Map `172:0` + `1703:0` fluid sloshing + Fresnel + `mat_id==0` mask)
+      * Animated Elemental Sacks (True Dual-Phase Flow Map `172:0` + `1703:0` fluid sloshing + Fresnel + Wet Specular)
+      * Physical Fresnel Glass Canisters (`BLEND_Translucent` + Refraction `1.45` + Fresnel Rim Opacity)
       * Animated Elemental Canisters (`Sine(Time*8)` pulsing collar `mat_id==1` + `Panner` fluid window `mat_id==20`)
-      * Animated Machine Muscle Cables (`8260:1`) & Optical Muscle Fibers (`19501:0`, Translucent Additive)
+      * Animated Machine Muscle Cables (`8260:1`) & Optical Muscle Fibers (`19501:0`, DXIL `Mask_Alpha*40`, TwoSided Additive)
       * Animated Machine Cores/Hearts (1 Hz `Abs(Sine)` heartbeat + `Panner` scroll) & Glowing Optical Eyes
+      * Character/Asset PBR Surface Profiles (Skin SSS, Masked Two-Sided Hair/Foliage, Glossy Eyes, Cloth, Glass)
 
 How to run inside Unreal Engine 5:
   1. Enable the built-in `Python Editor Script Plugin` in UE5.
-  2. In UE5 Menu -> Tools -> Execute Python Script... -> select this `ue5_import_machine.py`.
-  3. Open `/Game/HFW/{safe_mach}/SK_{safe_mach}` and hit Play/Realtime Viewport to watch all shaders animate!
+  2. In UE5 Menu -> Tools -> Execute Python Script... -> select this script.
+  3. Open `{dest_root}/{"SK_" if is_skeletal else "SM_"}{safe_mach}` and hit Realtime Viewport!
 """
 
 import json
@@ -681,6 +697,8 @@ import re
 import unreal
 
 MACHINE_NAME = {safe_mach!r}
+ASSET_KIND = {asset_kind!r}
+IS_SKELETAL = {is_skeletal!r}
 DEST_PACKAGE = {dest_root!r}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"{bundle_abs}"
 TEXTURE_DIR = os.path.join(SCRIPT_DIR, "textures")
@@ -690,10 +708,85 @@ FBX_CANDIDATES = [
 ]
 
 MATERIALS_META = json.loads(r"""{mats_json_str}""")
+SHADER_CONTROLS = json.loads(r"""{controls_json_str}""")
 
 mel = unreal.MaterialEditingLibrary
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 _TEX_CACHE = {{}}
+_MPC_ASSET = None
+
+
+def _ensure_mpc():
+    """Create shared `MPC_HFW_MachineControl` Material Parameter Collection for live global shader customization."""
+    global _MPC_ASSET
+    if ASSET_KIND != "machine":
+        return None
+    if _MPC_ASSET is not None:
+        return _MPC_ASSET
+    mpc_pkg = DEST_PACKAGE + "/Materials"
+    mpc_name = "MPC_HFW_MachineControl"
+    mpc_path = f"{{mpc_pkg}}/{{mpc_name}}"
+    existing = unreal.EditorAssetLibrary.load_asset(mpc_path)
+    if existing:
+        unreal.EditorAssetLibrary.delete_asset(mpc_path)
+    try:
+        mpc = asset_tools.create_asset(mpc_name, mpc_pkg, unreal.MaterialParameterCollection, unreal.MaterialParameterCollectionFactoryNew())
+        mc = SHADER_CONTROLS.get("muscle_color", [0.95, 0.28, 0.02])
+        ec = SHADER_CONTROLS.get("eye_color", [0.04, 0.56, 1.0])
+        eac = SHADER_CONTROLS.get("eye_alert_color", [1.0, 0.08, 0.01])
+        pc = SHADER_CONTROLS.get("plasma_color", [0.46, 0.05, 1.0])
+        lc = SHADER_CONTROLS.get("liquid_override_color", [0.08, 0.62, 1.0])
+
+        s_params = []
+        for pname, pval in (
+            ("MuscleGlowScale", 1.0),
+            ("EyeAlertState", 0.0),
+            ("EyeGlowScale", 1.0),
+            ("LiquidOverrideMix", float(SHADER_CONTROLS.get("liquid_override_fac", 0.0))),
+            ("LiquidGlowScale", float(SHADER_CONTROLS.get("liquid_glow_scale", 1.0))),
+            ("PlasmaCharge", float(SHADER_CONTROLS.get("plasma_charge", 0.0))),
+            ("AnimateSpeed", float(SHADER_CONTROLS.get("animation_speed", 1.0))),
+        ):
+            sp = unreal.CollectionScalarParameter()
+            sp.parameter_name = pname
+            sp.default_value = pval
+            s_params.append(sp)
+
+        v_params = []
+        for pname, prgb in (
+            ("MuscleColor", mc),
+            ("EyeColor", ec),
+            ("EyeAlertColor", eac),
+            ("LiquidOverrideColor", lc),
+            ("PlasmaColor", pc),
+        ):
+            vp = unreal.CollectionVectorParameter()
+            vp.parameter_name = pname
+            vp.default_value = unreal.LinearColor(float(prgb[0]), float(prgb[1]), float(prgb[2]), 1.0)
+            v_params.append(vp)
+
+        mpc.set_editor_property("scalar_parameters", s_params)
+        mpc.set_editor_property("vector_parameters", v_params)
+        unreal.EditorAssetLibrary.save_loaded_asset(mpc)
+        _MPC_ASSET = mpc
+    except Exception as exc:
+        unreal.log_warning(f"[HFW] MPC creation fallback to material params: {{exc}}")
+        _MPC_ASSET = None
+    return _MPC_ASSET
+
+
+def _mpc_param(mat, param_name: str, fallback_fn, x: int, y: int):
+    """Create a CollectionParameter linked to `MPC_HFW_MachineControl`, or fall back cleanly to a normal Parameter."""
+    mpc = _ensure_mpc()
+    if mpc is not None:
+        try:
+            n = _mk(mat, unreal.MaterialExpressionCollectionParameter, x, y)
+            n.set_editor_property("collection", mpc)
+            n.set_editor_property("parameter_name", param_name)
+            return n
+        except Exception:
+            pass
+    return fallback_fn()
 
 
 def _safe(name: str) -> str:
@@ -768,7 +861,7 @@ def _tex_node(mat, name: str, tex_asset, sampler_type, x: int, y: int):
 
 def _time_scaled(mat, x: int, y: int, speed_default: float = 1.0):
     n_t = _mk(mat, unreal.MaterialExpressionTime, x - 320, y)
-    n_s = _scalar(mat, "AnimateSpeed", speed_default, x - 320, y + 110)
+    n_s = _mpc_param(mat, "AnimateSpeed", lambda: _scalar(mat, "AnimateSpeed", speed_default, x - 320, y + 110), x - 320, y + 110)
     n_m = _mk(mat, unreal.MaterialExpressionMultiply, x - 100, y + 30)
     mel.connect_material_expressions(n_t, "", n_m, "A")
     mel.connect_material_expressions(n_s, "", n_m, "B")
@@ -839,6 +932,11 @@ def build_single_material(slot_name: str, meta: dict):
         tex = import_texture(pe.get("filename", ""), is_srgb=is_srgb, is_normal=False)
         stype = unreal.MaterialSamplerType.SAMPLERTYPE_COLOR if is_srgb else unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR
         tn = _tex_node(mat, "_".join(sorted(types_present)) or "Packed", tex, stype, -1280, y_cur)
+        uv_idx = int(pe.get("uv_index", 0) or 0)
+        if uv_idx > 0:
+            n_uv = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -1500, y_cur)
+            n_uv.set_editor_property("coordinate_index", uv_idx)
+            mel.connect_material_expressions(n_uv, "", tn, "UVs")
         y_cur += 260
         r_t = packing.get("R", "").split(".")[0]
         g_t = packing.get("G", "").split(".")[0]
@@ -882,6 +980,277 @@ def build_single_material(slot_name: str, meta: dict):
             sockets["Normal_RGB"] = (tn, "RGB")
 
     # ------------------------------------------------------------------
+    # HFW DXIL 8-LAYER CHARACTER OUTFIT & BUILDING BLOCK TILEABLE SHADER
+    # ------------------------------------------------------------------
+    layered = meta.get("outfit_layered")
+    if layered and layered.get("layers"):
+        layers = layered["layers"][:8]
+        is_bb = layered.get("mode") == "building_block"
+        uv_scale = float(layered.get("uv_scale", 4.0 if is_bb else 16.0))
+        n_uv = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -1800, -320)
+        n_uv.set_editor_property("u_tiling", uv_scale)
+        n_uv.set_editor_property("v_tiling", uv_scale)
+
+        l_cols, l_mets, l_rghs, l_nrms = [], [], [], []
+        t_hint = str(layered.get("tribe_hint", "")).lower()
+        macro_col_file = layered.get("macro_color_file", "")
+        macro_col_mode = layered.get("macro_color_mode", "replace")
+        use_macro_col = bool(macro_col_file)
+        replace_with_macro = use_macro_col and macro_col_mode != "multiply2"
+        nrm_tex_cache = {{}}
+
+        def _layer_rgh_range(lname, lcat, is_m):
+            nl = f"{{lcat}}/{{lname}}".lower()
+            if is_m or any(k in nl for k in ("robotplate", "iron", "steel", "copper", "bronze", "brass", "gold", "anodized", "metal")):
+                return (0.16, 0.44)
+            if any(k in nl for k in ("bead", "shell", "nacre", "pearl", "ceramic", "porcelain", "jade", "turquoise")):
+                return (0.18, 0.46)
+            if any(k in nl for k in ("buckskin", "suede", "nubuck")):
+                return (0.54, 0.78)
+            if any(k in nl for k in ("leather", "hide", "fish")):
+                return (0.34, 0.68)
+            if any(k in nl for k in ("carbon", "rubber")):
+                return (0.32, 0.64)
+            if any(k in nl for k in ("silk", "satin")):
+                return (0.42, 0.68)
+            if any(k in nl for k in ("wool", "cotton", "linen", "crochet", "cloth", "fabric", "braid", "felt")):
+                return (0.66, 0.88)
+            return (0.44, 0.76)
+
+        def _layer_tint_lin(lname, lcat, l_idx):
+            nl = f"{{lcat}}/{{lname}}".lower()
+            if "bronze" in nl or "brass" in nl or "gold" in nl:
+                srgb = [0.76, 0.56, 0.28]
+            elif "copper" in nl:
+                srgb = [0.78, 0.44, 0.28]
+            elif any(k in nl for k in ("robotplate", "iron", "metal", "steel", "anodized")):
+                srgb = [0.58, 0.60, 0.62]
+            elif "carbon" in nl or "rubber" in nl:
+                srgb = [0.14, 0.15, 0.17]
+            elif "fullgrain" in nl:
+                srgb = [0.33, 0.27, 0.20]
+            elif "finegrain" in nl or "nubuck" in nl:
+                srgb = [0.45, 0.34, 0.24]
+            elif "buckskin" in nl or "suede" in nl:
+                srgb = [0.58, 0.44, 0.28]
+            elif "leather" in nl:
+                srgb = [0.38, 0.24, 0.18]
+            elif any(k in nl for k in ("wood", "bark", "bone")):
+                srgb = [0.50, 0.38, 0.26]
+            elif "carja" in t_hint:
+                srgb = [0.78, 0.60, 0.10] if l_idx % 2 == 0 else [0.55, 0.30, 0.22]
+            elif "quen" in t_hint or "seyka" in t_hint:
+                srgb = [0.62, 0.72, 0.78] if l_idx % 2 == 0 else [0.86, 0.62, 0.50]
+            elif "tenakth" in t_hint:
+                srgb = [0.20, 0.42, 0.52] if l_idx % 2 == 0 else [0.58, 0.22, 0.16]
+            elif "utaru" in t_hint:
+                srgb = [0.36, 0.48, 0.32] if l_idx % 2 == 0 else [0.66, 0.60, 0.46]
+            else:
+                srgb = [0.22, 0.40, 0.57] if l_idx % 2 == 1 else [0.58, 0.54, 0.48]
+            return [c ** 2.2 for c in srgb]
+
+        n_flat_xy = _mk(mat, unreal.MaterialExpressionConstant2Vector, -1560, 2900)
+        n_flat_xy.set_editor_property("r", 0.5)
+        n_flat_xy.set_editor_property("g", 0.5)
+
+        for idx, lay in enumerate(layers):
+            lname = _safe(lay.get("name", f"Layer{{idx}}"))
+            is_m = bool(lay.get("is_metallic", False))
+            if is_bb:
+                c_tex = import_texture(lay.get("color_file", ""), is_srgb=True, is_normal=False)
+                if c_tex:
+                    cn = _tex_node(mat, f"BB_L{{idx}}_{{lname}}", c_tex, unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, -1340, -480 + idx * 240)
+                    mel.connect_material_expressions(n_uv, "", cn, "UVs")
+                    l_cols.append((cn, "RGB"))
+                else:
+                    l_cols.append((_vec(mat, f"BB_L{{idx}}_{{lname}}", [0.22, 0.21, 0.19], -1340, -480 + idx * 240), ""))
+                l_mets.append((_const(mat, 0.75 if is_m else 0.0, -1340, 1400 + idx * 90), ""))
+                l_rghs.append((_const(mat, 0.42 if is_m else 0.78, -1340, 2200 + idx * 90), ""))
+                l_nrms.append((n_flat_xy, ""))
+            else:
+                dye_lin = lay.get("dye_color_linear") or _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
+                tint_v = _vec(mat, f"L{{idx}}_{{lname}}_Dye", dye_lin, -1560, -560 + idx * 260)
+                # CRITICAL: HFW `Shaders_HRZ2/Materials/*_CLR` is Linear `0.5`-centered (`is_srgb=False`) -> pow(2.0 * tex, 2.2) * Dye!
+                c_tex = import_texture(lay.get("color_file", ""), is_srgb=False, is_normal=False)
+                if c_tex:
+                    cn = _tex_node(mat, f"L{{idx}}_{{lname}}_Detail", c_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1560, -440 + idx * 260)
+                    mel.connect_material_expressions(n_uv, "", cn, "UVs")
+                    n_x2 = _mk(mat, unreal.MaterialExpressionMultiply, -1300, -440 + idx * 260)
+                    n_x2.set_editor_property("const_b", 2.0)
+                    mel.connect_material_expressions(cn, "RGB", n_x2, "A")
+                    n_pw = _mk(mat, unreal.MaterialExpressionPower, -1140, -440 + idx * 260)
+                    n_pw.set_editor_property("const_exponent", 2.2)
+                    mel.connect_material_expressions(n_x2, "", n_pw, "Base")
+                    if replace_with_macro:
+                        l_cols.append((n_pw, ""))
+                    else:
+                        tm = _mk(mat, unreal.MaterialExpressionMultiply, -980, -500 + idx * 260)
+                        mel.connect_material_expressions(tint_v, "", tm, "A")
+                        mel.connect_material_expressions(n_pw, "", tm, "B")
+                        l_cols.append((tm, ""))
+                else:
+                    l_cols.append((_const(mat, 1.0, -1300, -500 + idx * 260), "") if replace_with_macro else (tint_v, ""))
+                l_mets.append((_const(mat, 0.88 if is_m else 0.0, -1340, 1400 + idx * 90), ""))
+
+                # Sample per-layer 16x micro Normal/Roughness (`*_NMT_RGH_HGT.png`: RG=Normal, B=GLS Smoothness)!
+                lnf = lay.get("normal_file", "")
+                ln_node = None
+                if lnf:
+                    if lnf in nrm_tex_cache:
+                        ln_node = nrm_tex_cache[lnf]
+                    else:
+                        lt = import_texture(lnf, is_srgb=False, is_normal=False)
+                        if lt:
+                            ln_node = _tex_node(mat, f"L{{idx}}_{{lname}}_MicroNrmRgh", lt, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1560, 2100 + idx * 240)
+                            mel.connect_material_expressions(n_uv, "", ln_node, "UVs")
+                            nrm_tex_cache[lnf] = ln_node
+
+                r_lo, r_hi = _layer_rgh_range(lay.get("name", ""), lay.get("category", ""), is_m)
+                if ln_node is not None:
+                    n_lr = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -1240, 2120 + idx * 240)
+                    n_lr.set_editor_property("const_a", r_hi)
+                    n_lr.set_editor_property("const_b", r_lo)
+                    mel.connect_material_expressions(ln_node, "B", n_lr, "Alpha")
+                    l_rghs.append((n_lr, ""))
+                    n_lxy = _mk(mat, unreal.MaterialExpressionAppendVector, -1240, 2240 + idx * 240)
+                    mel.connect_material_expressions(ln_node, "R", n_lxy, "A")
+                    mel.connect_material_expressions(ln_node, "G", n_lxy, "B")
+                    l_nrms.append((n_lxy, ""))
+                else:
+                    l_rghs.append((_const(mat, float(lay.get("roughness", (r_lo + r_hi) * 0.5)), -1340, 2200 + idx * 90), ""))
+                    l_nrms.append((n_flat_xy, ""))
+
+        while len(l_cols) < 8:
+            pidx = len(l_cols) % max(1, len(layers))
+            l_cols.append(l_cols[pidx])
+            l_mets.append(l_mets[pidx])
+            l_rghs.append(l_rghs[pidx])
+            l_nrms.append(l_nrms[pidx])
+
+        msk_tex = import_texture(layered.get("mask_file", ""), is_srgb=False, is_normal=False) if layered.get("mask_file") else None
+        if msk_tex and len(layers) > 1:
+            t_msk = _tex_node(mat, "OutfitMaskRGB", msk_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1340, -960)
+            def _tri(arr, y_off):
+                def _lp(a, b, pin, x, y):
+                    n = _mk(mat, unreal.MaterialExpressionLinearInterpolate, x, y)
+                    mel.connect_material_expressions(a[0], a[1], n, "A")
+                    mel.connect_material_expressions(b[0], b[1], n, "B")
+                    mel.connect_material_expressions(t_msk, pin, n, "Alpha")
+                    return (n, "")
+                # Exact DXIL 8-corner cube order:
+                #   (0,0,0)=L0 Black, (1,0,0)=L1 Red, (0,1,0)=L2 Green, (1,1,0)=L6 Yellow,
+                #   (0,0,1)=L3 Blue,  (1,0,1)=L5 Mag, (0,1,1)=L4 Cyan,  (1,1,1)=L7 White
+                c_g0b0 = _lp(arr[0], arr[1], "R", -780, y_off)
+                c_g1b0 = _lp(arr[2], arr[6], "R", -780, y_off + 140)
+                c_g0b1 = _lp(arr[3], arr[5], "R", -780, y_off + 280)
+                c_g1b1 = _lp(arr[4], arr[7], "R", -780, y_off + 420)
+                c_b0 = _lp(c_g0b0, c_g1b0, "G", -540, y_off + 70)
+                c_b1 = _lp(c_g0b1, c_g1b1, "G", -540, y_off + 350)
+                return _lp(c_b0, c_b1, "B", -320, y_off + 210)
+            col_out = _tri(l_cols, -420)
+            met_out = _tri(l_mets, 320)
+            rgh_out = _tri(l_rghs, 920)
+            micro_xy_out = _tri(l_nrms, 2100) if nrm_tex_cache else None
+            if layered.get("mask_has_alpha"):
+                mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+                mat.set_editor_property("two_sided", True)
+                mel.connect_material_property(t_msk, "A", unreal.MaterialProperty.MP_OPACITY_MASK)
+        else:
+            col_out = l_cols[0]
+            met_out = l_mets[0]
+            rgh_out = l_rghs[0]
+            micro_xy_out = l_nrms[0] if nrm_tex_cache else None
+
+        # Hybrid Macro Color (e.g., SeykaTorso `multiply2` overlay over 8-corner DXIL dyes, or `replace` trim sheet)!
+        if use_macro_col:
+            mc_tex = import_texture(macro_col_file, is_srgb=True, is_normal=False)
+            if mc_tex:
+                t_mc = _tex_node(mat, "OutfitMacroColor", mc_tex, unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, -520, -760)
+                if macro_col_mode == "multiply2":
+                    n_mc2 = _mk(mat, unreal.MaterialExpressionMultiply, -340, -680)
+                    n_mc2.set_editor_property("const_b", 2.0)
+                    mel.connect_material_expressions(t_mc, "RGB", n_mc2, "A")
+                    n_mcm = _mk(mat, unreal.MaterialExpressionMultiply, -180, -480)
+                    mel.connect_material_expressions(col_out[0], col_out[1], n_mcm, "A")
+                    mel.connect_material_expressions(n_mc2, "", n_mcm, "B")
+                    n_mcs = _mk(mat, unreal.MaterialExpressionSaturate, -60, -480)
+                    mel.connect_material_expressions(n_mcm, "", n_mcs, "")
+                    col_out = (n_mcs, "")
+                else:
+                    n_mcm = _mk(mat, unreal.MaterialExpressionMultiply, -180, -480)
+                    mel.connect_material_expressions(t_mc, "RGB", n_mcm, "A")
+                    mel.connect_material_expressions(col_out[0], col_out[1], n_mcm, "B")
+                    col_out = (n_mcm, "")
+
+        # Optional *_MISC dirt/wear roughness lift!
+        misc_f = layered.get("misc_file", "")
+        if misc_f:
+            ms_tex = import_texture(misc_f, is_srgb=False, is_normal=False)
+            if ms_tex:
+                t_ms = _tex_node(mat, "OutfitMiscDirt", ms_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -520, 1260)
+                n_dm = _mk(mat, unreal.MaterialExpressionMultiply, -280, 1260)
+                n_dm.set_editor_property("const_b", 0.45)
+                mel.connect_material_expressions(t_ms, "G", n_dm, "A")
+                n_dr = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -120, 1080)
+                n_dr.set_editor_property("const_b", 0.88)
+                mel.connect_material_expressions(rgh_out[0], rgh_out[1], n_dr, "A")
+                mel.connect_material_expressions(n_dm, "", n_dr, "Alpha")
+                rgh_out = (n_dr, "")
+
+        mel.connect_material_property(met_out[0], met_out[1], unreal.MaterialProperty.MP_METALLIC)
+        mel.connect_material_property(rgh_out[0], rgh_out[1], unreal.MaterialProperty.MP_ROUGHNESS)
+
+        nrm_tex = import_texture(layered.get("normal_file", ""), is_srgb=False, is_normal=False) if layered.get("normal_file") else None
+        if nrm_tex:
+            t_nrm = _tex_node(mat, "OutfitNormalAO", nrm_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -920, 1520)
+            if micro_xy_out is not None:
+                # Tangent-space UDN addition: macro_xy + (micro_xy - 0.5) * 0.55!
+                n_mxy = _mk(mat, unreal.MaterialExpressionAppendVector, -680, 1520)
+                mel.connect_material_expressions(t_nrm, "R", n_mxy, "A")
+                mel.connect_material_expressions(t_nrm, "G", n_mxy, "B")
+                n_mc = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -680, 1700)
+                n_mc.set_editor_property("bias", -0.5)
+                n_mc.set_editor_property("scale", 0.55)
+                mel.connect_material_expressions(micro_xy_out[0], micro_xy_out[1], n_mc, "")
+                n_add = _mk(mat, unreal.MaterialExpressionAdd, -500, 1580)
+                mel.connect_material_expressions(n_mxy, "", n_add, "A")
+                mel.connect_material_expressions(n_mc, "", n_add, "B")
+                n_sat = _mk(mat, unreal.MaterialExpressionSaturate, -380, 1580)
+                mel.connect_material_expressions(n_add, "", n_sat, "")
+                n_cr = _mk(mat, unreal.MaterialExpressionComponentMask, -260, 1520)
+                n_cr.set_editor_property("r", True); n_cr.set_editor_property("g", False); n_cr.set_editor_property("b", False)
+                mel.connect_material_expressions(n_sat, "", n_cr, "")
+                n_cg = _mk(mat, unreal.MaterialExpressionComponentMask, -260, 1620)
+                n_cg.set_editor_property("r", False); n_cg.set_editor_property("g", True); n_cg.set_editor_property("b", False)
+                mel.connect_material_expressions(n_sat, "", n_cg, "")
+                n_nrm = _reconstruct_normal_z(mat, n_cr, "", n_cg, "", -100, 1560)
+            else:
+                n_nrm = _reconstruct_normal_z(mat, t_nrm, "R", t_nrm, "G", -420, 1520)
+            mel.connect_material_property(n_nrm, "", unreal.MaterialProperty.MP_NORMAL)
+            npack = layered.get("normal_packing") or {{}}
+            if any(v.startswith("AO") for v in npack.values()):
+                n_ao = _mk(mat, unreal.MaterialExpressionMultiply, -180, -210)
+                mel.connect_material_expressions(col_out[0], col_out[1], n_ao, "A")
+                mel.connect_material_expressions(t_nrm, "B", n_ao, "B")
+                col_out = (n_ao, "")
+                mel.connect_material_property(t_nrm, "B", unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
+            # 2K Curvature (NMT_AO_CRV.A) edge highlight & cavity contrast (`0.78..1.24`)!
+            if any("Curvature" in v for v in npack.values()):
+                n_crv = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -240, -60)
+                n_crv.set_editor_property("const_a", 0.78)
+                n_crv.set_editor_property("const_b", 1.24)
+                mel.connect_material_expressions(t_nrm, "A", n_crv, "Alpha")
+                n_cmul = _mk(mat, unreal.MaterialExpressionMultiply, -40, -140)
+                mel.connect_material_expressions(col_out[0], col_out[1], n_cmul, "A")
+                mel.connect_material_expressions(n_crv, "", n_cmul, "B")
+                col_out = (n_cmul, "")
+
+        mel.connect_material_property(col_out[0], col_out[1], unreal.MaterialProperty.MP_BASE_COLOR)
+        mel.recompile_material(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+        return mat
+
+    # ------------------------------------------------------------------
     # SPECIALIZED ANIMATED SHADERS (Muscles, Cores, Eyes, Canisters, VFX)
     # ------------------------------------------------------------------
     if spec:
@@ -900,12 +1269,28 @@ def build_single_material(slot_name: str, meta: dict):
 
         if skind == "canister_glass":
             mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
-            n_tc = _vec(mat, "GlassTint", spec.get("tint_color", [0.80, 0.92, 0.91]), -400, -100)
-            n_al = _scalar(mat, "GlassOpacity", float(spec.get("alpha", 0.25)), -400, 80)
-            n_rg = _scalar(mat, "GlassRoughness", 0.08, -400, 200)
+            try:
+                mat.set_editor_property("translucency_lighting_mode", unreal.TranslucencyLightingMode.TLM_SURFACE)
+            except Exception:
+                pass
+            n_tc = _vec(mat, "GlassTint", spec.get("tint_color", [0.80, 0.92, 0.91]), -540, -180)
+            n_rg = _scalar(mat, "GlassRoughness", 0.05, -540, -20)
+            n_sp = _scalar(mat, "GlassSpecular", 0.85, -540, 80)
+            n_fr = _mk(mat, unreal.MaterialExpressionFresnel, -540, 220)
+            n_fr.set_editor_property("exponent", 3.0)
+            n_op = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -260, 180)
+            n_op.set_editor_property("const_a", 0.14)
+            n_op.set_editor_property("const_b", 0.68)
+            mel.connect_material_expressions(n_fr, "", n_op, "Alpha")
+            n_rf = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -260, 340)
+            n_rf.set_editor_property("const_a", 1.0)
+            n_rf.set_editor_property("const_b", float(spec.get("ior", 1.45)))
+            mel.connect_material_expressions(n_fr, "", n_rf, "Alpha")
             mel.connect_material_property(n_tc, "", unreal.MaterialProperty.MP_BASE_COLOR)
-            mel.connect_material_property(n_al, "", unreal.MaterialProperty.MP_OPACITY)
             mel.connect_material_property(n_rg, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            mel.connect_material_property(n_sp, "", unreal.MaterialProperty.MP_SPECULAR)
+            mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+            mel.connect_material_property(n_rf, "", unreal.MaterialProperty.MP_REFRACTION)
             mel.recompile_material(mat)
             unreal.EditorAssetLibrary.save_loaded_asset(mat)
             return mat
@@ -913,6 +1298,7 @@ def build_single_material(slot_name: str, meta: dict):
         if skind == "muscle_fiber_overlay":
             mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
             mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+            mat.set_editor_property("two_sided", True)
             n_t = _time_scaled(mat, -1000, 200)
             n_uv1 = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -1260, 0)
             n_uv1.set_editor_property("coordinate_index", 1)
@@ -926,47 +1312,84 @@ def build_single_material(slot_name: str, meta: dict):
             ramp_tex = import_texture(spec.get("ramp_file", ""), is_srgb=False)
             n_rmp = _tex_node(mat, "MuscleFiberRamp", ramp_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -680, 0)
             mel.connect_material_expressions(n_pan, "", n_rmp, "UVs")
+            n_b_scl = _mk(mat, unreal.MaterialExpressionMultiply, -540, -20)
+            n_b_scl.set_editor_property("const_b", 0.42)
+            mel.connect_material_expressions(n_rmp, "B", n_b_scl, "A")
             n_wadd = _mk(mat, unreal.MaterialExpressionAdd, -420, 40)
-            mel.connect_material_expressions(n_rmp, "B", n_wadd, "A")
+            mel.connect_material_expressions(n_b_scl, "", n_wadd, "A")
             mel.connect_material_expressions(n_rmp, "A", n_wadd, "B")
-            n_wsat = _mk(mat, unreal.MaterialExpressionSaturate, -280, 40)
+            n_wsat = _mk(mat, unreal.MaterialExpressionSaturate, -300, 40)
             mel.connect_material_expressions(n_wadd, "", n_wsat, "")
+            # Authentic DXIL sparse wave contrast (0.12..1.0) + center-facing Fresnel edge falloff (dark rims!)
+            n_wfl = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -180, 40)
+            n_wfl.set_editor_property("const_a", 0.12)
+            n_wfl.set_editor_property("const_b", 1.0)
+            mel.connect_material_expressions(n_wsat, "", n_wfl, "Alpha")
 
-            # Color blend: Calm Amber -> Electric Plasma Violet
-            n_cc = _vec(mat, "CalmColor", spec.get("calm_color", [0.95, 0.24, 0.02]), -720, -340)
-            n_pc = _vec(mat, "PlasmaColor", spec.get("plasma_color", [0.46, 0.05, 1.0]), -720, -180)
-            n_cs = _scalar(mat, "ChargeState", float(spec.get("charge_state", 0.0)), -720, -40)
+            n_fr = _mk(mat, unreal.MaterialExpressionFresnel, -540, 200)
+            n_fr.set_editor_property("exponent", 1.6)
+            n_cf = _mk(mat, unreal.MaterialExpressionOneMinus, -360, 200)
+            mel.connect_material_expressions(n_fr, "", n_cf, "")
+            n_cfp = _mk(mat, unreal.MaterialExpressionPower, -220, 200)
+            n_cfp.set_editor_property("const_exponent", 1.75)
+            mel.connect_material_expressions(n_cf, "", n_cfp, "Base")
+
+            n_heat = _mk(mat, unreal.MaterialExpressionMultiply, -40, 120)
+            mel.connect_material_expressions(n_wfl, "", n_heat, "A")
+            mel.connect_material_expressions(n_cfp, "", n_heat, "B")
+
+            # Color blend driven by MPC_HFW_MachineControl + 3-tier Ember -> MuscleColor -> HotCore gradient!
+            n_cc = _mpc_param(mat, "MuscleColor", lambda: _vec(mat, "CalmColor", spec.get("calm_color", [0.95, 0.28, 0.02]), -720, -340), -720, -340)
+            n_pc = _mpc_param(mat, "PlasmaColor", lambda: _vec(mat, "PlasmaColor", spec.get("plasma_color", [0.46, 0.05, 1.0]), -720, -180), -720, -180)
+            c_state_def = float(spec.get("charge_state", 0.0))
+            n_cs = _mpc_param(mat, "PlasmaCharge", lambda: _scalar(mat, "ChargeState", c_state_def, -720, -40), -720, -40) if c_state_def >= 0.5 else _scalar(mat, "ChargeState", 0.0, -720, -40)
             n_lerp = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -420, -240)
             mel.connect_material_expressions(n_cc, "", n_lerp, "A")
             mel.connect_material_expressions(n_pc, "", n_lerp, "B")
             mel.connect_material_expressions(n_cs, "", n_lerp, "Alpha")
 
-            n_str = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 3.4)), -420, 220)
-            n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, -180, -80)
-            mel.connect_material_expressions(n_lerp, "", n_m1, "A")
-            mel.connect_material_expressions(n_wsat, "", n_m1, "B")
-            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, -40, 0)
+            n_emb = _mk(mat, unreal.MaterialExpressionPower, -240, -340)
+            n_emb.set_editor_property("const_exponent", 2.2)
+            mel.connect_material_expressions(n_lerp, "", n_emb, "Base")
+            n_emb_d = _mk(mat, unreal.MaterialExpressionMultiply, -120, -340)
+            n_emb_d.set_editor_property("const_b", 0.40)
+            mel.connect_material_expressions(n_emb, "", n_emb_d, "A")
+            n_grad = _mk(mat, unreal.MaterialExpressionLinearInterpolate, 20, -240)
+            mel.connect_material_expressions(n_emb_d, "", n_grad, "A")
+            mel.connect_material_expressions(n_lerp, "", n_grad, "B")
+            mel.connect_material_expressions(n_heat, "", n_grad, "Alpha")
+
+            n_str_base = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 2.6)), -620, 320)
+            n_str_sc = _mpc_param(mat, "MuscleGlowScale", lambda: _scalar(mat, "MuscleGlowScale", 1.0, -620, 420), -620, 420)
+            n_str = _mk(mat, unreal.MaterialExpressionMultiply, -400, 340)
+            mel.connect_material_expressions(n_str_base, "", n_str, "A")
+            mel.connect_material_expressions(n_str_sc, "", n_str, "B")
+
+            n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, 140, -60)
+            mel.connect_material_expressions(n_grad, "", n_m1, "A")
+            mel.connect_material_expressions(n_heat, "", n_m1, "B")
+            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, 260, 0)
             mel.connect_material_expressions(n_m1, "", n_m2, "A")
             mel.connect_material_expressions(n_str, "", n_m2, "B")
             if "Mask_Alpha" in sockets:
-                # Smooth BC7-noise-free cavity fade (`saturate(Mask_Alpha * 11.0) * 0.84 + 0.16`)
-                n_ma = _mk(mat, unreal.MaterialExpressionMultiply, -420, 340)
-                n_ma.set_editor_property("const_b", 11.0)
+                # Exact DXIL L434 `saturate(Mask_Alpha * 40.0)` with 0.28..1.0 cavity gradient!
+                n_ma = _mk(mat, unreal.MaterialExpressionMultiply, -420, 480)
+                n_ma.set_editor_property("const_b", 40.0)
                 mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_ma, "A")
-                n_masat = _mk(mat, unreal.MaterialExpressionSaturate, -260, 340)
+                n_masat = _mk(mat, unreal.MaterialExpressionSaturate, -260, 480)
                 mel.connect_material_expressions(n_ma, "", n_masat, "")
-                n_malerp = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -100, 340)
-                n_malerp.set_editor_property("const_a", 0.16)
+                n_malerp = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -100, 480)
+                n_malerp.set_editor_property("const_a", 0.28)
                 n_malerp.set_editor_property("const_b", 1.0)
                 mel.connect_material_expressions(n_masat, "", n_malerp, "Alpha")
-                n_m3 = _mk(mat, unreal.MaterialExpressionMultiply, 100, 60)
+                n_m3 = _mk(mat, unreal.MaterialExpressionMultiply, 380, 80)
                 mel.connect_material_expressions(n_m2, "", n_m3, "A")
                 mel.connect_material_expressions(n_malerp, "", n_m3, "B")
                 n_m2 = n_m3
             mel.connect_material_property(n_m2, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
             # Subtle +0.14cm WorldPositionOffset along VertexNormalWS to prevent coplanar z-fighting in UE5!
-            n_vn = _mk(mat, unreal.MaterialExpressionVertexNormalWS, -340, 540)
-            n_wpo = _mk(mat, unreal.MaterialExpressionMultiply, -100, 540)
+            n_vn = _mk(mat, unreal.MaterialExpressionVertexNormalWS, -340, 580)
+            n_wpo = _mk(mat, unreal.MaterialExpressionMultiply, -100, 580)
             n_wpo.set_editor_property("const_b", 0.14)
             mel.connect_material_expressions(n_vn, "", n_wpo, "A")
             mel.connect_material_property(n_wpo, "", unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
@@ -1001,16 +1424,34 @@ def build_single_material(slot_name: str, meta: dict):
             n_pl = _tex_node(mat, "MusclePulse", pl_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -680, 340)
             mel.connect_material_expressions(n_pan, "", n_pl, "UVs")
 
-            n_gc = _vec(mat, "GlowColor", spec.get("glow_color", [0.0, 0.231, 1.0]), -680, 620)
-            n_gs = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 6.0)), -680, 780)
+            n_gc = _mpc_param(mat, "MuscleColor", lambda: _vec(mat, "GlowColor", spec.get("glow_color", [0.95, 0.28, 0.02]), -680, 620), -680, 620)
+            n_gs_b = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 3.0)), -680, 760)
+            n_gs_s = _mpc_param(mat, "MuscleGlowScale", lambda: _scalar(mat, "MuscleGlowScale", 1.0, -680, 860), -680, 860)
+            n_gs = _mk(mat, unreal.MaterialExpressionMultiply, -440, 780)
+            mel.connect_material_expressions(n_gs_b, "", n_gs, "A")
+            mel.connect_material_expressions(n_gs_s, "", n_gs, "B")
+            n_fr_c = _mk(mat, unreal.MaterialExpressionFresnel, -680, 120)
+            n_fr_c.set_editor_property("exponent", 1.6)
+            n_cf_c = _mk(mat, unreal.MaterialExpressionOneMinus, -520, 120)
+            mel.connect_material_expressions(n_fr_c, "", n_cf_c, "")
             n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, -400, 260)
             mel.connect_material_expressions(n_br, "B", n_m1, "A")
             mel.connect_material_expressions(n_pl, "R", n_m1, "B")
-            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, -220, 440)
-            mel.connect_material_expressions(n_gc, "", n_m2, "A")
+            n_heat_c = _mk(mat, unreal.MaterialExpressionMultiply, -260, 220)
+            mel.connect_material_expressions(n_m1, "", n_heat_c, "A")
+            mel.connect_material_expressions(n_cf_c, "", n_heat_c, "B")
+            n_emb_c = _mk(mat, unreal.MaterialExpressionPower, -420, 560)
+            n_emb_c.set_editor_property("const_exponent", 2.2)
+            mel.connect_material_expressions(n_gc, "", n_emb_c, "Base")
+            n_grad_c = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -220, 480)
+            mel.connect_material_expressions(n_emb_c, "", n_grad_c, "A")
+            mel.connect_material_expressions(n_gc, "", n_grad_c, "B")
+            mel.connect_material_expressions(n_heat_c, "", n_grad_c, "Alpha")
+            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, -80, 440)
+            mel.connect_material_expressions(n_grad_c, "", n_m2, "A")
             mel.connect_material_expressions(n_gs, "", n_m2, "B")
-            n_m3 = _mk(mat, unreal.MaterialExpressionMultiply, -40, 360)
-            mel.connect_material_expressions(n_m1, "", n_m3, "A")
+            n_m3 = _mk(mat, unreal.MaterialExpressionMultiply, 80, 360)
+            mel.connect_material_expressions(n_heat_c, "", n_m3, "A")
             mel.connect_material_expressions(n_m2, "", n_m3, "B")
             mel.connect_material_property(n_m3, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
             mel.recompile_material(mat)
@@ -1065,8 +1506,31 @@ def build_single_material(slot_name: str, meta: dict):
 
         if skind in ("machine_eye_glow", "canister_glow_core"):
             n_t = _time_scaled(mat, -960, 160)
-            n_gc = _vec(mat, "GlowColor", spec.get("glow_color", [0.05, 0.52, 1.0]), -580, -80)
-            n_gs = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 7.0)), -580, 320)
+            if skind == "machine_eye_glow":
+                n_ec = _mpc_param(mat, "EyeColor", lambda: _vec(mat, "GlowColor", spec.get("glow_color", [0.04, 0.56, 1.0]), -760, -140), -760, -140)
+                n_ea = _mpc_param(mat, "EyeAlertColor", lambda: _vec(mat, "AlertColor", spec.get("alert_color", [1.0, 0.08, 0.01]), -760, -20), -760, -20)
+                n_as = _mpc_param(mat, "EyeAlertState", lambda: _scalar(mat, "AlertState", 0.0, -760, 100), -760, 100)
+                n_gc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -460, -80)
+                mel.connect_material_expressions(n_ec, "", n_gc, "A")
+                mel.connect_material_expressions(n_ea, "", n_gc, "B")
+                mel.connect_material_expressions(n_as, "", n_gc, "Alpha")
+                n_gs_b = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 9.0)), -760, 320)
+                n_gs_s = _mpc_param(mat, "EyeGlowScale", lambda: _scalar(mat, "EyeGlowScale", 1.0, -760, 420), -760, 420)
+            else:
+                n_lc0 = _vec(mat, "NativeLiquidColor", spec.get("glow_color", [0.05, 0.48, 1.0]), -780, -140)
+                n_lco = _mpc_param(mat, "LiquidOverrideColor", lambda: _vec(mat, "LiquidOverrideColor", [0.08, 0.62, 1.0], -780, -20), -780, -20)
+                n_lcm = _mpc_param(mat, "LiquidOverrideMix", lambda: _scalar(mat, "LiquidOverrideMix", 0.0, -780, 100), -780, 100)
+                n_gc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -460, -80)
+                mel.connect_material_expressions(n_lc0, "", n_gc, "A")
+                mel.connect_material_expressions(n_lco, "", n_gc, "B")
+                mel.connect_material_expressions(n_lcm, "", n_gc, "Alpha")
+                n_gs_b = _scalar(mat, "GlowStrength", float(spec.get("glow_strength", 6.8)), -760, 320)
+                n_gs_s = _mpc_param(mat, "LiquidGlowScale", lambda: _scalar(mat, "LiquidGlowScale", 1.0, -760, 420), -760, 420)
+                n_rg = _scalar(mat, "LiquidRoughness", 0.08, -420, -340)
+                mel.connect_material_property(n_rg, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            n_gs = _mk(mat, unreal.MaterialExpressionMultiply, -520, 340)
+            mel.connect_material_expressions(n_gs_b, "", n_gs, "A")
+            mel.connect_material_expressions(n_gs_s, "", n_gs, "B")
             n_sin = _mk(mat, unreal.MaterialExpressionSine, -720, 160)
             n_sin.set_editor_property("period", 2.0 if skind == "canister_glow_core" else 2.5)
             mel.connect_material_expressions(n_t, "", n_sin, "")
@@ -1108,7 +1572,56 @@ def build_single_material(slot_name: str, meta: dict):
     # ------------------------------------------------------------------
     # STANDARD DECIMA PBR + ANIMATED OVERLAYS (Sacks, Canisters, Eyes!)
     # ------------------------------------------------------------------
-    if "Reflectance" in sockets:
+    sprof = meta.get("surface_profile", "pbr")
+    base_color_expr = sockets.get("Color")
+    if sprof == "skin" and meta.get("uses_skin_lut") and base_color_expr is not None:
+        # Exact DXIL Skin Tone LUT Reconstruction (`4.5948 * SkinTone_linear * Head_CLR_linear`)!
+        st_lin = meta.get("skin_tone_linear") or [0.453, 0.246, 0.209]
+        n_st = _vec(mat, "SkinTone", st_lin, -760, -440)
+        n_sb = _scalar(mat, "SkinBrightness", 1.0, -760, -320)
+        n_exp = _mk(mat, unreal.MaterialExpressionMultiply, -540, -240)
+        n_exp.set_editor_property("const_b", 4.5948)
+        mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_exp, "A")
+        n_st_b = _mk(mat, unreal.MaterialExpressionMultiply, -540, -400)
+        mel.connect_material_expressions(n_st, "", n_st_b, "A")
+        mel.connect_material_expressions(n_sb, "", n_st_b, "B")
+        n_sk_col = _mk(mat, unreal.MaterialExpressionMultiply, -360, -320)
+        mel.connect_material_expressions(n_st_b, "", n_sk_col, "A")
+        mel.connect_material_expressions(n_exp, "", n_sk_col, "B")
+        n_sk_sat = _mk(mat, unreal.MaterialExpressionSaturate, -240, -320)
+        mel.connect_material_expressions(n_sk_col, "", n_sk_sat, "")
+        base_color_expr = (n_sk_sat, "")
+    elif sprof in ("hair", "hair_face") and base_color_expr is None:
+        hc_lin = meta.get("hair_color_linear") or [0.045, 0.032, 0.025]
+        n_hc = _vec(mat, "HairColor", hc_lin, -540, -280)
+        base_color_expr = (n_hc, "")
+    elif sprof in ("rock_volcanic", "rock_tint") and base_color_expr is not None:
+        # HFW landscape rock `_TNT` textures are 2-channel Linear RG Tint/Blend maps (`B == 0`)!
+        if sprof == "rock_volcanic":
+            c_dark, c_mid, c_dust, dust_w = [0.022, 0.021, 0.024], [0.072, 0.068, 0.066], [0.135, 0.115, 0.098], 0.42
+        else:
+            c_dark, c_mid, c_dust, dust_w = [0.085, 0.070, 0.058], [0.245, 0.195, 0.155], [0.175, 0.160, 0.118], 0.35
+        n_rk_r = _mk(mat, unreal.MaterialExpressionComponentMask, -640, -300)
+        n_rk_r.set_editor_property("r", True); n_rk_r.set_editor_property("g", False); n_rk_r.set_editor_property("b", False)
+        mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_rk_r, "")
+        n_rk_g = _mk(mat, unreal.MaterialExpressionComponentMask, -640, -180)
+        n_rk_g.set_editor_property("r", False); n_rk_g.set_editor_property("g", True); n_rk_g.set_editor_property("b", False)
+        mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_rk_g, "")
+        n_rk_l1 = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -420, -280)
+        mel.connect_material_expressions(_vec(mat, "RockDark", c_dark, -640, -460), "", n_rk_l1, "A")
+        mel.connect_material_expressions(_vec(mat, "RockMid", c_mid, -640, -380), "", n_rk_l1, "B")
+        mel.connect_material_expressions(n_rk_r, "", n_rk_l1, "Alpha")
+        n_gmul = _mk(mat, unreal.MaterialExpressionMultiply, -440, -140)
+        n_gmul.set_editor_property("const_b", dust_w)
+        mel.connect_material_expressions(n_rk_g, "", n_gmul, "A")
+        n_rk_l2 = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -260, -240)
+        mel.connect_material_expressions(n_rk_l1, "", n_rk_l2, "A")
+        mel.connect_material_expressions(_vec(mat, "RockWeathering", c_dust, -440, -40), "", n_rk_l2, "B")
+        mel.connect_material_expressions(n_gmul, "", n_rk_l2, "Alpha")
+        base_color_expr = (n_rk_l2, "")
+
+    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "snow", "rock_volcanic", "rock_tint")
+    if "Reflectance" in sockets and sprof not in _DIELECTRIC_PROFILES:
         rfl_n, rfl_ch = sockets["Reflectance"]
         n_bias = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -620, 260)
         n_bias.set_editor_property("bias", -0.32)
@@ -1121,27 +1634,91 @@ def build_single_material(slot_name: str, meta: dict):
         n_f0 = _mk(mat, unreal.MaterialExpressionMultiply, -620, 100)
         mel.connect_material_expressions(rfl_n, rfl_ch, n_f0, "A")
         mel.connect_material_expressions(rfl_n, rfl_ch, n_f0, "B")
-        if "Color" in sockets:
-            n_bc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -240, -180)
-            mel.connect_material_expressions(sockets["Color"][0], sockets["Color"][1], n_bc, "A")
+        if base_color_expr is not None:
+            n_bc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -140, -180)
+            mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_bc, "A")
             mel.connect_material_expressions(n_f0, "", n_bc, "B")
             mel.connect_material_expressions(n_met, "", n_bc, "Alpha")
             mel.connect_material_property(n_bc, "", unreal.MaterialProperty.MP_BASE_COLOR)
-    elif "Color" in sockets:
-        mel.connect_material_property(sockets["Color"][0], sockets["Color"][1], unreal.MaterialProperty.MP_BASE_COLOR)
+    else:
+        if sprof in _DIELECTRIC_PROFILES:
+            # Dielectric hair/skin/rock NEVER treat Reflectance (e.g. Aloy hair `181:1.R` sheen mask) as Metallic!
+            mel.connect_material_property(_const(mat, 0.0, -400, 260), "", unreal.MaterialProperty.MP_METALLIC)
+            if sprof in ("hair", "hair_face") and "Reflectance" in sockets:
+                n_hsp = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -400, 140)
+                n_hsp.set_editor_property("const_a", 0.42)
+                n_hsp.set_editor_property("const_b", 0.72)
+                mel.connect_material_expressions(sockets["Reflectance"][0], sockets["Reflectance"][1], n_hsp, "Alpha")
+                mel.connect_material_property(n_hsp, "", unreal.MaterialProperty.MP_SPECULAR)
+        if base_color_expr is not None:
+            mel.connect_material_property(base_color_expr[0], base_color_expr[1], unreal.MaterialProperty.MP_BASE_COLOR)
+        elif sprof == "snow":
+            n_sn = _vec(mat, "SnowAlbedo", [0.78, 0.84, 0.92], -260, -180)
+            mel.connect_material_property(n_sn, "", unreal.MaterialProperty.MP_BASE_COLOR)
 
     if "Roughness" in sockets:
-        n_inv = _mk(mat, unreal.MaterialExpressionOneMinus, -460, -40)
-        mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_inv, "")
-        mel.connect_material_property(n_inv, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        if sprof in ("rock_volcanic", "rock_tint"):
+            # DXIL `8490:1` dry porous basalt roughness cap (`0.66..0.92`, zero wet-plastic shine!)
+            n_rr = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -460, -40)
+            n_rr.set_editor_property("const_a", 0.92)
+            n_rr.set_editor_property("const_b", 0.66)
+            mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_rr, "Alpha")
+            mel.connect_material_property(n_rr, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        elif sprof in ("hair", "hair_face"):
+            # Natural silky hair roughness (`0.38..0.56`) from `181:1.G`!
+            n_hr = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -460, -40)
+            n_hr.set_editor_property("const_a", 0.56)
+            n_hr.set_editor_property("const_b", 0.38)
+            mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_hr, "Alpha")
+            mel.connect_material_property(n_hr, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        else:
+            n_inv = _mk(mat, unreal.MaterialExpressionOneMinus, -460, -40)
+            mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_inv, "")
+            mel.connect_material_property(n_inv, "", unreal.MaterialProperty.MP_ROUGHNESS)
 
     if "AO" in sockets:
         mel.connect_material_property(sockets["AO"][0], sockets["AO"][1], unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
 
+    det_nrm_f = meta.get("asset_detail_normal_file", "")
+    det_nrm_node = None
+    if det_nrm_f:
+        dnt = import_texture(det_nrm_f, is_srgb=False, is_normal=False)
+        if dnt:
+            n_duv = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -980, 620)
+            n_duv.set_editor_property("u_tiling", 8.0)
+            n_duv.set_editor_property("v_tiling", 8.0)
+            det_nrm_node = _tex_node(mat, "AssetDetailNormal8x", dnt, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -740, 620)
+            mel.connect_material_expressions(n_duv, "", det_nrm_node, "UVs")
+
     if "Normal_RGB" in sockets:
         mel.connect_material_property(sockets["Normal_RGB"][0], sockets["Normal_RGB"][1], unreal.MaterialProperty.MP_NORMAL)
     elif "Normal.R" in sockets and "Normal.G" in sockets:
-        n_dz = _reconstruct_normal_z(mat, sockets["Normal.R"][0], sockets["Normal.R"][1], sockets["Normal.G"][0], sockets["Normal.G"][1], -320, 480)
+        if det_nrm_node is not None:
+            # Blend 8x basalt/asset micro-detail normal XY onto 4K macro normal XY via UDN addition!
+            n_mxy = _mk(mat, unreal.MaterialExpressionAppendVector, -540, 460)
+            mel.connect_material_expressions(sockets["Normal.R"][0], sockets["Normal.R"][1], n_mxy, "A")
+            mel.connect_material_expressions(sockets["Normal.G"][0], sockets["Normal.G"][1], n_mxy, "B")
+            n_dxy = _mk(mat, unreal.MaterialExpressionAppendVector, -540, 600)
+            mel.connect_material_expressions(det_nrm_node, "R", n_dxy, "A")
+            mel.connect_material_expressions(det_nrm_node, "G", n_dxy, "B")
+            n_dc = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -400, 600)
+            n_dc.set_editor_property("bias", -0.5)
+            n_dc.set_editor_property("scale", 0.55)
+            mel.connect_material_expressions(n_dxy, "", n_dc, "")
+            n_ad = _mk(mat, unreal.MaterialExpressionAdd, -260, 500)
+            mel.connect_material_expressions(n_mxy, "", n_ad, "A")
+            mel.connect_material_expressions(n_dc, "", n_ad, "B")
+            n_st = _mk(mat, unreal.MaterialExpressionSaturate, -160, 500)
+            mel.connect_material_expressions(n_ad, "", n_st, "")
+            n_dr = _mk(mat, unreal.MaterialExpressionComponentMask, -60, 440)
+            n_dr.set_editor_property("r", True); n_dr.set_editor_property("g", False); n_dr.set_editor_property("b", False)
+            mel.connect_material_expressions(n_st, "", n_dr, "")
+            n_dg = _mk(mat, unreal.MaterialExpressionComponentMask, -60, 540)
+            n_dg.set_editor_property("r", False); n_dg.set_editor_property("g", True); n_dg.set_editor_property("b", False)
+            mel.connect_material_expressions(n_st, "", n_dg, "")
+            n_dz = _reconstruct_normal_z(mat, n_dr, "", n_dg, "", 100, 480)
+        else:
+            n_dz = _reconstruct_normal_z(mat, sockets["Normal.R"][0], sockets["Normal.R"][1], sockets["Normal.G"][0], sockets["Normal.G"][1], -320, 480)
         mel.connect_material_property(n_dz, "", unreal.MaterialProperty.MP_NORMAL)
 
     # Wire Animated Elemental Sac / Canister / Eye Lens Overlays!
@@ -1150,7 +1727,7 @@ def build_single_material(slot_name: str, meta: dict):
         n_t = _time_scaled(mat, -1100, 960)
 
         if okind == "elemental_sack_overlay" and "Mask" in sockets:
-            # Exact DXIL mat_id==0 * Mask_Alpha + Dual-Phase Animated Flow Map + Fresnel Rim!
+            # Exact DXIL mat_id==0 * Mask_Alpha + True Dual-Phase Flow Map (172:0) + Caustics (1703:0) + Fresnel + Wet Specular!
             n_is0 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 0.0, -560, 820)
             sac_mask = n_is0
             if "Mask_Alpha" in sockets:
@@ -1159,34 +1736,133 @@ def build_single_material(slot_name: str, meta: dict):
                 mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_sm, "B")
                 sac_mask = n_sm
 
-            n_uv = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -1380, 1180)
-            n_uv.set_editor_property("u_tiling", 2.5)
-            n_uv.set_editor_property("v_tiling", 2.5)
-            n_pan = _mk(mat, unreal.MaterialExpressionPanner, -1080, 1180)
-            n_pan.set_editor_property("speed_x", 0.06)
-            n_pan.set_editor_property("speed_y", float(overlay.get("flow_speed", 0.35)))
-            mel.connect_material_expressions(n_uv, "", n_pan, "Coordinate")
-            mel.connect_material_expressions(n_t, "", n_pan, "Time")
+            # Dual-phase flow-map time: phase0 = frac(t*spd + 0.5)*2-1, phase1 = frac(t*spd + 1.0)*2-1, blend = abs(phase0)
+            n_fspd = _scalar(mat, "FlowSpeed", float(overlay.get("flow_speed", 0.35)), -1580, 1040)
+            n_tf = _mk(mat, unreal.MaterialExpressionMultiply, -1380, 1020)
+            mel.connect_material_expressions(n_t, "", n_tf, "A")
+            mel.connect_material_expressions(n_fspd, "", n_tf, "B")
+
+            n_a0 = _mk(mat, unreal.MaterialExpressionAdd, -1220, 960)
+            n_a0.set_editor_property("const_b", 0.5)
+            mel.connect_material_expressions(n_tf, "", n_a0, "A")
+            n_fr0 = _mk(mat, unreal.MaterialExpressionFrac, -1080, 960)
+            mel.connect_material_expressions(n_a0, "", n_fr0, "")
+            n_p0 = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -940, 960)
+            n_p0.set_editor_property("bias", -0.5)
+            n_p0.set_editor_property("scale", 2.0)
+            mel.connect_material_expressions(n_fr0, "", n_p0, "")
+
+            n_fr1 = _mk(mat, unreal.MaterialExpressionFrac, -1080, 1100)
+            mel.connect_material_expressions(n_tf, "", n_fr1, "")
+            n_p1 = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -940, 1100)
+            n_p1.set_editor_property("bias", -0.5)
+            n_p1.set_editor_property("scale", 2.0)
+            mel.connect_material_expressions(n_fr1, "", n_p1, "")
+
+            n_pbl = _mk(mat, unreal.MaterialExpressionAbs, -780, 960)
+            mel.connect_material_expressions(n_p0, "", n_pbl, "")
+
+            # Flow Vector from 172:0 (`RG * 2 - 1`) * FlowStrength
+            n_uv_flw = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -1620, 1280)
+            n_uv_flw.set_editor_property("u_tiling", 2.0)
+            n_uv_flw.set_editor_property("v_tiling", 2.0)
+            flow_tex = import_texture(overlay.get("flow_file", ""), is_srgb=False)
+            n_flw_t = _tex_node(mat, "SacFlowMap", flow_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1380, 1280)
+            mel.connect_material_expressions(n_uv_flw, "", n_flw_t, "UVs")
+            n_flw_rg = _mk(mat, unreal.MaterialExpressionAppendVector, -1120, 1280)
+            mel.connect_material_expressions(n_flw_t, "R", n_flw_rg, "A")
+            mel.connect_material_expressions(n_flw_t, "G", n_flw_rg, "B")
+            n_flw_dec = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -960, 1280)
+            n_flw_dec.set_editor_property("bias", -0.5)
+            n_flw_dec.set_editor_property("scale", 2.0)
+            mel.connect_material_expressions(n_flw_rg, "", n_flw_dec, "")
+            n_fstr = _scalar(mat, "FlowStrength", float(overlay.get("flow_strength", 0.14)), -960, 1420)
+            n_fvec = _mk(mat, unreal.MaterialExpressionMultiply, -780, 1280)
+            mel.connect_material_expressions(n_flw_dec, "", n_fvec, "A")
+            mel.connect_material_expressions(n_fstr, "", n_fvec, "B")
+
+            # Dual-phase UV distortion into 1703:0 Fluid Caustics
+            n_uv_fld = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -960, 1540)
+            n_uv_fld.set_editor_property("u_tiling", 2.5)
+            n_uv_fld.set_editor_property("v_tiling", 2.5)
+            n_off0 = _mk(mat, unreal.MaterialExpressionMultiply, -620, 1180)
+            mel.connect_material_expressions(n_fvec, "", n_off0, "A")
+            mel.connect_material_expressions(n_p0, "", n_off0, "B")
+            n_uv0 = _mk(mat, unreal.MaterialExpressionAdd, -480, 1180)
+            mel.connect_material_expressions(n_uv_fld, "", n_uv0, "A")
+            mel.connect_material_expressions(n_off0, "", n_uv0, "B")
+
+            n_off1 = _mk(mat, unreal.MaterialExpressionMultiply, -620, 1380)
+            mel.connect_material_expressions(n_fvec, "", n_off1, "A")
+            mel.connect_material_expressions(n_p1, "", n_off1, "B")
+            n_uv1 = _mk(mat, unreal.MaterialExpressionAdd, -480, 1380)
+            mel.connect_material_expressions(n_uv_fld, "", n_uv1, "A")
+            mel.connect_material_expressions(n_off1, "", n_uv1, "B")
+
             fluid_tex = import_texture(overlay.get("fluid_file", ""), is_srgb=False)
-            n_fl = _tex_node(mat, "SacFluidCaustics", fluid_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -800, 1180)
-            mel.connect_material_expressions(n_pan, "", n_fl, "UVs")
+            n_fl0 = _tex_node(mat, "SacFluidPhase0", fluid_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -320, 1160)
+            mel.connect_material_expressions(n_uv0, "", n_fl0, "UVs")
+            n_fl1 = _tex_node(mat, "SacFluidPhase1", fluid_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -320, 1400)
+            mel.connect_material_expressions(n_uv1, "", n_fl1, "UVs")
 
-            n_fl_add = _mk(mat, unreal.MaterialExpressionAdd, -540, 1180)
-            n_fl_add.set_editor_property("const_b", 0.45)
-            mel.connect_material_expressions(n_fl, "R", n_fl_add, "A")
+            n_fl_mix = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -80, 1260)
+            mel.connect_material_expressions(n_fl0, "R", n_fl_mix, "A")
+            mel.connect_material_expressions(n_fl1, "R", n_fl_mix, "B")
+            mel.connect_material_expressions(n_pbl, "", n_fl_mix, "Alpha")
 
-            n_gc = _vec(mat, "SacGlowColor", overlay.get("glow_color", [0.14, 0.68, 1.0]), -540, 1000)
-            n_gs = _scalar(mat, "SacGlowStrength", float(overlay.get("glow_strength", 6.5)), -540, 1340)
-            n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, -260, 1080)
-            mel.connect_material_expressions(n_fl_add, "", n_m1, "A")
+            # Swirling caustic contrast (0.38 + 1.15 * fluid) + Fresnel subsurface edge depth!
+            n_fl_sc = _mk(mat, unreal.MaterialExpressionMultiply, 60, 1260)
+            n_fl_sc.set_editor_property("const_b", 1.15)
+            mel.connect_material_expressions(n_fl_mix, "", n_fl_sc, "A")
+            n_fl_add = _mk(mat, unreal.MaterialExpressionAdd, 180, 1260)
+            n_fl_add.set_editor_property("const_b", 0.38)
+            mel.connect_material_expressions(n_fl_sc, "", n_fl_add, "A")
+
+            n_gc0 = _vec(mat, "SacGlowColor", overlay.get("glow_color", [0.14, 0.68, 1.0]), -180, 960)
+            n_gco = _mpc_param(mat, "LiquidOverrideColor", lambda: _vec(mat, "LiquidOverrideColor", [0.08, 0.62, 1.0], -180, 820), -180, 820)
+            n_gcm = _mpc_param(mat, "LiquidOverrideMix", lambda: _scalar(mat, "LiquidOverrideMix", 0.0, -180, 720), -180, 720)
+            n_gc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, 60, 920)
+            mel.connect_material_expressions(n_gc0, "", n_gc, "A")
+            mel.connect_material_expressions(n_gco, "", n_gc, "B")
+            mel.connect_material_expressions(n_gcm, "", n_gc, "Alpha")
+
+            # Fresnel rim subsurface depth darkening on sac edges
+            n_sfr = _mk(mat, unreal.MaterialExpressionFresnel, 60, 1080)
+            n_sfr.set_editor_property("exponent", 2.2)
+            n_fr_m = _mk(mat, unreal.MaterialExpressionLinearInterpolate, 220, 1060)
+            n_fr_m.set_editor_property("const_a", 1.0)
+            n_fr_m.set_editor_property("const_b", 0.48)
+            mel.connect_material_expressions(n_sfr, "", n_fr_m, "Alpha")
+
+            n_gs_b = _scalar(mat, "SacGlowStrength", float(overlay.get("glow_strength", 4.2)), 60, 1440)
+            n_gs_s = _mpc_param(mat, "LiquidGlowScale", lambda: _scalar(mat, "LiquidGlowScale", 1.0, 60, 1560), 60, 1560)
+            n_gs = _mk(mat, unreal.MaterialExpressionMultiply, 220, 1460)
+            mel.connect_material_expressions(n_gs_b, "", n_gs, "A")
+            mel.connect_material_expressions(n_gs_s, "", n_gs, "B")
+
+            n_m0 = _mk(mat, unreal.MaterialExpressionMultiply, 320, 1180)
+            mel.connect_material_expressions(n_fl_add, "", n_m0, "A")
+            mel.connect_material_expressions(n_fr_m, "", n_m0, "B")
+            n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, 440, 1120)
+            mel.connect_material_expressions(n_m0, "", n_m1, "A")
             mel.connect_material_expressions(sac_mask, "", n_m1, "B")
-            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, -120, 1140)
+            n_m2 = _mk(mat, unreal.MaterialExpressionMultiply, 560, 1160)
             mel.connect_material_expressions(n_m1, "", n_m2, "A")
             mel.connect_material_expressions(n_gs, "", n_m2, "B")
-            n_em = _mk(mat, unreal.MaterialExpressionMultiply, 40, 1060)
+            n_em = _mk(mat, unreal.MaterialExpressionMultiply, 700, 1060)
             mel.connect_material_expressions(n_gc, "", n_em, "A")
             mel.connect_material_expressions(n_m2, "", n_em, "B")
             mel.connect_material_property(n_em, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+            # Blend smooth wet glossy membrane roughness (0.12) onto sac regions!
+            if "Roughness" in sockets:
+                n_inv_s = _mk(mat, unreal.MaterialExpressionOneMinus, -220, -40)
+                mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_inv_s, "")
+                n_wrg = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -40, -40)
+                n_wrg.set_editor_property("const_b", 0.12)
+                mel.connect_material_expressions(n_inv_s, "", n_wrg, "A")
+                mel.connect_material_expressions(sac_mask, "", n_wrg, "Alpha")
+                mel.connect_material_property(n_wrg, "", unreal.MaterialProperty.MP_ROUGHNESS)
 
         elif okind == "canister_emissive_overlay" and "Mask" in sockets:
             n_is1 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 1.0, -560, 820)
@@ -1206,8 +1882,18 @@ def build_single_material(slot_name: str, meta: dict):
             n_max = _mk(mat, unreal.MaterialExpressionMax, -140, 960)
             mel.connect_material_expressions(n_c1, "", n_max, "A")
             mel.connect_material_expressions(n_is20, "", n_max, "B")
-            n_gc = _vec(mat, "CanisterGlowColor", overlay.get("glow_color", [0.52, 0.70, 0.10]), -360, 1420)
-            n_gs = _scalar(mat, "CanisterGlowStrength", float(overlay.get("glow_strength", 5.5)), -160, 1420)
+            n_gc0 = _vec(mat, "CanisterGlowColor", overlay.get("glow_color", [0.52, 0.70, 0.10]), -520, 1420)
+            n_gco = _mpc_param(mat, "LiquidOverrideColor", lambda: _vec(mat, "LiquidOverrideColor", [0.08, 0.62, 1.0], -520, 1560), -520, 1560)
+            n_gcm = _mpc_param(mat, "LiquidOverrideMix", lambda: _scalar(mat, "LiquidOverrideMix", 0.0, -520, 1680), -520, 1680)
+            n_gc = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -280, 1460)
+            mel.connect_material_expressions(n_gc0, "", n_gc, "A")
+            mel.connect_material_expressions(n_gco, "", n_gc, "B")
+            mel.connect_material_expressions(n_gcm, "", n_gc, "Alpha")
+            n_gs_b = _scalar(mat, "CanisterGlowStrength", float(overlay.get("glow_strength", 5.5)), -320, 1640)
+            n_gs_s = _mpc_param(mat, "LiquidGlowScale", lambda: _scalar(mat, "LiquidGlowScale", 1.0, -320, 1740), -320, 1740)
+            n_gs = _mk(mat, unreal.MaterialExpressionMultiply, -140, 1660)
+            mel.connect_material_expressions(n_gs_b, "", n_gs, "A")
+            mel.connect_material_expressions(n_gs_s, "", n_gs, "B")
             n_ms = _mk(mat, unreal.MaterialExpressionMultiply, 0, 1120)
             mel.connect_material_expressions(n_max, "", n_ms, "A")
             mel.connect_material_expressions(n_gs, "", n_ms, "B")
@@ -1219,14 +1905,18 @@ def build_single_material(slot_name: str, meta: dict):
         elif okind == "machine_eye_lens_overlay":
             iris_tex = import_texture(overlay.get("iris_file", ""), is_srgb=False)
             n_ir = _tex_node(mat, "EyeIrisMask", iris_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -700, 920)
-            n_cc = _vec(mat, "CalmEyeColor", overlay.get("calm_color", [0.04, 0.56, 1.0]), -700, 1180)
-            n_ac = _vec(mat, "AlertEyeColor", overlay.get("alert_color", [1.0, 0.10, 0.02]), -700, 1360)
-            n_as = _scalar(mat, "AlertState", float(overlay.get("alert_state", 0.0)), -700, 1520)
+            n_cc = _mpc_param(mat, "EyeColor", lambda: _vec(mat, "CalmEyeColor", overlay.get("calm_color", [0.04, 0.56, 1.0]), -700, 1180), -700, 1180)
+            n_ac = _mpc_param(mat, "EyeAlertColor", lambda: _vec(mat, "AlertEyeColor", overlay.get("alert_color", [1.0, 0.08, 0.01]), -700, 1360), -700, 1360)
+            n_as = _mpc_param(mat, "EyeAlertState", lambda: _scalar(mat, "AlertState", float(overlay.get("alert_state", 0.0)), -700, 1520), -700, 1520)
             n_lerp = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -420, 1240)
             mel.connect_material_expressions(n_cc, "", n_lerp, "A")
             mel.connect_material_expressions(n_ac, "", n_lerp, "B")
             mel.connect_material_expressions(n_as, "", n_lerp, "Alpha")
-            n_gs = _scalar(mat, "EyeGlowStrength", float(overlay.get("glow_strength", 9.0)), -420, 1040)
+            n_gs_b = _scalar(mat, "EyeGlowStrength", float(overlay.get("glow_strength", 9.0)), -560, 1040)
+            n_gs_s = _mpc_param(mat, "EyeGlowScale", lambda: _scalar(mat, "EyeGlowScale", 1.0, -560, 1120), -560, 1120)
+            n_gs = _mk(mat, unreal.MaterialExpressionMultiply, -380, 1040)
+            mel.connect_material_expressions(n_gs_b, "", n_gs, "A")
+            mel.connect_material_expressions(n_gs_s, "", n_gs, "B")
             n_m1 = _mk(mat, unreal.MaterialExpressionMultiply, -220, 980)
             mel.connect_material_expressions(n_ir, "R", n_m1, "A")
             mel.connect_material_expressions(n_gs, "", n_m1, "B")
@@ -1238,9 +1928,9 @@ def build_single_material(slot_name: str, meta: dict):
         elif okind == "plasma_charge_overlay":
             # Exact DXIL Slaughterspine Plasma Charge-Up (`VertexColor.R` * `(1 - AO)^2` * Head->Tail wave + `mat_id==1` conduits!)
             n_vc = _mk(mat, unreal.MaterialExpressionVertexColor, -1100, 820)
-            n_pc = _vec(mat, "PlasmaColor", overlay.get("plasma_color", [0.46, 0.05, 1.0]), -720, 1340)
-            n_ic = _vec(mat, "IdleConduitColor", overlay.get("idle_led_color", [0.85, 0.18, 0.02]), -720, 1500)
-            n_chg = _scalar(mat, "PlasmaCharge", float(overlay.get("plasma_charge", 1.0)), -720, 1180)
+            n_pc = _mpc_param(mat, "PlasmaColor", lambda: _vec(mat, "PlasmaColor", overlay.get("plasma_color", [0.46, 0.05, 1.0]), -720, 1340), -720, 1340)
+            n_ic = _mpc_param(mat, "MuscleColor", lambda: _vec(mat, "IdleConduitColor", overlay.get("idle_led_color", [0.85, 0.18, 0.02]), -720, 1500), -720, 1500)
+            n_chg = _mpc_param(mat, "PlasmaCharge", lambda: _scalar(mat, "PlasmaCharge", float(overlay.get("plasma_charge", 1.0)), -720, 1180), -720, 1180)
             n_gs = _scalar(mat, "PlasmaGlowStrength", float(overlay.get("glow_strength", 4.2)), -480, 1180)
 
             # Head->Tail plasma surge wave: 0.72 + 0.28 * sin(Time * 3.5 - VertexColor.G * 10)
@@ -1321,7 +2011,73 @@ def build_single_material(slot_name: str, meta: dict):
         mel.connect_material_expressions(n_gs, "", n_em, "B")
         mel.connect_material_property(n_em, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
-    if "Alpha" in sockets:
+    # Surface Profile refinements for Characters (Skin SSS, Hair, Brows/Lashes, Peach Fuzz, Eyes, Cloth) and General Assets (Foliage, Glass)!
+    sprof = meta.get("surface_profile", "pbr")
+    if sprof == "peach_fuzz":
+        mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+        n_op = _scalar(mat, "PeachFuzzOpacity", 0.0, -360, 620)
+        mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+    elif sprof == "hair_face":
+        mat.set_editor_property("two_sided", True)
+        if "Color" not in sockets:
+            n_hc = _vec(mat, "BrowLashColor", [0.14, 0.075, 0.045], -360, 480)
+            mel.connect_material_property(n_hc, "", unreal.MaterialProperty.MP_BASE_COLOR)
+        if "Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Alpha"][0], sockets["Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+        elif "Mask_Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+    elif sprof == "skin":
+        try:
+            mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_SUBSURFACE)
+            n_sss = _vec(mat, "SkinSubsurfaceColor", [0.85, 0.30, 0.20], -360, 620)
+            mel.connect_material_property(n_sss, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+        except Exception:
+            pass
+    elif sprof == "hair":
+        mat.set_editor_property("two_sided", True)
+        if "Color" not in sockets:
+            n_hc = _vec(mat, "HairTintColor", [0.045, 0.032, 0.025], -360, 480)
+            mel.connect_material_property(n_hc, "", unreal.MaterialProperty.MP_BASE_COLOR)
+        if "Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Alpha"][0], sockets["Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+        elif "Mask_Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+    elif sprof == "foliage":
+        mat.set_editor_property("two_sided", True)
+        try:
+            mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_TWO_SIDED_FOLIAGE)
+            if "Color" in sockets:
+                mel.connect_material_property(sockets["Color"][0], sockets["Color"][1], unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+        except Exception:
+            pass
+        if "Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Alpha"][0], sockets["Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+        elif "Mask_Alpha" in sockets:
+            mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            mel.connect_material_property(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
+    elif sprof == "eye":
+        try:
+            mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_CLEAR_COAT)
+            n_er = _scalar(mat, "EyeRoughness", 0.04, -360, 620)
+            mel.connect_material_property(n_er, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        except Exception:
+            pass
+    elif sprof == "eye_wet":
+        mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+        n_op = _scalar(mat, "WetOpacity", 0.12, -360, 620)
+        n_rg = _scalar(mat, "WetRoughness", 0.02, -360, 720)
+        mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+        mel.connect_material_property(n_rg, "", unreal.MaterialProperty.MP_ROUGHNESS)
+    elif sprof == "glass":
+        mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+        n_op = _scalar(mat, "GlassOpacity", 0.25, -360, 620)
+        mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+    elif meta.get("allow_alpha_cutout", True) and "Alpha" in sockets:
         mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
         mel.connect_material_property(sockets["Alpha"][0], sockets["Alpha"][1], unreal.MaterialProperty.MP_OPACITY_MASK)
 
@@ -1333,34 +2089,41 @@ def build_single_material(slot_name: str, meta: dict):
 def import_machine_fbx(built_materials: dict):
     fbx_path = next((p for p in FBX_CANDIDATES if os.path.exists(p)), None)
     if not fbx_path:
-        unreal.log_warning(f"[HFW] Rigged FBX not found yet (checked {{FBX_CANDIDATES}}). Materials were still built cleanly!")
+        unreal.log_warning(f"[HFW] FBX not found yet (checked {{FBX_CANDIDATES}}). Materials were still built cleanly!")
         return None
     opts = unreal.FbxImportUI()
     opts.import_mesh = True
-    opts.import_as_skeletal = True
+    opts.import_as_skeletal = bool(IS_SKELETAL)
     opts.import_materials = False
     opts.import_textures = False
     opts.import_animations = False
-    opts.skeletal_mesh_import_data.combine_meshes = True
-    opts.skeletal_mesh_import_data.import_morph_targets = False
-    if hasattr(opts.skeletal_mesh_import_data, "vertex_color_import_option"):
-        opts.skeletal_mesh_import_data.vertex_color_import_option = unreal.VertexColorImportOption.REPLACE
+    if IS_SKELETAL:
+        opts.skeletal_mesh_import_data.combine_meshes = True
+        opts.skeletal_mesh_import_data.import_morph_targets = False
+        if hasattr(opts.skeletal_mesh_import_data, "vertex_color_import_option"):
+            opts.skeletal_mesh_import_data.vertex_color_import_option = unreal.VertexColorImportOption.REPLACE
+    else:
+        opts.static_mesh_import_data.combine_meshes = True
+        if hasattr(opts.static_mesh_import_data, "vertex_color_import_option"):
+            opts.static_mesh_import_data.vertex_color_import_option = unreal.VertexColorImportOption.REPLACE
 
+    asset_prefix = "SK_" if IS_SKELETAL else "SM_"
     task = unreal.AssetImportTask()
     task.filename = fbx_path
     task.destination_path = DEST_PACKAGE
-    task.destination_name = "SK_" + MACHINE_NAME
+    task.destination_name = asset_prefix + MACHINE_NAME
     task.automated = True
     task.replace_existing = True
     task.save = True
     task.options = opts
     asset_tools.import_asset_tasks([task])
 
-    sk = unreal.EditorAssetLibrary.load_asset(f"{{DEST_PACKAGE}}/SK_{{MACHINE_NAME}}")
-    if sk and hasattr(sk, "materials"):
+    mesh_asset = unreal.EditorAssetLibrary.load_asset(f"{{DEST_PACKAGE}}/{{asset_prefix}}{{MACHINE_NAME}}")
+    slot_prop = "materials" if IS_SKELETAL else "static_materials"
+    if mesh_asset and hasattr(mesh_asset, slot_prop):
         assigned = 0
         new_mats = []
-        for sm in sk.materials:
+        for sm in getattr(mesh_asset, slot_prop):
             sname = str(sm.material_slot_name)
             matched = built_materials.get(sname) or built_materials.get(_safe(sname))
             if matched is None:
@@ -1372,14 +2135,15 @@ def import_machine_fbx(built_materials: dict):
                 sm.material_interface = matched
                 assigned += 1
             new_mats.append(sm)
-        sk.materials = new_mats
-        unreal.EditorAssetLibrary.save_loaded_asset(sk)
-        unreal.log(f"[HFW] Assigned {{assigned}}/{{len(new_mats)}} animated UE5 materials onto SK_{{MACHINE_NAME}}!")
-    return sk
+        setattr(mesh_asset, slot_prop, new_mats)
+        unreal.EditorAssetLibrary.save_loaded_asset(mesh_asset)
+        unreal.log(f"[HFW] Assigned {{assigned}}/{{len(new_mats)}} UE5 materials onto {{asset_prefix}}{{MACHINE_NAME}}!")
+    return mesh_asset
 
 
 def run_import():
-    unreal.log(f"[HFW] Building {{len(MATERIALS_META)}} animated UE5 materials for {{MACHINE_NAME}}...")
+    _ensure_mpc()
+    unreal.log(f"[HFW] Building {{len(MATERIALS_META)}} UE5 materials for {{MACHINE_NAME}} ({{ASSET_KIND}})...")
     built = {{}}
     for slot_name, meta in MATERIALS_META.items():
         try:

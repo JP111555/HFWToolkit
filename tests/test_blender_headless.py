@@ -58,7 +58,9 @@ mf_ng = bpy.data.node_groups.get("HFW_MachineMuscleFiber")
 muscle_fiber_cycles_safe = False
 if mf_ng is not None:
     ntypes = {n.type for n in mf_ng.nodes}
-    muscle_fiber_cycles_safe = ("LIGHT_PATH" in ntypes) and ("NEW_GEOMETRY" in ntypes) and ("MAP_RANGE" in ntypes)
+    # Pillar 1 fix: bypass Cycles shadow rays (`LIGHT_PATH`) + exact DXIL Mask_Alpha*40 remap (`MAP_RANGE`),
+    # deliberately WITHOUT killing Backfacing so double-sided muscle strips glow cleanly from all angles!
+    muscle_fiber_cycles_safe = ("LIGHT_PATH" in ntypes) and ("MAP_RANGE" in ntypes)
 
 meshes_with_color0 = sum(1 for o in meshes if "Color0" in o.data.color_attributes)
 skinned_tris = sum(len(o.data.polygons) for o in skinned if not o.hide_viewport)

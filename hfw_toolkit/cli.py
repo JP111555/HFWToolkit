@@ -20,6 +20,8 @@ from hfw_toolkit.decima.exe_rtti import extract_rtti_from_exe, get_exe_version_s
 from hfw_toolkit.extract import (
     SUPPORTED_OUTPUT_FORMATS,
     AudioItemInfo,
+    assemble_character,
+    assemble_general_asset,
     assemble_machine,
     decode_audio_object,
     detect_digital_extras_ost,
@@ -27,6 +29,7 @@ from hfw_toolkit.extract import (
     extract_audio_items_to_dir,
     extract_music_cues_to_dir,
     has_pyav,
+    resolve_character_prompt,
     resolve_machine_entity_id,
     write_audio_file,
 )
@@ -111,6 +114,8 @@ def _cmd_doctor(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
     if cat_built:
         print(
             f"  Asset Catalog DB  : READY ({cat_stats.get('machines', 0)} machines, "
+            f"{cat_stats.get('characters', 0):,} characters/{cat_stats.get('character_outfits', 0)} outfits, "
+            f"{cat_stats.get('dev_assets', 0):,} dev-dir assets, "
             f"{cat_stats.get('texture_sets', 0):,} TextureSets, {cat_stats.get('shaders', 0):,} shaders, "
             f"{cat_stats.get('music_cues', 0):,} music cues)"
         )
@@ -662,6 +667,280 @@ def _cmd_audio(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             game.close()
 
 
+def _cmd_characters(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
+    cfg.ensure_dirs()
+    cat = AssetCatalog(cfg.index_db_path)
+    game: HFWGame | None = None
+
+    def get_game() -> HFWGame:
+        nonlocal game
+        if game is None:
+            game = HFWGame(cfg)
+        return game
+
+    def ensure_indexed() -> None:
+        if not cat.is_characters_assets_built():
+            print("Character & dev-asset catalog not indexed yet — indexing now...")
+            cat.index_characters_and_assets(get_game(), progress_cb=print)
+
+    try:
+        sub = args.char_cmd
+        if sub == "list":
+            ensure_indexed()
+            rows = cat.list_characters(
+                query=args.query or "",
+                kind=args.kind or "",
+                tribe=args.tribe or "",
+                gender=args.gender or "",
+                limit=args.limit,
+            )
+            print(f"Found {len(rows)} character(s):")
+            for r in rows:
+                print(
+                    f"  [{r['character_kind']:9s}] {r['char_id']:18s} | {r['display_name']:28s} | "
+                    f"{r['tribe']:10s} | {r['gender']:7s} | outfits={r['outfit_count']:2d} | {r['dev_folder']}"
+                )
+            return 0
+
+        if sub == "outfits":
+            ensure_indexed()
+            rows = cat.list_character_outfits(char_id=args.char or "", query=args.query or "", limit=args.limit)
+            print(f"Found {len(rows)} outfit variation(s):")
+            for r in rows:
+                dlc = " [DLC]" if r["is_dlc"] else ""
+                hg = " (HG toggle)" if r["has_headgear_toggle"] else ""
+                print(
+                    f"  {r['outfit_id']:14s} | {r['char_id']:12s} | {r['display_name']:32s}{dlc}{hg} | {r['dev_folder']}"
+                )
+            return 0
+
+        if sub == "resolve":
+            ensure_indexed()
+            res = resolve_character_prompt(cat, args.prompt)
+            print(f"Prompt      : {res['prompt']!r}")
+            print(f"Matched     : {res['summary']} (confidence={res['confidence']})")
+            print(f"Character   : {res['character']['char_id'] if res['character'] else None}")
+            print(f"Outfit      : {res['outfit']['outfit_id'] if res['outfit'] else None}")
+            print(f"Options     : headgear={res['headgear']}, include_hair={res['include_hair']}, hair_lod={res['hair_lod']}")
+            if res["alternatives"]:
+                print("Alternatives:")
+                for a in res["alternatives"][:5]:
+                    print(f"  - {a['display_name']} ({a['outfit_name'] or a['char_id']}) [score={a['score']}]")
+            return 0
+
+        if sub in ("export-bundle", "export-blend", "export-ue5"):
+            ensure_indexed()
+            g = get_game()
+            print(f"[1/3] Assembling HFW character ({args.prompt or args.char})...")
+            asm = assemble_character(
+                g,
+                catalog=cat,
+                char_id=args.char or None,
+                outfit_id=args.outfit or None,
+                prompt=args.prompt or None,
+                headgear=None if (args.prompt and not args.no_headgear) else (not args.no_headgear),
+                include_hair=None if (args.prompt and not args.no_hair) else (not args.no_hair),
+                hair_lod=args.hair_lod,
+                facial_id=args.facial or None,
+                lod_index=args.lod,
+            )
+            safe_name = re.sub(r"[^A-Za-z0-9_\-.]+", "_", f"{asm.display_name}_{asm.variant_label}").strip("_")[:64] or "Character"
+            print(
+                f"      -> {asm.display_name} ({asm.variant_label}) | "
+                f"{len(asm.skeleton.joints)} unified joints, {len(asm.parts)} mesh parts, {len(asm.materials)} materials"
+            )
+            if sub == "export-bundle":
+                out_dir = Path(args.out) if args.out else (cfg.exports_dir / "Characters" / f"{safe_name}_bundle")
+                export_assembly_bundle(
+                    g,
+                    asm,
+                    out_dir,
+                    max_texture_size=args.max_tex_size,
+                    unpack_textures=args.unpack_textures,
+                    asset_kind="character",
+                )
+                print(f"Exported character bundle -> {out_dir}")
+                return 0
+
+            if sub == "export-ue5":
+                out_dir = Path(args.out) if args.out else (cfg.exports_dir / "Characters" / f"{safe_name}_UE5")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                export_assembly_bundle(
+                    g,
+                    asm,
+                    out_dir,
+                    max_texture_size=args.max_tex_size,
+                    unpack_textures=args.unpack_textures,
+                    asset_kind="character",
+                )
+                fbx_out = out_dir / f"{safe_name}.fbx"
+                blend_tmp = out_dir / f"{safe_name}.blend"
+                print(f"[3/3] Building UE5 Rigged Character FBX -> {fbx_out}")
+                build_blend_headless(out_dir, blend_tmp, config=cfg, export_fbx=fbx_out)
+                print(f"Success! UE5 Character Importer: {out_dir / 'ue5_import_character.py'}")
+                return 0
+
+            # export-blend
+            out_blend = Path(args.out) if args.out else (cfg.exports_dir / "Characters" / f"{safe_name}.blend")
+            out_blend.parent.mkdir(parents=True, exist_ok=True)
+            bdir = out_blend.parent / f"{out_blend.stem}_bundle"
+            print(f"[2/3] Exporting character bundle & textures -> {bdir}")
+            export_assembly_bundle(
+                g,
+                asm,
+                bdir,
+                max_texture_size=args.max_tex_size,
+                unpack_textures=args.unpack_textures,
+                asset_kind="character",
+            )
+            fbx_out = (bdir / f"{safe_name}.fbx") if args.export_fbx else None
+            print(f"[3/3] Building ready-to-pose Blender 5.3 character rig -> {out_blend}")
+            build_blend_headless(
+                bdir,
+                out_blend,
+                config=cfg,
+                pack_textures=args.pack,
+                export_fbx=fbx_out,
+            )
+            print(f"Success! Open directly in Blender 5.3: {out_blend}")
+            return 0
+        return 1
+    finally:
+        cat.close()
+        if game is not None:
+            game.close()
+
+
+def _cmd_assets(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
+    cfg.ensure_dirs()
+    cat = AssetCatalog(cfg.index_db_path)
+    game: HFWGame | None = None
+
+    def get_game() -> HFWGame:
+        nonlocal game
+        if game is None:
+            game = HFWGame(cfg)
+        return game
+
+    def ensure_indexed() -> None:
+        if not cat.is_characters_assets_built():
+            print("Developer-directory asset catalog not indexed yet — indexing now...")
+            cat.index_characters_and_assets(get_game(), progress_cb=print)
+
+    try:
+        sub = args.asset_cmd
+        if sub == "tree":
+            ensure_indexed()
+            tree = cat.list_dev_tree_children(args.folder or "")
+            print(f"Guerrilla Developer Directory: /{tree['parent_dir'] or ''}")
+            for f in tree["folders"]:
+                cats = ",".join(f["categories"])
+                print(f"  [DIR]   {f['path']:54s} ({f['asset_count']:4d} assets | {cats})")
+            for a in tree["assets"]:
+                rig = "RIGGED" if a["is_skinned"] else "STATIC"
+                print(f"  [{rig}] {a['dev_path']:54s} -> {a['resource_type']} ({a['resource_id']})")
+            return 0
+
+        if sub == "list":
+            ensure_indexed()
+            rows = cat.search_dev_assets(
+                query=args.query or "",
+                category=args.category or "",
+                dir_prefix=args.dir or "",
+                limit=args.limit,
+            )
+            print(f"Found {len(rows)} developer-directory asset(s):")
+            for r in rows:
+                rig = "RIGGED" if r["is_skinned"] else "STATIC"
+                print(
+                    f"  [{r['category']:15s}|{rig}] {r['dev_path']:52s} | {r['resource_type']:20s} | {r['resource_id']}"
+                )
+            return 0
+
+        if sub in ("export-bundle", "export-blend", "export-ue5"):
+            ensure_indexed()
+            g = get_game()
+            row = cat.get_dev_asset(args.asset)
+            if row is not None:
+                res_id = row["resource_id"]
+                disp = row["display_name"]
+                dev_p = row["dev_path"]
+                cat_name = row["category"]
+            else:
+                res_id = args.asset
+                disp = ""
+                dev_p = ""
+                cat_name = "props"
+
+            print(f"[1/3] Assembling HFW asset {dev_p or res_id} ({res_id})...")
+            asm = assemble_general_asset(
+                g,
+                res_id,
+                display_name=disp,
+                dev_path=dev_p,
+                category=cat_name,
+                lod_index=args.lod,
+            )
+            safe_name = re.sub(r"[^A-Za-z0-9_\-.]+", "_", asm.display_name).strip("_")[:64] or "Asset"
+            # Preserve developer directory layout under exports/Assets/<dev_path> by default!
+            rel_folder = Path(*[p for p in dev_p.replace("\\", "/").split("/") if p]) if dev_p else Path(safe_name)
+            print(
+                f"      -> {asm.display_name} | {len(asm.skeleton.joints)} joints, "
+                f"{len(asm.parts)} parts, {len(asm.materials)} materials"
+            )
+
+            if sub == "export-bundle":
+                out_dir = Path(args.out) if args.out else (cfg.exports_dir / "Assets" / rel_folder)
+                export_assembly_bundle(
+                    g,
+                    asm,
+                    out_dir,
+                    max_texture_size=args.max_tex_size,
+                    unpack_textures=args.unpack_textures,
+                    asset_kind="asset",
+                )
+                print(f"Exported asset bundle -> {out_dir}")
+                return 0
+
+            if sub == "export-ue5":
+                out_dir = Path(args.out) if args.out else (cfg.exports_dir / "Assets" / rel_folder)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                export_assembly_bundle(
+                    g,
+                    asm,
+                    out_dir,
+                    max_texture_size=args.max_tex_size,
+                    unpack_textures=args.unpack_textures,
+                    asset_kind="asset",
+                )
+                fbx_out = out_dir / f"{safe_name}.fbx"
+                blend_tmp = out_dir / f"{safe_name}.blend"
+                build_blend_headless(out_dir, blend_tmp, config=cfg, export_fbx=fbx_out)
+                print(f"Success! UE5 Asset Importer: {out_dir / 'ue5_import_asset.py'}")
+                return 0
+
+            out_blend = Path(args.out) if args.out else (cfg.exports_dir / "Assets" / rel_folder / f"{safe_name}.blend")
+            out_blend.parent.mkdir(parents=True, exist_ok=True)
+            bdir = out_blend.parent / f"{out_blend.stem}_bundle"
+            export_assembly_bundle(
+                g,
+                asm,
+                bdir,
+                max_texture_size=args.max_tex_size,
+                unpack_textures=args.unpack_textures,
+                asset_kind="asset",
+            )
+            fbx_out = (bdir / f"{safe_name}.fbx") if args.export_fbx else None
+            build_blend_headless(bdir, out_blend, config=cfg, pack_textures=args.pack, export_fbx=fbx_out)
+            print(f"Success! Open directly in Blender 5.3: {out_blend}")
+            return 0
+        return 1
+    finally:
+        cat.close()
+        if game is not None:
+            game.close()
+
+
 def _cmd_web(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
     import uvicorn
     from hfw_toolkit.web import create_app
@@ -792,6 +1071,74 @@ def main(argv: list[str] | None = None) -> int:
     p_au_ex.add_argument("--limit", type=int, default=None, help="Optional maximum number of cues/items to extract")
     p_au_ex.add_argument("--out", default=None, help="Output directory (default: exports/Audio)")
 
+    # Characters & Outfits subcommand group
+    p_ch = sub.add_parser("characters", help="Search, resolve via natural-language prompt & export HFW characters, outfits & rigs")
+    ch_sub = p_ch.add_subparsers(dest="char_cmd", required=True)
+
+    p_ch_ls = ch_sub.add_parser("list", help="List indexed HFW characters (Aloy, Companions, Tribal NPCs)")
+    p_ch_ls.add_argument("--kind", choices=("hero", "companion", "npc"), default="")
+    p_ch_ls.add_argument("--tribe", default="")
+    p_ch_ls.add_argument("--gender", default="")
+    p_ch_ls.add_argument("--query", "-q", default="")
+    p_ch_ls.add_argument("--limit", type=int, default=60)
+
+    p_ch_of = ch_sub.add_parser("outfits", help="List outfit variations (e.g. all 35 Aloy base + DLC outfits)")
+    p_ch_of.add_argument("--char", default="aloy")
+    p_ch_of.add_argument("--query", "-q", default="")
+    p_ch_of.add_argument("--limit", type=int, default=80)
+
+    p_ch_res = ch_sub.add_parser("resolve", help="Test natural-language prompt resolution (e.g. 'Aloy Carja Blazon no headgear')")
+    p_ch_res.add_argument("prompt", help="Natural-language character description")
+
+    for sub_name, sub_help in (
+        ("export-bundle", "Export rigged character bundle (JSON + NPZ + textures + ue5_import_character.py)"),
+        ("export-blend", "One-command assemble & build ready-to-pose Blender 5.3 character .blend"),
+        ("export-ue5", "Export UE5-ready rigged character FBX + textures + ue5_import_character.py"),
+    ):
+        p_cx = ch_sub.add_parser(sub_name, help=sub_help)
+        p_cx.add_argument("--prompt", "-p", default="", help="Natural-language prompt (e.g. 'Aloy Carja Blazon no headgear', 'Seyka', 'Erend', 'Tenakth female warrior')")
+        p_cx.add_argument("--char", default="", help="Character ID (e.g. aloy, erend, seyka, bv:10366:18)")
+        p_cx.add_argument("--outfit", default="", help="Outfit ID (e.g. osd:72479:0)")
+        p_cx.add_argument("--facial", default="", help="Optional modular head swap FacialAnimationComponentResource ID")
+        p_cx.add_argument("--no-headgear", action="store_true", help="Hide outfit headgear when supported")
+        p_cx.add_argument("--no-hair", action="store_true", help="Skip external braided HairResource")
+        p_cx.add_argument("--hair-lod", type=int, default=2, help="HairResource LOD (0=ultra, 2=balanced default, 3=light)")
+        p_cx.add_argument("--lod", type=int, default=0)
+        p_cx.add_argument("--unpack-textures", action="store_true")
+        p_cx.add_argument("--max-tex-size", type=int, default=None)
+        p_cx.add_argument("--out", default=None)
+        if sub_name == "export-blend":
+            p_cx.add_argument("--pack", action="store_true")
+            p_cx.add_argument("--export-fbx", action="store_true")
+
+    # General Assets (Guerrilla Developer Directory Catalog) subcommand group
+    p_as = sub.add_parser("assets", help="Browse Guerrilla's original developer directory tree & export any HFW asset to Blender / UE5")
+    as_sub = p_as.add_subparsers(dest="asset_cmd", required=True)
+
+    p_as_tr = as_sub.add_parser("tree", help="Browse Guerrilla's original models/... developer folder tree")
+    p_as_tr.add_argument("folder", nargs="?", default="", help="Optional developer folder path (e.g. models/weapons, models/Eco_Assets_HRZ2)")
+
+    p_as_ls = as_sub.add_parser("list", help="Search indexed general assets across all developer folders")
+    p_as_ls.add_argument("--category", choices=("weapons", "animals", "building_blocks", "eco_assets", "landscape", "props", "characters", "machines"), default="")
+    p_as_ls.add_argument("--dir", default="", help="Developer folder prefix filter")
+    p_as_ls.add_argument("--query", "-q", default="")
+    p_as_ls.add_argument("--limit", type=int, default=60)
+
+    for sub_name, sub_help in (
+        ("export-bundle", "Export general asset bundle preserving developer folder structure"),
+        ("export-blend", "Export any HFW asset as a ready-to-use Blender 5.3 .blend"),
+        ("export-ue5", "Export any HFW asset as UE5 FBX + materials + ue5_import_asset.py"),
+    ):
+        p_ax = as_sub.add_parser(sub_name, help=sub_help)
+        p_ax.add_argument("--asset", "-a", required=True, help="Developer folder path (e.g. DLC/models/weapons/Bow_Heavy_Quen_SE) or resource ID ('85387:14')")
+        p_ax.add_argument("--lod", type=int, default=0)
+        p_ax.add_argument("--unpack-textures", action="store_true")
+        p_ax.add_argument("--max-tex-size", type=int, default=None)
+        p_ax.add_argument("--out", default=None)
+        if sub_name == "export-blend":
+            p_ax.add_argument("--pack", action="store_true")
+            p_ax.add_argument("--export-fbx", action="store_true")
+
     args = parser.parse_args(argv)
     cfg = ToolkitConfig.load()
     game_override = args.game_dir or getattr(args, "setup_game_dir", None)
@@ -813,6 +1160,8 @@ def main(argv: list[str] | None = None) -> int:
         "inspect-material": _cmd_inspect_material,
         "install-blender-addon": _cmd_install_addon,
         "audio": _cmd_audio,
+        "characters": _cmd_characters,
+        "assets": _cmd_assets,
         "web": _cmd_web,
     }
     return dispatch[args.cmd](args, cfg)

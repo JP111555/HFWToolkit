@@ -291,13 +291,14 @@ def parse_material(game: HFWGame, render_effect_obj: dict[str, Any]) -> Material
                 )
             )
 
-    # Pick the richest main shading technique (prefer Normal set + Deferred/Forward with most textures!)
+    # Pick the richest main shading technique (NEVER prefer a 0-texture DepthOnly/Shadow technique over a textured one!)
     primary: TechniqueInfo | None = None
     if techniques:
-        def tech_score(t: TechniqueInfo) -> tuple[int, int, int]:
+        def tech_score(t: TechniqueInfo) -> tuple[int, int, int, int]:
+            has_tbs = 1 if len(t.texture_bindings) > 0 else 0
             is_normal_set = 1 if "Normal" in t.technique_set_type else 0
             is_color_pass = 1 if any(p in ("Deferred", "DeferredEmissive", "DeferredForeground", "CustomDeferred", "Transparency", "CustomForward", "Unlit") for p in t.available_passes) else 0
-            return (is_normal_set, is_color_pass, len(t.texture_bindings))
+            return (has_tbs, is_normal_set, is_color_pass, len(t.texture_bindings))
 
         primary = max(techniques, key=tech_score)
 

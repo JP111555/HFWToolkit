@@ -311,6 +311,64 @@ CREATE INDEX IF NOT EXISTS idx_ag_folder ON audio_groups(dev_folder);
 CREATE INDEX IF NOT EXISTS idx_aa_kind_grp ON audio_assets(kind, group_id);
 CREATE INDEX IF NOT EXISTS idx_aa_speaker ON audio_assets(speaker);
 CREATE INDEX IF NOT EXISTS idx_aa_name ON audio_assets(name);
+
+CREATE TABLE IF NOT EXISTS characters (
+    char_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    character_kind TEXT NOT NULL,
+    tribe TEXT NOT NULL,
+    gender TEXT NOT NULL,
+    dev_folder TEXT NOT NULL,
+    body_variant_id TEXT NOT NULL,
+    facial_id TEXT NOT NULL,
+    hair_id TEXT NOT NULL,
+    outfit_count INTEGER NOT NULL,
+    part_count INTEGER NOT NULL,
+    tags TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS character_outfits (
+    outfit_id TEXT PRIMARY KEY,
+    char_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    tribe TEXT NOT NULL,
+    dev_folder TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    facial_id TEXT NOT NULL,
+    has_headgear_toggle INTEGER NOT NULL,
+    is_dlc INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS character_heads (
+    facial_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    gender TEXT NOT NULL,
+    dev_folder TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dev_assets (
+    dev_path TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    parent_dir TEXT NOT NULL,
+    category TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    group_id INTEGER NOT NULL,
+    is_skinned INTEGER NOT NULL,
+    tset_count INTEGER NOT NULL,
+    shader_count INTEGER NOT NULL,
+    is_dlc INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_char_kind ON characters(character_kind, tribe, display_name);
+CREATE INDEX IF NOT EXISTS idx_co_char ON character_outfits(char_id, display_name);
+CREATE INDEX IF NOT EXISTS idx_ch_gender ON character_heads(gender, display_name);
+CREATE INDEX IF NOT EXISTS idx_da_parent ON dev_assets(parent_dir);
+CREATE INDEX IF NOT EXISTS idx_da_cat ON dev_assets(category, display_name);
+CREATE INDEX IF NOT EXISTS idx_da_aid ON dev_assets(asset_id);
+CREATE INDEX IF NOT EXISTS idx_da_rid ON dev_assets(resource_id);
 """
 
 
@@ -366,6 +424,10 @@ class AssetCatalog:
         out["voiceline_groups"] = self.conn.execute(
             "SELECT COUNT(*) AS c FROM audio_groups WHERE kind = 'voiceline'"
         ).fetchone()["c"]
+        out["characters"] = self.conn.execute("SELECT COUNT(*) AS c FROM characters").fetchone()["c"]
+        out["character_outfits"] = self.conn.execute("SELECT COUNT(*) AS c FROM character_outfits").fetchone()["c"]
+        out["character_heads"] = self.conn.execute("SELECT COUNT(*) AS c FROM character_heads").fetchone()["c"]
+        out["dev_assets"] = self.conn.execute("SELECT COUNT(*) AS c FROM dev_assets").fetchone()["c"]
         return out
 
     def build(
@@ -497,6 +559,7 @@ class AssetCatalog:
             )
 
         self.build_audio_index(game, progress_cb=log)
+        self.index_characters_and_assets(game, progress_cb=log)
         st = self.stats()
         log(f"Catalog build complete in {time.time() - t0:.1f}s: {st}")
         return st
@@ -1442,3 +1505,348 @@ class AssetCatalog:
         items = [{"speaker": k, "indexed_lines": v} for k, v in found.items()]
         items.sort(key=lambda x: (-x["indexed_lines"], x["speaker"].lower()))
         return items[:limit]
+
+    # ------------------------------------------------------------------
+    # Characters, Outfits, Modular Heads & Guerrilla Dev-Directory Asset Catalog
+    # ------------------------------------------------------------------
+
+    def is_characters_assets_built(self) -> bool:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'chars_assets_schema_version'"
+        ).fetchone()
+        return row is not None and row["value"] == "1"
+
+    def index_characters_and_assets(
+        self,
+        game: HFWGame,
+        progress_cb: Callable[[str], None] | None = None,
+    ) -> dict[str, int]:
+        """Fast (~2-4s) indexing of ALL HFW Characters (Aloy + outfits, Companions, Tribal NPCs, 211 Heads)
+        and the Guerrilla Developer Directory Asset Catalog (`models/...`, `dlc/models/...`).
+        """
+        from hfw_toolkit.extract.asset_assembler import discover_dev_directory_assets
+        from hfw_toolkit.extract.character_assembler import discover_all_characters
+
+        t0 = time.time()
+        log = progress_cb or (lambda _msg: None)
+
+        log("Indexing HFW characters, outfits & modular facial heads...")
+        characters, outfits, heads = discover_all_characters(game, self)
+
+        log("Building Guerrilla Developer Directory Asset Catalog...")
+        dev_assets = discover_dev_directory_assets(game, self)
+
+        char_rows = [
+            (
+                c.char_id,
+                c.display_name,
+                c.character_kind,
+                c.tribe,
+                c.gender,
+                c.dev_folder,
+                c.body_variant_id,
+                c.facial_id,
+                c.hair_id,
+                int(c.outfit_count),
+                int(c.part_count),
+                c.tags,
+            )
+            for c in characters
+        ]
+        outfit_rows = [
+            (
+                o.outfit_id,
+                o.char_id,
+                o.display_name,
+                o.tribe,
+                o.dev_folder,
+                o.resource_type,
+                o.resource_id,
+                o.facial_id,
+                1 if o.has_headgear_toggle else 0,
+                1 if o.is_dlc else 0,
+            )
+            for o in outfits
+        ]
+        head_rows = [
+            (
+                h["facial_id"],
+                h["display_name"],
+                h["gender"],
+                h["dev_folder"],
+            )
+            for h in heads
+        ]
+        asset_rows = [
+            (
+                a.dev_path,
+                a.asset_id,
+                a.parent_dir,
+                a.category,
+                a.display_name,
+                a.resource_type,
+                a.resource_id,
+                int(a.group_id),
+                1 if a.is_skinned else 0,
+                int(a.tset_count),
+                int(a.shader_count),
+                1 if a.is_dlc else 0,
+            )
+            for a in dev_assets
+        ]
+
+        with self.conn:
+            self.conn.execute("DELETE FROM characters")
+            self.conn.execute("DELETE FROM character_outfits")
+            self.conn.execute("DELETE FROM character_heads")
+            self.conn.execute("DELETE FROM dev_assets")
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO characters VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                char_rows,
+            )
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO character_outfits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                outfit_rows,
+            )
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO character_heads VALUES (?, ?, ?, ?)",
+                head_rows,
+            )
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO dev_assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                asset_rows,
+            )
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('chars_assets_schema_version', '1')")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('chars_assets_built_at', ?)",
+                (str(int(time.time())),),
+            )
+
+        res = {
+            "characters": len(char_rows),
+            "character_outfits": len(outfit_rows),
+            "character_heads": len(head_rows),
+            "dev_assets": len(asset_rows),
+        }
+        log(
+            f"Indexed {res['characters']} characters ({res['character_outfits']} outfits, "
+            f"{res['character_heads']} heads) & {res['dev_assets']} dev-directory assets in {time.time() - t0:.1f}s"
+        )
+        return res
+
+    def list_characters(
+        self,
+        query: str = "",
+        kind: str = "",
+        tribe: str = "",
+        gender: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM characters WHERE 1=1"
+        params: list[Any] = []
+        if kind:
+            sql += " AND character_kind = ?"
+            params.append(kind)
+        if tribe:
+            sql += " AND LOWER(tribe) = LOWER(?)"
+            params.append(tribe)
+        if gender:
+            sql += " AND LOWER(gender) = LOWER(?)"
+            params.append(gender)
+        if query:
+            like = f"%{query}%"
+            sql += (
+                " AND (display_name LIKE ? OR char_id LIKE ? OR tribe LIKE ? "
+                "OR dev_folder LIKE ? OR tags LIKE ?)"
+            )
+            params.extend([like, like, like, like, like])
+        sql += (
+            " ORDER BY CASE character_kind WHEN 'hero' THEN 0 WHEN 'companion' THEN 1 ELSE 2 END, "
+            "CASE WHEN facial_id != '' THEN 0 ELSE 1 END, outfit_count DESC, display_name LIMIT ?"
+        )
+        params.append(limit)
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def get_character(self, char_id: str) -> dict[str, Any] | None:
+        r = self.conn.execute("SELECT * FROM characters WHERE char_id = ?", (char_id,)).fetchone()
+        if r is None:
+            r = self.conn.execute(
+                "SELECT * FROM characters WHERE LOWER(display_name) = LOWER(?) LIMIT 1", (char_id,)
+            ).fetchone()
+        return dict(r) if r is not None else None
+
+    def list_character_outfits(
+        self,
+        char_id: str = "",
+        query: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM character_outfits WHERE 1=1"
+        params: list[Any] = []
+        if char_id:
+            sql += " AND char_id = ?"
+            params.append(char_id)
+        if query:
+            like = f"%{query}%"
+            sql += " AND (display_name LIKE ? OR tribe LIKE ? OR dev_folder LIKE ? OR outfit_id = ?)"
+            params.extend([like, like, like, query])
+        sql += " ORDER BY is_dlc ASC, tribe, display_name LIMIT ?"
+        params.append(limit)
+        out = []
+        for r in self.conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["has_headgear_toggle"] = bool(d["has_headgear_toggle"])
+            d["is_dlc"] = bool(d["is_dlc"])
+            out.append(d)
+        return out
+
+    def get_character_outfit(self, outfit_id: str) -> dict[str, Any] | None:
+        r = self.conn.execute(
+            "SELECT * FROM character_outfits WHERE outfit_id = ? OR resource_id = ? LIMIT 1",
+            (outfit_id, outfit_id),
+        ).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["has_headgear_toggle"] = bool(d["has_headgear_toggle"])
+        d["is_dlc"] = bool(d["is_dlc"])
+        return d
+
+    def list_character_heads(
+        self,
+        query: str = "",
+        gender: str = "",
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM character_heads WHERE 1=1"
+        params: list[Any] = []
+        if gender:
+            sql += " AND LOWER(gender) = LOWER(?)"
+            params.append(gender)
+        if query:
+            like = f"%{query}%"
+            sql += " AND (display_name LIKE ? OR dev_folder LIKE ? OR facial_id = ?)"
+            params.extend([like, like, query])
+        sql += " ORDER BY display_name LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def list_dev_asset_categories(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT category, COUNT(*) AS asset_count,
+                   SUM(CASE WHEN is_skinned = 1 THEN 1 ELSE 0 END) AS rigged_count
+            FROM dev_assets
+            GROUP BY category
+            ORDER BY asset_count DESC, category
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_dev_tree_children(self, parent_dir: str = "") -> dict[str, Any]:
+        """Browse Guerrilla's original developer directory hierarchy one folder level at a time.
+
+        Returns immediate child folders (with recursive asset counts) and direct assets inside `parent_dir`.
+        """
+        norm_parent = parent_dir.replace("\\", "/").strip("/")
+        norm_parent_low = norm_parent.lower()
+        prefix_low = (norm_parent_low + "/") if norm_parent_low else ""
+
+        rows = self.conn.execute("SELECT * FROM dev_assets ORDER BY dev_path").fetchall()
+        folder_counts: dict[str, dict[str, Any]] = {}
+        direct_assets: list[dict[str, Any]] = []
+
+        for r in rows:
+            dp = r["dev_path"]
+            dp_low = dp.lower()
+            if prefix_low and not dp_low.startswith(prefix_low):
+                continue
+            rel = dp[len(prefix_low) :] if prefix_low else dp
+            parts = [p for p in rel.split("/") if p]
+            if not parts:
+                continue
+            if len(parts) == 1:
+                d = dict(r)
+                d["is_skinned"] = bool(d["is_skinned"])
+                d["is_dlc"] = bool(d["is_dlc"])
+                direct_assets.append(d)
+            else:
+                seg = parts[0]
+                child_path = f"{norm_parent}/{seg}" if norm_parent else seg
+                ckey = child_path.lower()
+                ent = folder_counts.get(ckey)
+                if ent is None:
+                    ent = {
+                        "path": child_path,
+                        "name": seg,
+                        "asset_count": 0,
+                        "categories": set(),
+                    }
+                    folder_counts[ckey] = ent
+                ent["asset_count"] += 1
+                ent["categories"].add(r["category"])
+
+        folders = [
+            {
+                "path": v["path"],
+                "name": v["name"],
+                "asset_count": v["asset_count"],
+                "categories": sorted(v["categories"]),
+            }
+            for v in sorted(folder_counts.values(), key=lambda x: (-x["asset_count"], x["name"].lower()))
+        ]
+        return {
+            "parent_dir": norm_parent,
+            "folders": folders,
+            "assets": direct_assets,
+        }
+
+    def search_dev_assets(
+        self,
+        query: str = "",
+        category: str = "",
+        dir_prefix: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM dev_assets WHERE 1=1"
+        params: list[Any] = []
+        if category:
+            sql += " AND category = ?"
+            params.append(category)
+        if dir_prefix:
+            pref = dir_prefix.replace("\\", "/").strip("/")
+            sql += " AND (LOWER(dev_path) LIKE LOWER(?) OR LOWER(parent_dir) LIKE LOWER(?))"
+            params.extend([f"{pref}%", f"{pref}%"])
+        if query:
+            like = f"%{query}%"
+            sql += (
+                " AND (display_name LIKE ? OR dev_path LIKE ? OR resource_type LIKE ? "
+                "OR asset_id = ? OR resource_id = ?)"
+            )
+            params.extend([like, like, like, query, query])
+        sql += " ORDER BY is_skinned DESC, tset_count DESC, dev_path LIMIT ?"
+        params.append(limit)
+        out = []
+        for r in self.conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["is_skinned"] = bool(d["is_skinned"])
+            d["is_dlc"] = bool(d["is_dlc"])
+            out.append(d)
+        return out
+
+    def get_dev_asset(self, asset_id_or_path: str) -> dict[str, Any] | None:
+        key = asset_id_or_path.replace("\\", "/").strip("/")
+        r = self.conn.execute(
+            """
+            SELECT * FROM dev_assets
+            WHERE LOWER(dev_path) = LOWER(?) OR asset_id = ? OR resource_id = ?
+            LIMIT 1
+            """,
+            (key, asset_id_or_path, asset_id_or_path),
+        ).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["is_skinned"] = bool(d["is_skinned"])
+        d["is_dlc"] = bool(d["is_dlc"])
+        return d
