@@ -4572,6 +4572,178 @@ def _load_control_rig_module():
     return mod
 
 
+def _bind_native_shader_drivers(
+    arm_obj: Any,
+    asset_kind: str,
+    shader_controls: dict[str, Any] | None,
+    has_plasma_charge: bool = False,
+) -> None:
+    """Expose native keyframeable shader Custom Properties on `arm_obj` & wire pure-C AVERAGE drivers
+    directly into `HFW_MachineShaderControl` / `HFW_PlasmaChargeControl` / `HFW_CharacterControl`!
+
+    Works 100% natively in vanilla Blender WITHOUT the HFWToolkit add-on AND even with Python disabled!
+    """
+    if arm_obj is None:
+        return
+    sc = shader_controls or {}
+
+    def _set_col_prop(key: str, rgb: Any, desc: str) -> None:
+        vals = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+        arm_obj[key] = vals
+        try:
+            arm_obj.id_properties_ui(key).update(
+                min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, subtype="COLOR", description=desc
+            )
+        except Exception:
+            pass
+
+    def _set_flt_prop(key: str, val: float, mn: float, mx: float, desc: str, *, factor: bool = False) -> None:
+        arm_obj[key] = float(val)
+        try:
+            kw: dict[str, Any] = {"min": mn, "max": mx, "soft_min": mn, "soft_max": mx, "description": desc}
+            if factor:
+                kw["subtype"] = "FACTOR"
+            arm_obj.id_properties_ui(key).update(**kw)
+        except Exception:
+            pass
+
+    def _drive_scalar(sock: Any, prop_key: str) -> None:
+        try:
+            sock.driver_remove("default_value")
+        except Exception:
+            pass
+        try:
+            fc = sock.driver_add("default_value")
+            drv = fc.driver
+            drv.type = "AVERAGE"
+            v = drv.variables.new()
+            v.name = "val"
+            v.type = "SINGLE_PROP"
+            v.targets[0].id_type = "OBJECT"
+            v.targets[0].id = arm_obj
+            v.targets[0].data_path = f'["{prop_key}"]'
+        except Exception:
+            pass
+
+    def _drive_color(sock: Any, prop_key: str) -> None:
+        for ch in range(3):
+            try:
+                sock.driver_remove("default_value", ch)
+            except Exception:
+                pass
+            try:
+                fc = sock.driver_add("default_value", ch)
+                drv = fc.driver
+                drv.type = "AVERAGE"
+                v = drv.variables.new()
+                v.name = "c"
+                v.type = "SINGLE_PROP"
+                v.targets[0].id_type = "OBJECT"
+                v.targets[0].id = arm_obj
+                v.targets[0].data_path = f'["{prop_key}"][{ch}]'
+            except Exception:
+                pass
+
+    if asset_kind == "machine":
+        ctrl_ng = bpy.data.node_groups.get("HFW_MachineShaderControl")
+        plasma_ng = bpy.data.node_groups.get("HFW_PlasmaChargeControl")
+        if ctrl_ng is None and plasma_ng is None:
+            return
+        arm_obj["hfw_shader_kind"] = "machine"
+        mc = sc.get("muscle_color", [0.95, 0.28, 0.02])
+        ec = sc.get("eye_color", [0.04, 0.56, 1.0])
+        eac = sc.get("eye_alert_color", [1.0, 0.08, 0.01])
+        lc = sc.get("liquid_override_color", [0.08, 0.62, 1.0])
+        pc = sc.get("plasma_color", [0.46, 0.05, 1.0])
+        p_def = float(sc.get("plasma_charge", 1.0 if (has_plasma_charge or sc.get("is_plasma")) else 0.0))
+
+        _set_col_prop("hfw_sh_muscle_color", mc, "Machine optical muscle fiber glow color")
+        _set_flt_prop("hfw_sh_muscle_glow", 1.0, 0.0, 4.0, "Machine muscle & cable emission strength")
+        _set_col_prop("hfw_sh_eye_color", ec, "Calm / patrol eye optics color")
+        _set_col_prop("hfw_sh_eye_alert_color", eac, "Hostile / combat alert eye optics color")
+        _set_flt_prop("hfw_sh_eye_alert", 0.0, 0.0, 1.0, "Eye Alert blend (0 = Patrol, 1 = Alert)", factor=True)
+        _set_flt_prop("hfw_sh_eye_glow", 1.0, 0.0, 4.0, "Eye optics emission strength")
+        _set_col_prop("hfw_sh_liquid_color", lc, "Override color for elemental sacs & canisters")
+        _set_flt_prop("hfw_sh_liquid_mix", float(sc.get("liquid_override_fac", 0.0)), 0.0, 1.0, "Override native sac/canister liquid colors", factor=True)
+        _set_flt_prop("hfw_sh_liquid_glow", float(sc.get("liquid_glow_scale", 1.0)), 0.0, 4.0, "Elemental liquid & canister glow strength")
+        _set_flt_prop("hfw_sh_anim_speed", float(sc.get("animation_speed", 1.0)), 0.0, 4.0, "Animated muscle/liquid/scan shader speed")
+        if has_plasma_charge or sc.get("is_plasma"):
+            _set_col_prop("hfw_sh_plasma_color", pc, "Plasma charge-up emission color")
+            _set_flt_prop("hfw_sh_plasma_charge", p_def, 0.0, 1.0, "Plasma Charge-Up (0 = Idle, 1 = Full Charge)", factor=True)
+            arm_obj["hfw_plasma_charge"] = p_def
+
+        col_map = {
+            "Muscle Color": "hfw_sh_muscle_color",
+            "Eye Color": "hfw_sh_eye_color",
+            "Eye Alert Color": "hfw_sh_eye_alert_color",
+            "Liquid Override Color": "hfw_sh_liquid_color",
+            "Plasma Color": "hfw_sh_plasma_color",
+        }
+        val_map = {
+            "Muscle Glow Scale": "hfw_sh_muscle_glow",
+            "Eye Alert State": "hfw_sh_eye_alert",
+            "Eye Glow Scale": "hfw_sh_eye_glow",
+            "Liquid Override Mix": "hfw_sh_liquid_mix",
+            "Liquid Glow Scale": "hfw_sh_liquid_glow",
+            "Animation Speed": "hfw_sh_anim_speed",
+            "Plasma Charge": "hfw_sh_plasma_charge",
+        }
+        if ctrl_ng is not None:
+            for n in ctrl_ng.nodes:
+                if n.type == "RGB" and n.label in col_map and col_map[n.label] in arm_obj:
+                    _drive_color(n.outputs[0], col_map[n.label])
+                elif n.type == "VALUE" and n.label in val_map and val_map[n.label] in arm_obj:
+                    _drive_scalar(n.outputs[0], val_map[n.label])
+        if plasma_ng is not None and "hfw_sh_plasma_charge" in arm_obj:
+            for n in plasma_ng.nodes:
+                if n.type == "VALUE" and n.label == "Plasma Charge":
+                    _drive_scalar(n.outputs[0], "hfw_sh_plasma_charge")
+
+    elif asset_kind == "character":
+        char_ng = bpy.data.node_groups.get("HFW_CharacterControl")
+        if char_ng is None:
+            return
+        arm_obj["hfw_shader_kind"] = "character"
+        st = sc.get("skin_tone_linear") or [0.453, 0.246, 0.209]
+        hc = sc.get("hair_color_linear") or [0.045, 0.032, 0.025]
+        _set_col_prop("hfw_sh_skin_tone", st, "Shared DXIL 570:0 Skin LUT tone across Head & Body")
+        _set_flt_prop("hfw_sh_skin_brightness", 1.0, 0.25, 2.0, "Skin albedo brightness multiplier")
+        _set_flt_prop("hfw_sh_sss_weight", 0.14, 0.0, 0.6, "Subsurface scattering weight")
+        _set_col_prop("hfw_sh_hair_color", hc, "Shared DXIL 382:0 Hair LUT color")
+        for n in char_ng.nodes:
+            if n.type == "RGB" and n.label == "Skin Tone":
+                _drive_color(n.outputs[0], "hfw_sh_skin_tone")
+            elif n.type == "RGB" and n.label == "Hair Color":
+                _drive_color(n.outputs[0], "hfw_sh_hair_color")
+            elif n.type == "VALUE" and n.label == "Skin Brightness":
+                _drive_scalar(n.outputs[0], "hfw_sh_skin_brightness")
+            elif n.type == "VALUE" and n.label == "Subsurface Weight":
+                _drive_scalar(n.outputs[0], "hfw_sh_sss_weight")
+
+
+def _embed_native_rig_ui_in_blend() -> None:
+    """Embed self-contained `hfw_rig_ui.py` (`use_module = True`) into the .blend so Rig & Shader UI works WITHOUT the add-on!"""
+    ui_src_path = Path(__file__).resolve().with_name("rig_ui_embedded.py")
+    if not ui_src_path.is_file():
+        return
+    try:
+        src_text = ui_src_path.read_text(encoding="utf-8")
+        txt = bpy.data.texts.get("hfw_rig_ui.py")
+        if txt is None:
+            txt = bpy.data.texts.new("hfw_rig_ui.py")
+        txt.clear()
+        txt.write(src_text)
+        txt.use_module = True
+        # Register immediately in the active Blender session too
+        ns: dict[str, Any] = {"__name__": "hfw_rig_ui"}
+        exec(compile(src_text, "hfw_rig_ui.py", "exec"), ns)
+        reg_fn = ns.get("register")
+        if callable(reg_fn):
+            reg_fn()
+    except Exception as exc:
+        print(f"[HFWToolkit] Note: Embedded native Rig UI skipped ({exc})")
+
+
 def import_bundle_into_scene(
     bundle_dir: str | Path,
     enable_detail_nodes: bool = True,
@@ -4629,41 +4801,12 @@ def import_bundle_into_scene(
     if shader_controls:
         arm_obj["hfw_variant_profile"] = str(shader_controls.get("profile", "standard"))
 
-    # If this is a Plasma-charging machine (Slaughterspine!), expose a single live `hfw_plasma_charge` slider (0..1)
-    # on the Armature driving `HFW_PlasmaChargeControl` across every PlasmaSpike, PlasmaCharger, PlasmaCore, Body & Muscle!
+    # Wire native keyframeable Armature shader drivers & embed add-on-free `hfw_rig_ui.py`!
     has_plasma_charge = any(
         (mmeta.get("emissive_overlay") or {}).get("kind") == "plasma_charge_overlay"
         for mmeta in manifest["materials"].values()
     )
-    if has_plasma_charge:
-        arm_obj["hfw_plasma_charge"] = 1.0
-        try:
-            ui_m = arm_obj.id_properties_ui("hfw_plasma_charge")
-            ui_m.update(
-                min=0.0,
-                max=1.0,
-                soft_min=0.0,
-                soft_max=1.0,
-                description="Slaughterspine Plasma Charge-Up (0.0 = Uncharged Idle, 1.0 = Full Electric Purple Plasma Charge)",
-            )
-        except Exception:
-            pass
-        ctrl_ng = bpy.data.node_groups.get("HFW_PlasmaChargeControl")
-        if ctrl_ng is not None:
-            for n in ctrl_ng.nodes:
-                if n.type == "VALUE" and n.label == "Plasma Charge":
-                    try:
-                        fc = n.outputs[0].driver_add("default_value")
-                        drv = fc.driver
-                        drv.type = "AVERAGE"
-                        var = drv.variables.new()
-                        var.name = "chg"
-                        var.type = "SINGLE_PROP"
-                        var.targets[0].id_type = "OBJECT"
-                        var.targets[0].id = arm_obj
-                        var.targets[0].data_path = '["hfw_plasma_charge"]'
-                    except Exception:
-                        pass
+    _bind_native_shader_drivers(arm_obj, asset_kind, shader_controls, has_plasma_charge=has_plasma_charge)
 
     created = 0
     for pmeta in manifest["parts"]:
@@ -4738,6 +4881,9 @@ def import_bundle_into_scene(
                     anim_count = len(acts)
                 except Exception as exc:
                     print(f"[HFWToolkit] Warning: Animation import skipped ({exc})")
+
+    # Always embed the add-on-free `hfw_rig_ui.py` so both Rig Controls & Shader Controls work natively in `Item`!
+    _embed_native_rig_ui_in_blend()
 
     anim_summary_str = f", {anim_count} HFW animations" if anim_count else ""
     print(

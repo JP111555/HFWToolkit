@@ -169,13 +169,11 @@ def test_universal_control_rig_chain_detection(game_and_catalog, query, expected
         assert dyn["wings_ik"] == "Wings IK"
     if expected_archetype == "serpentine":
         assert len(spec["spine"]) >= 20
-        assert spec["torso_ik_mode"] == "hood"
-        assert dyn["torso_ik"] == "Cobra Hood IK"
-        assert dyn["hood_fk"] == "Cobra Hood FK"
+        assert spec["torso_ik_mode"] == "none"
         assert dyn["frills"] == "Hood Feathers"
-        assert any(s.get("kind") == "spine" for s in spec.get("spline_chains") or [])
+        assert any(s.get("kind") == "serpent_full" and len(s.get("bones") or []) >= 45 for s in spec.get("spline_chains") or [])
         assert dyn["spline_ik"] == "Serpent Spline IK"
-        assert len(spec.get("spinners") or []) >= 40
+        assert len(spec.get("spinners") or []) >= 70
         assert dyn["spinners"] in ("Earthgrinders", "Drills & Grinders")
     if query == "behemoth":
         assert spec["chest"] == "C_Chest_sjnt_0"
@@ -344,8 +342,8 @@ for skey, expected_nm in (
     ("weapons", "Jaw Saws & Launchers"),
 ):
     assert slots.get(skey) == expected_nm, f"Expected slot {{skey}}={{expected_nm}}, got {{slots.get(skey)}}"
-    assert expected_nm in arm.data.collections, f"Missing dynamic collection {{expected_nm}}"
-assert "plates" in slots and slots["plates"] in arm.data.collections
+    assert expected_nm in arm.data.collections_all, f"Missing dynamic collection {{expected_nm}}"
+assert "plates" in slots and slots["plates"] in arm.data.collections_all
 
 # Verify Multi-Bone CTRL_Chest Move (G) arches LOWER + MID + UPPER SPINE, `hfw_rig_chest = 0.0` disables Chest IK cleanly, AND switches cleanly to Pure Spine FK!
 arm["hfw_rig_master"] = 1.0
@@ -374,8 +372,8 @@ bpy.context.view_layer.update()
 # Turn Chest IK OFF -> Spine FK (zero-pop snap + hides Chest IK + shows Spine FK!)
 cr.switch_limb_ik_fk(arm, group="torso", to_ik=False, snap_pose=True)
 assert float(arm["hfw_ik_fk_torso"]) == 0.0
-assert arm.data.collections[slots["spine_fk"]].is_visible is True
-assert arm.data.collections[slots["torso_ik"]].is_visible is False
+assert arm.data.collections_all[slots["spine_fk"]].is_visible is True
+assert arm.data.collections_all[slots["torso_ik"]].is_visible is False
 assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - head_c1).length < 0.01
 cr.switch_limb_ik_fk(arm, group="torso", to_ik=True, snap_pose=True)
 cr.reset_control_rig_pose(arm)
@@ -405,8 +403,8 @@ assert (arm.pose.bones["L_thumb_sjnt_0"].matrix.to_translation() - dew_r0).lengt
 
 cr.switch_limb_ik_fk(arm, group="legs", to_ik=False, snap_pose=True)
 assert float(arm["hfw_ik_fk_legs"]) == 0.0
-assert arm.data.collections[slots["legs_fk"]].is_visible is True
-assert arm.data.collections[slots["legs_ik"]].is_visible is False
+assert arm.data.collections_all[slots["legs_fk"]].is_visible is True
+assert arm.data.collections_all[slots["legs_ik"]].is_visible is False
 assert (arm.pose.bones["L_leg_sjnt_3"].matrix.to_translation() - foot_ik_p).length < 0.005
 
 # Edit in pure FK mode -> must visibly move leg -> then zero-pop snap back to IK!
@@ -419,8 +417,8 @@ assert (foot_fk_moved - foot_ik_p).length > 0.15
 
 cr.switch_limb_ik_fk(arm, group="legs", to_ik=True, snap_pose=True)
 assert float(arm["hfw_ik_fk_legs"]) == 1.0
-assert arm.data.collections[slots["legs_ik"]].is_visible is True
-assert arm.data.collections[slots["legs_fk"]].is_visible is False
+assert arm.data.collections_all[slots["legs_ik"]].is_visible is True
+assert arm.data.collections_all[slots["legs_fk"]].is_visible is False
 assert (arm.pose.bones["L_leg_sjnt_3"].matrix.to_translation() - foot_fk_moved).length < 0.005
 cr.reset_control_rig_pose(arm)
 
@@ -451,12 +449,23 @@ assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - hd_w0).length 
 arm["hfw_ik_fk_head"] = 0.0; arm["hfw_head_ik_space"] = 0.0
 cr.reset_control_rig_pose(arm)
 
-# Looping Mouth Chainsaws (auto-spin speed AND manual dial, zero drift at rest!)
+# Physically-Linked Mouth Chainsaws (0.0 default speed, independent L/R dials, <2.5deg latch, <2mm X-clip!)
 saw_teeth = [pb.name for pb in arm.pose.bones if not pb.name.startswith(("CTRL_", "MCH_", "WGT_")) and "sawblade" in pb.name.lower()]
 assert len(saw_teeth) == 52
+assert float(arm["hfw_saw_speed"]) == 0.0
+saw_grps = rig_meta.get("chainsaw_groups") or []
+assert len(saw_grps) == 2
 bpy.context.scene.frame_set(1); arm["hfw_saw_speed"] = 0.0
 arm.update_tag(); bpy.context.view_layer.update()
 saw_p0 = {{b: arm.pose.bones[b].matrix.to_translation().copy() for b in saw_teeth}}
+# Independent per-saw dial moves ONLY left saw, leaving right saw at 0.000m!
+d_l = saw_grps[0]["dial_ctrl"]
+arm.pose.bones[d_l].rotation_mode = "XYZ"
+arm.pose.bones[d_l].rotation_euler = Euler((0.0, math.pi * 0.5, 0.0), "XYZ")
+arm.update_tag(); bpy.context.view_layer.update()
+assert (arm.pose.bones[saw_grps[0]["def_bones"][0]].head - saw_p0[saw_grps[0]["def_bones"][0]]).length > 0.15
+assert (arm.pose.bones[saw_grps[1]["def_bones"][0]].head - saw_p0[saw_grps[1]["def_bones"][0]]).length < 0.0005
+arm.pose.bones[d_l].rotation_euler = Euler((0.0, 0.0, 0.0), "XYZ")
 arm["hfw_saw_speed"] = 1.0; arm.update_tag()
 bpy.context.scene.frame_set(15); bpy.context.view_layer.update()
 assert min((arm.pose.bones[b].matrix.to_translation() - saw_p0[b]).length for b in saw_teeth) > 0.10
@@ -464,6 +473,12 @@ arm["hfw_saw_speed"] = 0.0; bpy.context.scene.frame_set(1)
 arm.pose.bones["CTRL_Saw_Spin"].rotation_euler = Euler((0.0, 2.0, 0.0), "XYZ")
 arm.update_tag(); bpy.context.view_layer.update()
 assert min((arm.pose.bones[b].matrix.to_translation() - saw_p0[b]).length for b in saw_teeth) > 0.08
+# Verify zero-unlatching neighbor alignment across all 26 teeth of Left Saw!
+l_defs = saw_grps[0]["def_bones"]
+for si in range(len(l_defs)):
+    v_n = (arm.pose.bones[l_defs[(si - 1) % len(l_defs)]].head - arm.pose.bones[l_defs[si]].head).normalized()
+    y_a = arm.pose.bones[l_defs[si]].matrix.to_3x3().col[1].normalized()
+    assert math.degrees(math.acos(max(-1.0, min(1.0, abs(y_a.dot(v_n)))))) < 2.5
 cr.reset_control_rig_pose(arm)
 
 # Master Finger/Talon Curl lever curls all phalanges cleanly
@@ -479,15 +494,31 @@ curled_cnt = sum(
 assert curled_cnt >= 2
 cr.reset_control_rig_pose(arm)
 
-# Toggleable B-Bone Spline IK on Tail (rigid uniform armor scale!)
+# Zero-Stretch Sliding B-Bone Spline IK on Tail (pulling end knot +10m must NEVER stretch any tail segment!)
 arm["hfw_ik_fk_spline"] = 1.0; arm.update_tag(); bpy.context.view_layer.update()
+t_bones = rig_meta["spline_ik"][0]["bones"]
+t_rest_lens = [(arm.data.bones[t_bones[i + 1]].head_local - arm.data.bones[t_bones[i]].head_local).length for i in range(len(t_bones) - 1)]
 t_tip0 = arm.pose.bones["C_tail_sjnt_7"].matrix.to_translation().copy()
-arm.pose.bones[rig_meta["spline_ctrls"][-1]].location = (0.6, 0.0, 0.5)
+arm.pose.bones[rig_meta["spline_ctrls"][-1]].location = (0.6, -10.0, 0.5)
 arm.update_tag(); bpy.context.view_layer.update()
-assert (arm.pose.bones["C_tail_sjnt_7"].matrix.to_translation() - t_tip0).length > 0.35
+assert (arm.pose.bones["C_tail_sjnt_7"].matrix.to_translation() - t_tip0).length > 0.25
+for i in range(len(t_bones) - 1):
+    d_now = (arm.pose.bones[t_bones[i + 1]].head - arm.pose.bones[t_bones[i]].head).length
+    assert abs(d_now - t_rest_lens[i]) < 0.002, f"Spline IK stretched segment {{i}}: {{d_now}} vs {{t_rest_lens[i]}}"
 assert max(abs(s - 1.0) for s in arm.pose.bones["C_tail_sjnt_7"].matrix.to_scale()) < 0.005
 arm["hfw_ik_fk_spline"] = 0.0
 cr.reset_control_rig_pose(arm)
+
+# Native Add-on-Free UI (`hfw_rig_ui.py`), Hierarchical Bone Collections, and Pure-C Armature Shader Drivers!
+ui_tb = bpy.data.texts.get("hfw_rig_ui.py")
+assert ui_tb is not None and ui_tb.use_module is True
+assert "01. Main Controls" in arm.data.collections and "05. Mechanism (Hidden)" in arm.data.collections
+arm["hfw_sh_eye_alert"] = 1.0
+arm.update_tag(); bpy.context.view_layer.update()
+ng_ev = bpy.data.node_groups["HFW_MachineShaderControl"].evaluated_get(bpy.context.evaluated_depsgraph_get())
+al_nd = next(n for n in ng_ev.nodes if n.label == "Eye Alert State")
+assert abs(float(al_nd.outputs[0].default_value) - 1.0) < 0.01
+arm["hfw_sh_eye_alert"] = 0.0
 
 # Switch back to pure game anim before baking
 arm["hfw_rig_master"] = 0.0

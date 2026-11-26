@@ -207,9 +207,9 @@ def _extract_side(name: str) -> str:
     return "C"
 
 
-def _numeric_sort_key(name: str) -> tuple[int, str]:
+def _numeric_sort_key(name: str) -> tuple[tuple[int, ...], str]:
     nums = re.findall(r"\d+", name)
-    return (int(nums[-1]) if nums else -1, name.lower())
+    return (tuple(int(x) for x in nums), name.lower())
 
 
 def _order_chain_topologically(names: list[str], parent_map: dict[str, str | None]) -> list[str]:
@@ -958,18 +958,10 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         neck_chain = [b for b in neck_chain if b != chest_bone]
 
     # Multi-bone Torso/Chest IK is supported whenever chest_bone sits directly at the top of spine_chain (`spine_0..k -> chest`)!
-    # Serpentine rigs (Slitherfang) instead support Cobra Hood IK across `chest_bone -> neck_0..N` (`torso_ik_mode = "hood"`)!
+    # Serpentine rigs (Slitherfang) use ONE unified, continuous, non-stretching Full-Body Spline IK from Hood Tip -> Hips -> Tail
+    # so there is NEVER a harsh kink at hipsBone!
     spine_torso_ik = bool(spine_chain and chest_bone and parent_map.get(chest_bone) == spine_chain[-1])
-    hood_torso_ik = bool(
-        not spine_torso_ik
-        and len(legs) == 0
-        and len(spine_chain) >= 8
-        and chest_bone
-        and len(neck_chain) >= 4
-        and parent_map.get(neck_chain[0]) == chest_bone
-        and all(parent_map.get(neck_chain[i]) == neck_chain[i - 1] for i in range(1, len(neck_chain)))
-    )
-    torso_ik_mode = "spine" if spine_torso_ik else ("hood" if hood_torso_ik else "none")
+    torso_ik_mode = "spine" if spine_torso_ik else "none"
     torso_ik_supported = torso_ik_mode != "none"
 
     # 8. Smaller Articulated FK Chains: Hand Fingers/Claws, Wing Ribs/Fingers, Foot Toes/Talons/Hooves, Secondary Machine Details!
@@ -1104,10 +1096,10 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         "drill_sjnt",
         "drill_jnt",
         "bodygrinder",
+        "ballgrinder",
+        "mouthroofgrinder",
         "slotmachinegrinder",
-        "_grinder_",
-        "grinder_sjnt",
-        "grinder_jnt",
+        "grinder",
         "legrotor",
         "longhornrotor",
         "rotor_jnt",
@@ -1117,7 +1109,40 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         "tonguedrum",
         "drumturret",
     )
-    _SPINNER_EXCL = ("plate", "clip", "helper", "muzzle", "eject", "danger", "scrape", "arm")
+    _SPINNER_EXCL = ("plate", "clip", "helper", "muzzle", "eject", "danger", "scrape", "arm", "hinge", "door", "cover", "hatch", "bracket", "guard")
+
+    def _classify_spinner_group(bone_low: str) -> tuple[str, str]:
+        """Return `(group_id, human_label)` so every distinct mechanical drill/grinder bank gets its own independent controls!"""
+        if "slotmachine" in bone_low:
+            return "drum_grinders", "Drum Grinders"
+        if "ballgrinder" in bone_low:
+            return "hood_grinders", "Hood Grinders"
+        if "mouthroof" in bone_low:
+            return "mouth_grinders", "Mouth Grinders"
+        if "bodygrinder" in bone_low or "centerbodygrinder" in bone_low:
+            return "body_grinders", "Body Grinders"
+        if "grinder" in bone_low:
+            return "grinders", "Grinders"
+        if "drillbit" in bone_low:
+            return "mouth_drills", "Mouth Drills"
+        if "jawdrill" in bone_low:
+            return "jaw_drills", "Jaw Drills"
+        if "headdrill" in bone_low:
+            return "head_drills", "Head Drills"
+        if "drill" in bone_low:
+            return "drills", "Drills"
+        if "legrotor" in bone_low:
+            return "leg_rotors", "Leg Rotors"
+        if "hornrotor" in bone_low:
+            return "horn_rotors", "Horn Rotors"
+        if "turbine" in bone_low:
+            return "turbine", "Turbine"
+        if "tonguedrum" in bone_low:
+            return "tongue_drum", "Tongue Drum"
+        if "drumturret" in bone_low:
+            return "drum_turrets", "Drum Turrets"
+        return "rotors", "Rotors"
+
     spinners: list[dict[str, Any]] = []
     for n in names:
         low = n.lower()
@@ -1135,10 +1160,13 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 if "grinder" in low
                 else ("rotor" if ("rotor" in low or "turbine" in low or "drum" in low) else "drill")
             )
+            grp_id, grp_label = _classify_spinner_group(low)
             spinners.append(
                 {
                     "name": f"{stem}_{side}",
                     "kind": kind,
+                    "group_id": grp_id,
+                    "group_label": grp_label,
                     "side": side,
                     "parent_def": parent_map.get(n),
                     "bone": n,
@@ -1371,10 +1399,11 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                             fwd_vec = (dt[0] / tl, dt[1] / tl, 0.0)
                             break
 
-    # 9b. Toggleable Head/Neck IK & Spline IK Chain Detection
+    # 9b. Toggleable Head/Neck IK & Non-Stretching Spline IK Chain Detection
     head_ik_supported = bool(
         head_bone
         and len(neck_chain) >= 1
+        and archetype != "serpentine"
         and torso_ik_mode != "hood"
         and parent_map.get(head_bone) == neck_chain[-1]
         and all(parent_map.get(neck_chain[i]) == neck_chain[i - 1] for i in range(1, len(neck_chain)))
@@ -1382,14 +1411,28 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
 
     spline_chains: list[dict[str, Any]] = []
     if archetype == "serpentine" and len(spine_chain) >= 8:
+        # Build ONE continuous unbroken front-to-back serpent column:
+        # Cobra Hood Tip (`C_neck_sjnt_11`) -> Neck -> Chest -> Hips (`hipsBone`) -> Body -> Tail Tip (`C_spine_sjnt_40`)!
+        # Eliminates EVERY rigid hips kink so the ENTIRE 52-bone snake flows smoothly as one unified spline!
+        serp_col: list[str] = []
+        for nb in reversed(neck_chain):
+            if nb not in serp_col:
+                serp_col.append(nb)
+        if chest_bone and chest_bone not in serp_col:
+            serp_col.append(chest_bone)
+        if hips_bone and hips_bone not in serp_col:
+            serp_col.append(hips_bone)
+        for sb in spine_chain:
+            if sb not in serp_col:
+                serp_col.append(sb)
         spline_chains.append(
             {
                 "name": "SerpentBody",
-                "kind": "spine",
+                "kind": "serpent_full",
                 "group_prop": "hfw_rig_spine",
-                "bones": list(spine_chain),
+                "bones": serp_col,
                 "default_on": True,
-                "knots": min(7, max(4, len(spine_chain) // 6 + 2)),
+                "knots": min(9, max(6, len(serp_col) // 6 + 1)),
             }
         )
     else:
@@ -1784,40 +1827,109 @@ def _analyze_armature_mesh_geometry(arm_obj: Any) -> tuple[dict[str, float], dic
                 if plist:
                     pts_by_bone.setdefault(bnm, []).append(np.array(plist, dtype=np.float32))
 
+    # Aggregate descendant helper mesh vertices into parent rotary/grinder bones so bones whose meshes live on child
+    # `*_helper` joints (e.g. Slitherfang `L/R_bodyGrinder*`, `C_slotMachineGrinders*`, `L/R_ballGrinder*`) get EXACT spin axes!
+    _rotary_hint_tokens = ("grind", "drill", "rotor", "disc", "drum", "turb", "saw", "spin", "wheel", "prop")
+    bone_by_name = {b.name: b for b in bones if b.name in bone_inv}
+    rotary_pts: dict[str, list[np.ndarray]] = {}
+    for bnm, b in bone_by_name.items():
+        if not any(tk in bnm.lower() for tk in _rotary_hint_tokens):
+            continue
+        desc_names: set[str] = {bnm}
+        stack = [b]
+        while stack:
+            cur = stack.pop()
+            for ch in cur.children:
+                if ch.name in bone_inv:
+                    desc_names.add(ch.name)
+                    stack.append(ch)
+        inv_root = bone_inv[bnm]
+        agg: list[np.ndarray] = []
+        for dn in desc_names:
+            if dn not in pts_by_bone:
+                continue
+            if dn == bnm:
+                agg.extend(pts_by_bone[dn])
+            else:
+                rel_m = inv_root @ bone_by_name[dn].matrix_local
+                r3 = np.array(rel_m.to_3x3(), dtype=np.float32)
+                t3 = np.array(rel_m.to_translation(), dtype=np.float32)
+                for chunk in pts_by_bone[dn]:
+                    agg.append(chunk @ r3.T + t3[None, :])
+        if agg:
+            rotary_pts[bnm] = agg
+
+    def _detect_circular_spin_axis(arr_in: np.ndarray) -> tuple[float, float, float] | None:
+        """Find the true mechanical spin axle via 2D cross-section circularity + pivot concentricity!"""
+        if len(arr_in) < 6:
+            return None
+        arr64 = arr_in.astype(np.float64, copy=False)
+        cands = [
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+        ]
+        cen = arr64 - arr64.mean(axis=0, keepdims=True)
+        cov3 = (cen.T @ cen) / max(1, len(arr64))
+        ev3, vec3 = np.linalg.eigh(cov3)
+        if float(ev3[2]) > 1e-8:
+            cands.append(vec3[:, 0])
+            cands.append(vec3[:, 2])
+        best_ax = None
+        best_score = 1e9
+        for ax in cands:
+            nrm = float(np.linalg.norm(ax))
+            if nrm < 1e-6:
+                continue
+            ax = ax / nrm
+            perp_v = arr64 - np.outer(arr64 @ ax, ax)
+            tmp = np.array([1.0, 0.0, 0.0]) if abs(ax[0]) < 0.8 else np.array([0.0, 1.0, 0.0])
+            u = np.cross(ax, tmp)
+            u /= float(np.linalg.norm(u)) or 1.0
+            v = np.cross(ax, u)
+            px = perp_v @ u
+            py = perp_v @ v
+            r_mean = float(np.mean(np.hypot(px, py))) + 1e-6
+            ecc_pivot = math.hypot(float(np.mean(px)), float(np.mean(py))) / r_mean
+            cov2 = np.cov(np.vstack([px, py]))
+            w2 = np.linalg.eigvalsh(cov2)
+            aspect = math.sqrt(max(float(w2[1]), 1e-9) / max(float(w2[0]), 1e-9)) - 1.0
+            score = aspect + 1.5 * ecc_pivot
+            if score < best_score:
+                best_score = score
+                best_ax = ax
+        if best_ax is None:
+            return None
+        abs_ax = np.abs(best_ax)
+        dom = int(np.argmax(abs_ax))
+        if float(abs_ax[dom]) > 0.92:
+            snap = [0.0, 0.0, 0.0]
+            snap[dom] = 1.0 if best_ax[dom] >= 0.0 else -1.0
+            return (snap[0], snap[1], snap[2])
+        nrm = float(np.linalg.norm(best_ax)) or 1.0
+        return (float(best_ax[0] / nrm), float(best_ax[1] / nrm), float(best_ax[2] / nrm))
+
     radii: dict[str, float] = {}
     spin_axes: dict[str, tuple[float, float, float]] = {}
     for bnm, chunks in pts_by_bone.items():
         arr = np.concatenate(chunks, axis=0)
         if len(arr) < 4:
             continue
-        # Measure perpendicular radius around the bone's TRUE anatomical axis (head->child), 75th percentile ignores thin fins/plates!
         u_ax = bone_axis_local.get(bnm, np.array((0.0, 1.0, 0.0), dtype=np.float32))
         proj = (arr @ u_ax)[:, None] * u_ax[None, :]
         perp = np.linalg.norm(arr - proj, axis=1)
         r75 = float(np.percentile(perp, 75))
         if r75 > 0.005:
             radii[bnm] = r75
-        # 3D PCA spin-axis detection for cylindrical drills / flat discs / grinders
-        centered = arr - arr.mean(axis=0, keepdims=True)
-        cov = (centered.T @ centered) / max(1, len(arr))
-        evals, evecs = np.linalg.eigh(cov)
-        # evals sorted ascending: e0 <= e1 <= e2
-        e0, e1, e2 = float(evals[0]), float(evals[1]), float(evals[2])
-        if e2 > 1e-6:
-            # Elongated cylinder/cone drill (`e2 >> e1 ~ e0`) vs flat disc/wheel (`e0 << e1 ~ e2`)
-            ratio_long = e2 / max(e1, 1e-6)
-            ratio_flat = e1 / max(e0, 1e-6)
-            ax_vec = evecs[:, 2] if ratio_long >= ratio_flat else evecs[:, 0]
-            # Snap cleanly to cardinal bone axis if within ~20 deg (matches Decima authoring convention!)
-            abs_ax = np.abs(ax_vec)
-            dom = int(np.argmax(abs_ax))
-            if float(abs_ax[dom]) > 0.93:
-                snap = [0.0, 0.0, 0.0]
-                snap[dom] = 1.0 if ax_vec[dom] >= 0.0 else -1.0
-                spin_axes[bnm] = (snap[0], snap[1], snap[2])
-            else:
-                nrm = float(np.linalg.norm(ax_vec)) or 1.0
-                spin_axes[bnm] = (float(ax_vec[0] / nrm), float(ax_vec[1] / nrm), float(ax_vec[2] / nrm))
+        ax_det = _detect_circular_spin_axis(arr)
+        if ax_det is not None:
+            spin_axes[bnm] = ax_det
+
+    for bnm, chunks in rotary_pts.items():
+        arr = np.concatenate(chunks, axis=0)
+        ax_det = _detect_circular_spin_axis(arr)
+        if ax_det is not None:
+            spin_axes[bnm] = ax_det
 
     # Propagate helper/armor radii gently onto immediate parent core bone so armored torsos get true outer armor clearance!
     for b in bones:
@@ -2053,7 +2165,7 @@ def compute_dynamic_collection_labels(
         sk0 = spline_chains[0].get("kind")
         spline_ik_lbl = (
             "Serpent Spline IK"
-            if sk0 == "spine"
+            if sk0 in ("spine", "serpent_full")
             else ("Trunk Spline IK" if sk0 == "appendage" else "Tail Spline IK")
         )
     else:
@@ -2374,7 +2486,8 @@ def remove_control_rig(arm_obj: Any) -> None:
         except Exception:
             pass
     _RAW_DEF_COLLS = {"Skeleton", "Body", "Helpers"}
-    for bc in arm_obj.data.collections:
+    all_bcolls = getattr(arm_obj.data, "collections_all", arm_obj.data.collections)
+    for bc in list(all_bcolls):
         if bc.name in _RAW_DEF_COLLS:
             continue
         bones_in = list(bc.bones)
@@ -2397,10 +2510,16 @@ def remove_control_rig(arm_obj: Any) -> None:
         ebones.remove(eb)
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    for cname in colls_to_remove:
+    for cname in list(colls_to_remove) + [
+        "01. Main Controls",
+        "02. Hands, Feet & Appendages",
+        "03. Chainsaws, Drills & Weapons",
+        "04. Secondary & Armor",
+        "05. Mechanism (Hidden)",
+    ]:
         if cname in _RAW_DEF_COLLS:
             continue
-        bc = arm_obj.data.collections.get(cname)
+        bc = getattr(arm_obj.data, "collections_all", arm_obj.data.collections).get(cname)
         if bc is not None:
             try:
                 arm_obj.data.collections.remove(bc)
@@ -2483,10 +2602,14 @@ def build_control_rig(
             visible_helper_meshes[pb_nm] = obj.name
             pl = pb_nm.lower()
             if any(tk in pl for tk in ("disc_c_01", "tidaldisc", "grinder_disc", "legrotor_grinder", "headgrinder")) and "dmg" not in pl:
+                h_gid = "tidal_disc" if ("disc_c_01" in pl or "tidaldisc" in pl) else "rotors"
+                h_glbl = "Tidal Disc" if h_gid == "tidal_disc" else "Rotary Discs"
                 helper_spinners.append(
                     {
                         "name": re.sub(r"(_[LlRrCc]x)?_helper$", "", pb_nm, flags=re.IGNORECASE)[:18],
                         "kind": "rotor",
+                        "group_id": h_gid,
+                        "group_label": h_glbl,
                         "side": _extract_side(pb_nm),
                         "parent_def": arm_data.bones[pb_nm].parent.name if (pb_nm in arm_data.bones and arm_data.bones[pb_nm].parent) else None,
                         "bone": pb_nm,
@@ -2495,10 +2618,49 @@ def build_control_rig(
 
     all_spinners = list(spec.get("spinners") or []) + helper_spinners
 
-    def _get_coll(cname: str, visible: bool = True) -> Any:
-        bc = arm_data.collections.get(cname) or arm_data.collections.new(cname)
+    # Native Blender 4.2+/5.3 Hierarchical Bone Collections Tree so Armature Properties is clean & organized WITHOUT any add-on!
+    def _get_coll(cname: str, visible: bool = True, parent_coll: Any = None) -> Any:
+        all_c = getattr(arm_data, "collections_all", arm_data.collections)
+        bc = all_c.get(cname) or arm_data.collections.new(cname, parent=parent_coll)
+        if parent_coll is not None and getattr(bc, "parent", None) != parent_coll:
+            try:
+                bc.parent = parent_coll
+            except Exception:
+                pass
         bc.is_visible = visible
         return bc
+
+    grp_main_coll = _get_coll("01. Main Controls", True)
+    grp_hf_coll = _get_coll("02. Hands, Feet & Appendages", True)
+    grp_mech_coll = _get_coll("03. Chainsaws, Drills & Weapons", True)
+    grp_sec_coll = _get_coll("04. Secondary & Armor", True)
+    grp_mch_root = _get_coll("05. Mechanism (Hidden)", False)
+
+    _SLOT_PARENT_COLL = {
+        "body": grp_main_coll,
+        "head_ik": grp_main_coll,
+        "torso_ik": grp_main_coll,
+        "hood_fk": grp_main_coll,
+        "spline_ik": grp_main_coll,
+        "spine_fk": grp_main_coll,
+        "wings_ik": grp_main_coll,
+        "wings_fk": grp_main_coll,
+        "front_legs_ik": grp_main_coll,
+        "front_legs_fk": grp_main_coll,
+        "legs_ik": grp_main_coll,
+        "legs_fk": grp_main_coll,
+        "arms_ik": grp_main_coll,
+        "arms_fk": grp_main_coll,
+        "hands_feet": grp_hf_coll,
+        "hf_tweaks": grp_hf_coll,
+        "tail": grp_hf_coll,
+        "appendages": grp_hf_coll,
+        "spinners": grp_mech_coll,
+        "weapons": grp_mech_coll,
+        "frills": grp_sec_coll,
+        "plates": grp_sec_coll,
+        "mechanism": grp_mch_root,
+    }
 
     # Compute descriptive, asset-specific Bone Collection names based on what each group controls!
     spec_for_labels = dict(spec)
@@ -2512,13 +2674,14 @@ def build_control_rig(
             return None
         cname = dyn_labels[slot_key]
         active_slots[slot_key] = cname
-        return _get_coll(cname, visible)
+        return _get_coll(cname, visible, parent_coll=_SLOT_PARENT_COLL.get(slot_key))
 
     torso_ik_mode = str(spec.get("torso_ik_mode") or ("spine" if spec.get("torso_ik_supported") else "none"))
     has_torso_ik_spec = torso_ik_mode != "none"
     has_head_ik_spec = bool(spec.get("head_ik_supported"))
     has_spline_spec = bool(spline_chains_spec)
-    spline_spine_active = any(sc.get("kind") == "spine" for sc in spline_chains_spec)
+    spline_spine_active = any(sc.get("kind") in ("spine", "serpent_full") for sc in spline_chains_spec)
+    serpent_full_spec = next((sc for sc in spline_chains_spec if sc.get("kind") == "serpent_full"), None)
     spline_tail_active = any(sc.get("kind") == "tail" for sc in spline_chains_spec)
     spline_app_active = any(sc.get("kind") == "appendage" for sc in spline_chains_spec)
     has_front_legs = any(lg["name"].startswith("FrontLeg_") for lg in spec["legs"])
@@ -2710,6 +2873,7 @@ def build_control_rig(
     # --- 2. CTRL_COG (Hips / Center of Gravity) ---
     hips_def = spec["hips"]
     ctrl_cog = ctrl_root
+    hips_fk_bind: str | None = None
     if hips_def and hips_def in def_rest:
         h_pos = def_rest[hips_def][0]
         ctrl_cog = _new_bone(
@@ -2731,7 +2895,15 @@ def build_control_rig(
             "side": "C",
             "is_root": True, "is_detail": False, "category": "body", "lock_loc": False, "rot_mode": "XYZ",
         }
-        _make_bind_child(hips_def, ctrl_cog, "hfw_rig_spine", "TRANSFORM")
+        if serpent_full_spec is not None:
+            # On Serpentine rigs (Slitherfang!), `hipsBone` rides smoothly INSIDE the continuous full-body Spline IK
+            # (zero rigid hips kink!) and falls back to `CTRL_COG` only in FK mode (`hfw_ik_fk_spline = 0.0`)!
+            hips_fk_bind = _make_bind_child(
+                hips_def, ctrl_cog, "hfw_rig_spine", "TRANSFORM",
+                prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_spline", ik_invert=True, con_name="HFW_FK_Xform",
+            )
+        else:
+            _make_bind_child(hips_def, ctrl_cog, "hfw_rig_spine", "TRANSFORM")
         bake_fk_pairs.append({"ctrl": "CTRL_COG", "def_bone": hips_def, "mode": "TRANSFORM"})
         core_def_bones.add(hips_def)
 
@@ -2775,7 +2947,9 @@ def build_control_rig(
         def_to_driver_eb[bname] = mf
         return mf
 
-    # Helper: Cycle-Free Blender-Studio B-Bone Spline IK overlaid cleanly on any long FK chain (`hfw_ik_fk_spline`)!
+    # Helper: ZERO-STRETCH Cycle-Free Sliding B-Bone Spline IK (`hfw_ik_fk_spline`)!
+    # Guarantees 0.000mm bone/mesh stretching EVER: pulling knots past chain length simply slides the chain smoothly
+    # along the B-Bone curve via arc-length-parameterized sample targets + CONNECTED fixed-length `MCH_SplineLink_*`!
     def _build_bbone_spline_for_chain(
         chain_name: str,
         chain_bones: list[str],
@@ -2786,20 +2960,84 @@ def build_control_rig(
         grp_prop: str,
         num_knots: int,
         side: str = "C",
+        meta_kind: str = "",
     ) -> list[str]:
-        n_b = len(chain_bones)
-        if n_b < 5:
+        if len(chain_bones) < 5:
             return []
-        k_cnt = max(3, min(num_knots, n_b))
-        knot_idxs = sorted({int(round(i * (n_b - 1) / (k_cnt - 1))) for i in range(k_cnt)})
+
+        active_bones: list[str] = []
+        coincident_to_active: dict[str, int] = {}
+        for bn in chain_bones:
+            p_cur = def_rest[bn][0]
+            if not active_bones:
+                active_bones.append(bn)
+            elif (p_cur - def_rest[active_bones[-1]][0]).length < 0.015:
+                coincident_to_active[bn] = len(active_bones) - 1
+            else:
+                active_bones.append(bn)
+
+        n_a = len(active_bones)
+        if n_a < 4:
+            return []
+
+        act_pts = [def_rest[b][0] for b in active_bones]
+        last_dir = act_pts[-1] - act_pts[-2]
+        last_seg_l = max(0.08, last_dir.length)
+        tip_pt = act_pts[-1] + (last_dir.normalized() if last_dir.length > 1e-4 else -fwd_vec) * last_seg_l
+        poly_pts = act_pts + [tip_pt]
+
+        seg_lens = [max(0.015, (poly_pts[i + 1] - poly_pts[i]).length) for i in range(n_a)]
+        cum_s: list[float] = [0.0]
+        for sl in seg_lens:
+            cum_s.append(cum_s[-1] + sl)
+        total_s = max(0.1, cum_s[-1])
+
+        k_cnt = max(3, min(num_knots, n_a))
+        knot_idxs: list[int] = [0]
+        for ki in range(1, k_cnt - 1):
+            tgt_s = total_s * ki / (k_cnt - 1)
+            best_i = min(range(1, n_a), key=lambda idx: abs(cum_s[idx] - tgt_s))
+            if best_i > knot_idxs[-1]:
+                knot_idxs.append(best_i)
+        if knot_idxs[-1] != n_a - 1:
+            knot_idxs.append(n_a - 1)
+        # On continuous serpent columns (`serpent_full`), snap the closest interior knot to the hood-to-body elbow (`hipsBone`)!
+        if meta_kind == "serpent_full" and hips_def in active_bones:
+            hi_idx = active_bones.index(hips_def)
+            if 1 <= hi_idx <= n_a - 2 and hi_idx not in knot_idxs and len(knot_idxs) >= 3:
+                near_k = min(range(1, len(knot_idxs) - 1), key=lambda k: abs(knot_idxs[k] - hi_idx))
+                if knot_idxs[near_k - 1] < hi_idx < knot_idxs[near_k + 1]:
+                    knot_idxs[near_k] = hi_idx
         k_cnt = len(knot_idxs)
+        if k_cnt < 3:
+            return []
+
+        knot_pts = [poly_pts[ki] for ki in knot_idxs]
         knot_ctrls: list[Any] = []
         knot_ctrl_names: list[str] = []
-        knot_pts = [def_rest[chain_bones[ki]][0] for ki in knot_idxs]
 
-        # Build clean, bold 3D gimbal Spline Knot handles (`CTRL_Spline_<name>_00..K-1`)
+        # Dedicated 1D Slide handle (`CTRL_Spline_<Name>_Slide`) so animators can slide the entire snake/tail smoothly along its curve!
+        slide_nm = _unique_name(f"CTRL_Spline_{chain_name}_Slide")
+        s_tang = (knot_pts[1] - knot_pts[0]).normalized() if (knot_pts[1] - knot_pts[0]).length > 1e-4 else -fwd_vec
+        s_off_z = max(0.35, min(2.2, total_s * 0.06))
+        s_pos = knot_pts[0] + Vector((0.0, 0.0, s_off_z))
+        _new_bone(slide_nm, s_pos, s_pos + s_tang * max(0.25, min(1.0, total_s * 0.03)), knot_parent, colls=(spline_ik_coll or body_coll,))
+        ctrl_styles[slide_nm] = {
+            "widget": "diamond",
+            "scale": max(0.16, min(0.65, total_s * 0.018)),
+            "side": side,
+            "is_root": False,
+            "is_detail": False,
+            "category": "spline",
+            "lock_loc": False,
+            "lock_rot": (True, True, True),
+            "rot_mode": "XYZ",
+        }
+        spline_ctrls.append(slide_nm)
+
+        # Build clean 3-axis gimbal Spline Knot handles (`CTRL_Spline_<name>_00..K-1`)
         for ki_pos, bi in enumerate(knot_idxs):
-            bname = chain_bones[bi]
+            bname = active_bones[bi]
             p_cur = knot_pts[ki_pos]
             if ki_pos + 1 < k_cnt:
                 tang = knot_pts[ki_pos + 1] - p_cur
@@ -2808,9 +3046,7 @@ def build_control_rig(
             if tang.length < 1e-4:
                 tang = -fwd_vec
             tang = tang.normalized()
-            seg_len_hint = (
-                (knot_pts[min(ki_pos + 1, k_cnt - 1)] - knot_pts[max(ki_pos - 1, 0)]).length * 0.14
-            )
+            seg_len_hint = (knot_pts[min(ki_pos + 1, k_cnt - 1)] - knot_pts[max(ki_pos - 1, 0)]).length * 0.14
             c_len = max(0.18, min(1.2, seg_len_hint))
             par_eb = anchor_parent if ki_pos == 0 else knot_parent
             kn_nm = _unique_name(f"CTRL_Spline_{chain_name}_{ki_pos:02d}")
@@ -2819,8 +3055,8 @@ def build_control_rig(
                 bname,
                 max(0.28, rig_h * 0.22),
                 min_s=0.18 if not is_humanoid else 0.12,
-                max_s=max(1.45, rig_h * 0.45),
-                mult=1.22,
+                max_s=max(1.35, rig_h * 0.42),
+                mult=1.20,
             )
             ctrl_styles[kn_nm] = {
                 "widget": "spline",
@@ -2836,82 +3072,172 @@ def build_control_rig(
             knot_ctrl_names.append(kn_nm)
             spline_ctrls.append(kn_nm)
 
-        # Build K-1 Bendy-Bone cubic Bézier bridge segments (`MCH_SplineSeg_*`) with exact-rest tangent handle children -> 0.000mm rest drift!
+        # Build K-1 Bendy-Bone cubic Bézier bridge segments (`MCH_SplineSeg_*`) with PARALLEL-TRANSPORTED roll (ZERO 180° flips!)
+        seg_names: list[str] = []
+        seg_arc_lens: list[float] = []
+        seg_arc_ratios: list[float] = []
+        seg_cum_starts: list[float] = []
         seg_ebs: list[Any] = []
+        seg_mats: list[Matrix] = []
+        # Seed parallel-transport up vector cleanly orthogonal to first segment!
+        y0_seed = (knot_pts[1] - knot_pts[0]).normalized() if (knot_pts[1] - knot_pts[0]).length > 1e-4 else -fwd_vec
+        z_pt_prev = Vector((0.0, 0.0, 1.0)) if abs(y0_seed.z) < 0.85 else Vector((0.0, 1.0, 0.0))
+        z_pt_prev = (z_pt_prev - y0_seed * z_pt_prev.dot(y0_seed)).normalized()
+
         for si in range(k_cnt - 1):
             p0, p1 = knot_pts[si], knot_pts[si + 1]
+            s_chord = max(0.02, (p1 - p0).length)
+            s_arc = max(0.02, cum_s[knot_idxs[si + 1]] - cum_s[knot_idxs[si]])
+            seg_arc_lens.append(s_arc)
+            seg_arc_ratios.append(s_arc / s_chord)
+            seg_cum_starts.append(cum_s[knot_idxs[si]])
+
+            y_s = (p1 - p0).normalized()
+            z_s = z_pt_prev - y_s * z_pt_prev.dot(y_s)
+            if z_s.length < 1e-4:
+                alt = Vector((1.0, 0.0, 0.0)) if abs(y_s.x) < 0.8 else Vector((0.0, 0.0, 1.0))
+                z_s = (alt - y_s * alt.dot(y_s)).normalized()
+            else:
+                z_s.normalize()
+            x_s = y_s.cross(z_s).normalized()
+            z_s = x_s.cross(y_s).normalized()
+            z_pt_prev = z_s
+
+            s_mat = Matrix((
+                (x_s.x, y_s.x, z_s.x, p0.x),
+                (x_s.y, y_s.y, z_s.y, p0.y),
+                (x_s.z, y_s.z, z_s.z, p0.z),
+                (0.0, 0.0, 0.0, 1.0),
+            ))
             seg_nm = _unique_name(f"MCH_SplineSeg_{chain_name}_{si:02d}")
-            s_eb = _new_bone(seg_nm, p0, p1, knot_ctrls[si], colls=(mch_coll,))
+            s_eb = _new_bone(seg_nm, p0, p1, knot_ctrls[si], matrix=s_mat, colls=(mch_coll,))
+            s_eb.length = s_chord
             s_eb.bbone_segments = 16
             s_eb.bbone_handle_type_start = "TANGENT"
             s_eb.bbone_handle_type_end = "TANGENT"
             s_eb.bbone_easein = 1.0
             s_eb.bbone_easeout = 1.0
-            s_mat3 = s_eb.matrix.to_3x3().to_4x4()
-            s_dir = (p1 - p0).normalized() * max(0.08, (p1 - p0).length * 0.12)
+            s_mat3 = s_mat.to_3x3().to_4x4()
+            s_dir = y_s * max(0.08, s_chord * 0.14)
             h0_eb = _new_bone(
                 _unique_name(f"MCH_SplineH0_{chain_name}_{si:02d}"),
-                p0,
-                p0 + s_dir,
-                knot_ctrls[si],
-                matrix=Matrix.Translation(p0) @ s_mat3,
-                colls=(mch_coll,),
+                p0, p0 + s_dir, knot_ctrls[si], matrix=Matrix.Translation(p0) @ s_mat3, colls=(mch_coll,),
             )
             h1_eb = _new_bone(
                 _unique_name(f"MCH_SplineH1_{chain_name}_{si:02d}"),
-                p1,
-                p1 + s_dir,
-                knot_ctrls[si + 1],
-                matrix=Matrix.Translation(p1) @ s_mat3,
-                colls=(mch_coll,),
+                p1, p1 + s_dir, knot_ctrls[si + 1], matrix=Matrix.Translation(p1) @ s_mat3, colls=(mch_coll,),
             )
             s_eb.bbone_custom_handle_start = h0_eb
             s_eb.bbone_custom_handle_end = h1_eb
             seg_ebs.append(s_eb)
-            spline_setups.append(
-                {
-                    "type": "seg",
-                    "bone": seg_nm,
-                    "end_ctrl": knot_ctrl_names[si + 1],
-                }
-            )
+            seg_mats.append(s_mat)
+            seg_names.append(seg_nm)
 
-        # Sample EVERY bone in `chain_bones` cleanly along its B-Bone bridge segment (rigid scale = 1.0, exact rest bind offset!)
-        for bi, bname in enumerate(chain_bones):
-            # Locate segment `si` such that knot_idxs[si] <= bi <= knot_idxs[si+1]
-            si = 0
+        # Tangent continuation segment past final knot (parallel-transported frame so compression glides cleanly!)
+        ext_len = total_s + 5.0
+        end_dir = (knot_pts[-1] - knot_pts[-2]).normalized() if (knot_pts[-1] - knot_pts[-2]).length > 1e-4 else -fwd_vec
+        ext_mat = Matrix.Translation(knot_pts[-1]) @ seg_mats[-1].to_3x3().to_4x4()
+        ext_nm = _unique_name(f"MCH_SplineExt_{chain_name}")
+        ext_eb = _new_bone(ext_nm, knot_pts[-1], knot_pts[-1] + end_dir * ext_len, knot_ctrls[-1], matrix=ext_mat, colls=(mch_coll,))
+        ext_eb.length = ext_len
+
+        # Arc-length-parameterized sample points `MCH_SplinePt_0..n_a` placed at EXACT rest B-Bone coords,
+        # with zero-drift child targets `MCH_SplineTgt_0..n_a` at `poly_pts[idx_p]` & twist guides `MCH_SplineUp_0..n_a-1`!
+        pt_names: list[str] = []
+        tgt_names: list[str] = []
+        up_names: list[str] = []
+        link_z_rest: list[Vector] = []
+        for idx_p in range(n_a + 1):
+            s_p = cum_s[idx_p]
+            # Match Pose-Mode `>=` segment selection rule EXACTLY (clamped to final segment for idx_p == n_a)!
+            si_ref = 0
             for cand_s in range(k_cnt - 1):
-                if knot_idxs[cand_s] <= bi <= knot_idxs[cand_s + 1]:
-                    si = cand_s
-                    break
-            i0, i1 = knot_idxs[si], knot_idxs[si + 1]
-            p0, p1 = knot_pts[si], knot_pts[si + 1]
-            seg_vec = p1 - p0
-            seg_len2 = max(1e-6, seg_vec.length_squared)
-            p_b = def_rest[bname][0]
-            # Exact projection `t_i` along straight rest B-Bone segment (handles non-uniform bone spacing!)
-            t_i = max(0.0, min(1.0, (p_b - p0).dot(seg_vec) / seg_len2)) if i1 > i0 else 0.0
-            p_on_seg = p0.lerp(p1, t_i)
-            s_mat3 = seg_ebs[si].matrix.to_3x3().to_4x4()
-            s_dir = seg_vec.normalized() * 0.12 if seg_vec.length > 1e-4 else -fwd_vec * 0.12
+                if s_p >= seg_cum_starts[cand_s] - 1e-5:
+                    si_ref = cand_s
+            t_rest = min(max((s_p - seg_cum_starts[si_ref]) / seg_arc_lens[si_ref], 0.0), 1.0)
+            pt_rest = knot_pts[si_ref].lerp(knot_pts[si_ref + 1], t_rest)
+            s_m3 = seg_mats[si_ref].to_3x3().to_4x4()
+            seg_dir = seg_mats[si_ref].to_3x3().col[1].normalized() * 0.12
 
-            pt_nm = _unique_name(f"MCH_SplinePt_{chain_name}_{bi:02d}")
-            _new_bone(pt_nm, p_on_seg, p_on_seg + s_dir, ctrl_root, matrix=Matrix.Translation(p_on_seg) @ s_mat3, colls=(mch_coll,))
-            rg_nm = _unique_name(f"MCH_SplineRigid_{chain_name}_{bi:02d}")
-            rg_eb = _new_bone(rg_nm, p_on_seg, p_on_seg + s_dir, ctrl_root, matrix=Matrix.Translation(p_on_seg) @ s_mat3, colls=(mch_coll,))
+            pt_nm = _unique_name(f"MCH_SplinePt_{chain_name}_{idx_p:02d}")
+            pt_eb = _new_bone(pt_nm, pt_rest, pt_rest + seg_dir, ctrl_root, matrix=Matrix.Translation(pt_rest) @ s_m3, colls=(mch_coll,))
+            pt_names.append(pt_nm)
 
-            spline_setups.append(
-                {
-                    "type": "sample",
-                    "pt_bone": pt_nm,
-                    "rigid_bone": rg_nm,
-                    "seg_bone": seg_ebs[si].name,
-                    "head_tail": float(t_i),
-                }
+            p_cur = poly_pts[idx_p]
+            tgt_nm = _unique_name(f"MCH_SplineTgt_{chain_name}_{idx_p:02d}")
+            _new_bone(tgt_nm, p_cur, p_cur + seg_dir, pt_eb, matrix=Matrix.Translation(p_cur) @ s_m3, colls=(mch_coll,))
+            tgt_names.append(tgt_nm)
+
+            if idx_p < n_a:
+                y_l = (poly_pts[idx_p + 1] - p_cur).normalized()
+                z_seg = seg_mats[si_ref].to_3x3().col[2].normalized()
+                z_l = z_seg - y_l * z_seg.dot(y_l)
+                if z_l.length < 1e-4:
+                    z_l = Vector((0.0, 0.0, 1.0)) if abs(y_l.z) < 0.85 else Vector((1.0, 0.0, 0.0))
+                    z_l = (z_l - y_l * z_l.dot(y_l)).normalized()
+                else:
+                    z_l.normalize()
+                link_z_rest.append(z_l)
+                up_p = p_cur + z_l * 0.40
+                up_nm = _unique_name(f"MCH_SplineUp_{chain_name}_{idx_p:02d}")
+                _new_bone(up_nm, up_p, up_p + z_l * 0.10, pt_eb, colls=(mch_coll,))
+                up_names.append(up_nm)
+
+        # CONNECTED fixed-length rigid link chain `MCH_SplineLink_0..n_a-1` -> 0.000mm rest drift AND 0.000mm stretch!
+        link_ebs: list[Any] = []
+        link_names: list[str] = []
+        for i in range(n_a):
+            p0_l, p1_l = poly_pts[i], poly_pts[i + 1]
+            y_l = (p1_l - p0_l).normalized()
+            z_l = link_z_rest[i]
+            x_l = y_l.cross(z_l).normalized()
+            z_l = x_l.cross(y_l).normalized()
+            l_mat = Matrix((
+                (x_l.x, y_l.x, z_l.x, p0_l.x),
+                (x_l.y, y_l.y, z_l.y, p0_l.y),
+                (x_l.z, y_l.z, z_l.z, p0_l.z),
+                (0.0, 0.0, 0.0, 1.0),
+            ))
+            ln_nm = _unique_name(f"MCH_SplineLink_{chain_name}_{i:02d}")
+            l_eb = _new_bone(
+                ln_nm,
+                p0_l,
+                p1_l,
+                ctrl_root if i == 0 else link_ebs[-1],
+                matrix=l_mat,
+                colls=(mch_coll,),
+                use_connect=(i > 0),
             )
+            l_eb.length = seg_lens[i]
+            l_eb.inherit_scale = "NONE"
+            link_ebs.append(l_eb)
+            link_names.append(ln_nm)
+
+        spline_setups.append(
+            {
+                "type": "sliding_chain",
+                "chain_name": chain_name,
+                "slide_ctrl": slide_nm,
+                "knot_ctrls": list(knot_ctrl_names),
+                "seg_bones": seg_names,
+                "seg_arc_lens": seg_arc_lens,
+                "seg_arc_ratios": seg_arc_ratios,
+                "seg_cum_starts": seg_cum_starts,
+                "ext_bone": ext_nm,
+                "ext_len": ext_len,
+                "pt_bones": pt_names,
+                "tgt_bones": tgt_names,
+                "up_bones": up_names,
+                "link_bones": link_names,
+                "cum_s": cum_s,
+            }
+        )
+
+        # Bind every active bone (and any coincident bone like `C_neck_sjnt_0` == `hipsBone`) to its fixed-length link!
+        for i, bname in enumerate(active_bones):
             ik_b = _make_bind_child(
                 bname,
-                rg_eb,
+                link_ebs[i],
                 grp_prop,
                 "TRANSFORM",
                 prefix="MCH_BindSpline_",
@@ -2922,14 +3248,30 @@ def build_control_rig(
             if bname in fk_binds_map:
                 _make_dual_follow_socket(bname, fk_binds_map[bname], ik_b, "hfw_ik_fk_spline")
             else:
-                def_to_driver_eb[bname] = rg_eb
+                def_to_driver_eb[bname] = link_ebs[i]
+        for b_co, act_idx in coincident_to_active.items():
+            ik_b = _make_bind_child(
+                b_co,
+                link_ebs[act_idx],
+                grp_prop,
+                "TRANSFORM",
+                prefix="MCH_BindSpline_",
+                ik_prop="hfw_ik_fk_spline",
+                ik_invert=False,
+                con_name="HFW_Spline_Xform",
+            )
+            if b_co in fk_binds_map:
+                _make_dual_follow_socket(b_co, fk_binds_map[b_co], ik_b, "hfw_ik_fk_spline")
+            else:
+                def_to_driver_eb[b_co] = link_ebs[act_idx]
 
         spline_ik_meta.append(
             {
                 "name": chain_name,
-                "kind": "spine" if grp_prop == "hfw_rig_spine" else "tail",
+                "kind": meta_kind or ("spine" if grp_prop == "hfw_rig_spine" else "tail"),
+                "slide_ctrl": slide_nm,
                 "knots": [
-                    {"ctrl": knot_ctrl_names[ki_pos], "def_bone": chain_bones[bi]}
+                    {"ctrl": knot_ctrl_names[ki_pos], "def_bone": active_bones[bi]}
                     for ki_pos, bi in enumerate(knot_idxs)
                 ],
                 "bones": list(chain_bones),
@@ -3182,6 +3524,92 @@ def build_control_rig(
             fk_ctrl_list=spine_ctrls,
             nxt_after_tip=spec["neck"][0] if spec["neck"] else spec["head"],
         )
+    elif serpent_full_spec is not None:
+        # UNIFIED CONTINUOUS FULL-BODY SERPENT RIG (Slitherfang!):
+        # ONE smooth, zero-stretch sliding B-Bone Spline running unbroken from Hood Tip (`C_neck_sjnt_11`) -> Hips -> Tail Tip (`C_spine_sjnt_40`)!
+        # Zero hips kink! Moving `CTRL_COG` translates the whole coiled snake; moving any aqua knot flows seamlessly through hips!
+        serp_fk_binds: dict[str, str] = {}
+        serp_fk_pairs: list[dict[str, str]] = []
+        if hips_def and hips_fk_bind:
+            serp_fk_binds[hips_def] = hips_fk_bind
+
+        # FK fallback chain for body (`C_spine_sjnt_1..40`, hidden while Spline IK is active)
+        spine_handles = _sample_chain_handles(spine_full, max_handles=14)
+        fk_sp_par = ctrl_cog
+        for i, sb in enumerate(spine_full):
+            core_def_bones.add(sb)
+            if sb in spine_handles:
+                h_pos = def_rest[sb][0]
+                t_pos = def_rest[spine_full[i + 1]][0] if (i + 1 < len(spine_full)) else (h_pos - fwd_vec * 0.4)
+                cname = f"CTRL_Spine_{spine_handles.index(sb):02d}"
+                c_eb = _new_bone(cname, h_pos, t_pos, fk_sp_par, colls=(spine_fk_coll or body_coll,))
+                ctrl_styles[cname] = {
+                    "widget": "fk_ring",
+                    "scale": _fit_scale(sb, max(0.30, rig_h * 0.24), 0.24, max(1.35, rig_h * 0.35), 1.18),
+                    "side": "C", "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
+                }
+                serp_fk_binds[sb] = _make_bind_child(
+                    sb, c_eb, "hfw_rig_spine", "TRANSFORM",
+                    prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_spline", ik_invert=True, con_name="HFW_FK_Xform",
+                )
+                pair = {"ctrl": cname, "def_bone": sb, "mode": "ROTATION"}
+                bake_fk_pairs.append(pair)
+                serp_fk_pairs.append(pair)
+                spine_ctrls.append(cname)
+                fk_sp_par = c_eb
+            else:
+                serp_fk_binds[sb] = _make_bind_child(
+                    sb, fk_sp_par, "hfw_rig_spine", "TRANSFORM",
+                    prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_spline", ik_invert=True, con_name="HFW_FK_Xform",
+                )
+
+        # FK fallback chain for hood/neck (`chest_def` + `C_neck_sjnt_0..11`, hidden while Spline IK is active)
+        hood_seq = ([chest_def] if (chest_def and chest_def in def_rest and chest_def not in neck_full) else []) + list(neck_full)
+        hood_handles = _sample_chain_handles(hood_seq, max_handles=8)
+        fk_hd_par = ctrl_cog
+        for i, nb in enumerate(hood_seq):
+            core_def_bones.add(nb)
+            if nb in hood_handles:
+                h_pos = def_rest[nb][0]
+                t_pos = def_rest[hood_seq[i + 1]][0] if (i + 1 < len(hood_seq) and (def_rest[hood_seq[i + 1]][0] - h_pos).length > 0.02) else (h_pos + fwd_vec * 0.4)
+                cname = f"CTRL_Neck_{hood_handles.index(nb):02d}"
+                c_eb = _new_bone(cname, h_pos, t_pos, fk_hd_par, colls=(spine_fk_coll or body_coll,))
+                ctrl_styles[cname] = {
+                    "widget": "fk_ring",
+                    "scale": _fit_scale(nb, max(0.28, rig_h * 0.20), 0.22, max(1.25, rig_h * 0.30), 1.18),
+                    "side": "C", "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
+                }
+                serp_fk_binds[nb] = _make_bind_child(
+                    nb, c_eb, "hfw_rig_spine", "TRANSFORM",
+                    prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_spline", ik_invert=True, con_name="HFW_FK_Xform",
+                )
+                pair = {"ctrl": cname, "def_bone": nb, "mode": "ROTATION"}
+                bake_fk_pairs.append(pair)
+                serp_fk_pairs.append(pair)
+                neck_ctrls.append(cname)
+                fk_hd_par = c_eb
+            else:
+                serp_fk_binds[nb] = _make_bind_child(
+                    nb, fk_hd_par, "hfw_rig_spine", "TRANSFORM",
+                    prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_spline", ik_invert=True, con_name="HFW_FK_Xform",
+                )
+
+        serp_bones = [b for b in serpent_full_spec["bones"] if b in def_rest]
+        limb_fk_chains["spline"].append({"name": serpent_full_spec["name"], "fk_pairs": serp_fk_pairs})
+        _build_bbone_spline_for_chain(
+            serpent_full_spec["name"],
+            serp_bones,
+            serp_fk_binds,
+            anchor_parent=ctrl_cog,
+            knot_parent=ctrl_cog,
+            grp_prop="hfw_rig_spine",
+            num_knots=int(serpent_full_spec.get("knots", 8)),
+            side="C",
+            meta_kind="serpent_full",
+        )
+        front_tip = neck_full[-1] if neck_full else (chest_def or hips_def)
+        spine_parent_eb = def_to_driver_eb.get(front_tip, ctrl_cog)
+        skip_standard_neck = True
     else:
         # Pure FK Spine (AND B-Bone Spline IK on Slitherfang's 40-bone serpent body!)
         spine_spline_spec = next((sc for sc in spline_chains_spec if sc.get("kind") == "spine"), None)
@@ -4438,17 +4866,20 @@ def build_control_rig(
         widget_name="weapon", cat_key="weapons", min_sc=0.11, max_sc=0.40, scale_frac=0.090,
     )
 
-    # --- 9b. True Closed-Loop Parametric Stadium Chainsaw Rig (`Clawstrider` 2x26-tooth Jaw Saws, `Charger/Lancehorn` Horn Saws!) ---
+    # --- 9b. Physically-Linked Closed-Loop Chainsaw Rig (`Clawstrider` 2x26-tooth Jaw Saws, `Charger/Lancehorn` Horn Saws!) ---
+    # Every saw tooth is hinged to `MCH_SawPin_i` (`COPY_LOCATION`) and physically locked onto its neighbor pin via
+    # `LOCKED_TRACK(TRACK_Y, LOCK_X) -> MCH_SawPin_{(i+nbr)%N}` -> ZERO unlatching, ZERO side clipping, ZERO wrap jumps!
     chainsaws_spec = spec.get("chainsaws") or []
     saw_master_ctrl = ""
+    chainsaw_groups_meta: list[dict[str, Any]] = []
+    spinner_groups_meta: list[dict[str, Any]] = []
     if chainsaws_spec and spin_coll is not None:
-        # Place ONE bold magenta gear wheel `CTRL_Saw_Spin` clearly ABOVE the snout/jaw (outside armor!) so 1 dial revs ALL chainsaws!
         saw_pts_all = [def_rest[b][0] for cs in chainsaws_spec for b in cs["blades"] if b in def_rest]
         if saw_pts_all:
             saw_ctr = sum(saw_pts_all, Vector((0.0, 0.0, 0.0))) / len(saw_pts_all)
             dial_pos = saw_ctr + Vector((0.0, 0.0, max(0.58, rig_h * 0.30))) + fwd_vec * 0.16
             saw_master_par = ctrl_head if ctrl_head is not None else ctrl_cog
-            c_saw_eb = _new_bone("CTRL_Saw_Spin", dial_pos, dial_pos + Vector((0.20, 0.0, 0.0)), saw_master_par, colls=(spin_coll,))
+            _new_bone("CTRL_Saw_Spin", dial_pos, dial_pos + Vector((0.20, 0.0, 0.0)), saw_master_par, colls=(spin_coll,))
             ctrl_styles["CTRL_Saw_Spin"] = {
                 "widget": "gear",
                 "scale": max(0.22, min(0.42, rig_h * 0.14)),
@@ -4457,26 +4888,28 @@ def build_control_rig(
                 "is_detail": False,
                 "category": "spin",
                 "lock_loc": True,
-                "lock_rot": (True, False, True),  # Rotate Y ONLY -> instant chainsaw spin!
+                "lock_rot": (True, False, True),  # Rotate Y ONLY -> keyframeable phase/rev for ALL saws!
                 "rot_mode": "XYZ",
             }
             saw_master_ctrl = "CTRL_Saw_Spin"
             spin_ctrls.append(saw_master_ctrl)
             cat_counts["spinners"] += 1
 
-        for cs in chainsaws_spec:
+        for cs_idx, cs in enumerate(chainsaws_spec):
             bl_bones = [b for b in cs["blades"] if b in def_rest and b not in driven_def_bones]
-            if len(bl_bones) < 4:
+            nb = len(bl_bones)
+            if nb < 4:
                 continue
             par_def = cs.get("parent_def")
             saw_par_eb = def_to_driver_eb.get(par_def) or _find_parent_driver(par_def or bl_bones[0], ctrl_head)
-            pts_w = np.array([[def_rest[b][0].x, def_rest[b][0].y, def_rest[b][0].z] for b in bl_bones], dtype=np.float64)
+            rest_pts = [def_rest[b][0] for b in bl_bones]
+            rest_mats = [def_rest[b][2] for b in bl_bones]
+            pts_w = np.array([[p.x, p.y, p.z] for p in rest_pts], dtype=np.float64)
             ctr_w = pts_w.mean(axis=0)
             rel_w = pts_w - ctr_w
             _, _, vh = np.linalg.svd(rel_w, full_matrices=False)
             u_ax = Vector(vh[0]).normalized()  # Long stadium axis (+Y of MCH_SawFrame)
             v_ax = Vector(vh[1]).normalized()  # Short stadium axis (+Z of MCH_SawFrame)
-            # Keep u_ax pointing generally forward (+fwd_vec) and v_ax generally upward (+Z) for intuitive spin direction
             if u_ax.dot(fwd_vec) < 0.0:
                 u_ax = -u_ax
             if v_ax.z < 0.0:
@@ -4494,8 +4927,42 @@ def build_control_rig(
             fr_eb = _new_bone(fr_nm, Vector(ctr_w), Vector(ctr_w) + u_ax * 0.25, saw_par_eb, matrix=frame_mat, colls=(mch_coll,))
             fr_inv = frame_mat.inverted()
 
-            # Measure exact stadium dimensions (L = straight rail length, r = semicircular tip radius, P = 2L + 2*pi*r)
-            local_yz = [fr_inv @ def_rest[b][0] for b in bl_bones]
+            # Create independent per-saw gear dial (`CTRL_Saw_L`, `CTRL_Saw_R`, etc.) offset cleanly outside each saw!
+            side_c = cs.get("side", "C")
+            side_dial_nm = _unique_name(f"CTRL_Saw_{cs['name']}")
+            lat_off = Vector(((-0.22 if side_c == "L" else (0.22 if side_c == "R" else 0.0)), 0.0, 0.16))
+            sd_pos = Vector(ctr_w) + lat_off
+            _new_bone(side_dial_nm, sd_pos, sd_pos + n_ax * 0.14, saw_par_eb, colls=(spin_coll,))
+            ctrl_styles[side_dial_nm] = {
+                "widget": "gear",
+                "scale": max(0.11, min(0.22, rig_h * 0.065)),
+                "side": side_c,
+                "is_root": False,
+                "is_detail": True,
+                "category": "spin",
+                "lock_loc": True,
+                "lock_rot": (True, False, True),
+                "rot_mode": "XYZ",
+            }
+            spin_ctrls.append(side_dial_nm)
+            cat_counts["spinners"] += 1
+            saw_spd_prop = f"hfw_saw_{re.sub(r'[^a-z0-9]+', '_', cs['name'].lower()).strip('_')}_speed"
+            chainsaw_groups_meta.append(
+                {
+                    "name": cs["name"],
+                    "label": f"{'Left' if side_c == 'L' else ('Right' if side_c == 'R' else '')} Jaw Saw".strip() if "saw" in cs["name"].lower() else cs["name"],
+                    "side": side_c,
+                    "dial_ctrl": side_dial_nm,
+                    "master_ctrl": saw_master_ctrl,
+                    "frame_bone": fr_nm,
+                    "speed_prop": saw_spd_prop,
+                    "teeth": nb,
+                    "def_bones": list(bl_bones),
+                }
+            )
+
+            # Calibrate exact uniform-spacing stadium (y_mid, z_mid, L, r) directly against the nb real rest pin positions!
+            local_yz = [fr_inv @ p for p in rest_pts]
             ys = [p.y for p in local_yz]
             zs = [p.z for p in local_yz]
             y_mid = 0.5 * (min(ys) + max(ys))
@@ -4504,47 +4971,118 @@ def build_control_rig(
             span_z = max(0.02, max(zs) - min(zs))
             rad = max(0.01, 0.5 * min(span_y, span_z))
             straight_L = max(0.002, max(span_y, span_z) - 2.0 * rad)
+
+            def _eval_stad(q_val: float, ym: float, zm: float, sl: float, rr: float) -> tuple[float, float]:
+                hp = sl + math.pi * rr
+                pp = 2.0 * hp
+                qm = q_val - pp * math.floor(q_val / pp)
+                u1 = min(max(qm, 0.0), sl)
+                a1 = min(max(qm - sl, 0.0), math.pi * rr) / rr
+                u2 = min(max(qm - hp, 0.0), sl)
+                a2 = min(max(qm - hp - sl, 0.0), math.pi * rr) / rr
+                return (
+                    ym - 0.5 * sl + u1 - u2 + rr * math.sin(a1) - rr * math.sin(a2),
+                    zm + rr + rr * math.cos(a1) - rr * math.cos(a2),
+                )
+
+            def _fit_uniform_qs(ym: float, zm: float, sl: float, rr: float) -> tuple[list[float], float]:
+                pp = 2.0 * (sl + math.pi * rr)
+                gn = 360
+                gpts = [_eval_stad(pp * gi / gn, ym, zm, sl, rr) for gi in range(gn)]
+                q_raw = [
+                    pp * min(range(gn), key=lambda gi: (gpts[gi][0] - p.y) ** 2 + (gpts[gi][1] - p.z) ** 2) / gn
+                    for p in local_yz
+                ]
+                dq0 = (q_raw[1] - q_raw[0] + 0.5 * pp) % pp - 0.5 * pp
+                sgn_step = 1.0 if dq0 >= 0.0 else -1.0
+                angs = [2.0 * math.pi * ((q_raw[i] - sgn_step * i * pp / nb) % pp) / pp for i in range(nb)]
+                q_base = (math.atan2(sum(math.sin(a) for a in angs), sum(math.cos(a) for a in angs)) / (2.0 * math.pi) % 1.0) * pp
+                qs = [(q_base + sgn_step * i * pp / nb) % pp for i in range(nb)]
+                err = sum(
+                    (_eval_stad(qs[i], ym, zm, sl, rr)[0] - local_yz[i].y) ** 2
+                    + (_eval_stad(qs[i], ym, zm, sl, rr)[1] - local_yz[i].z) ** 2
+                    for i in range(nb)
+                )
+                return qs, err
+
+            # Fast 2-pass coordinate descent (<2ms) tightens stadium fit to real Decima link spacing!
+            best_params = [y_mid, z_mid, straight_L, rad]
+            q0_unif, best_err = _fit_uniform_qs(*best_params)
+            for step_sz in (0.008, 0.002, 0.0005):
+                for pi_idx in (2, 3, 0, 1):
+                    for delta in (-step_sz, step_sz):
+                        cand = list(best_params)
+                        cand[pi_idx] += delta
+                        if cand[2] < 0.002 or cand[3] < 0.005:
+                            continue
+                        qs_c, err_c = _fit_uniform_qs(*cand)
+                        if err_c < best_err:
+                            best_err = err_c
+                            best_params = cand
+                            q0_unif = qs_c
+            y_mid, z_mid, straight_L, rad = best_params
             half_a = 0.5 * straight_L
             half_P = straight_L + math.pi * rad
             perim_P = 2.0 * half_P
 
-            def _stadium_eval(q_val: float) -> tuple[float, float, float]:
-                qm = q_val - perim_P * math.floor(q_val / perim_P)
-                u1 = min(max(qm, 0.0), straight_L)
-                a1 = min(max(qm - straight_L, 0.0), math.pi * rad) / rad
-                u2 = min(max(qm - half_P, 0.0), straight_L)
-                a2 = min(max(qm - half_P - straight_L, 0.0), math.pi * rad) / rad
-                yv = y_mid - half_a + u1 - u2 + rad * math.sin(a1) - rad * math.sin(a2)
-                zv = z_mid + rad * math.cos(a1) - rad * math.cos(a2) + rad
-                phv = -(a1 + a2)
-                return yv, zv, phv
+            # Auto-detect which neighbor pin `(i - 1)` vs `(i + 1)` each rigid tooth extends toward at rest!
+            dot_prev = sum(
+                rest_mats[i].to_3x3().col[1].normalized().dot((rest_pts[(i - 1) % nb] - rest_pts[i]).normalized())
+                for i in range(nb)
+            )
+            dot_next = sum(
+                rest_mats[i].to_3x3().col[1].normalized().dot((rest_pts[(i + 1) % nb] - rest_pts[i]).normalized())
+                for i in range(nb)
+            )
+            nbr_off = -1 if abs(dot_prev) >= abs(dot_next) else 1
 
-            # Find exact initial arc-length parameter q0 for each tooth by dense lookup along the closed stadium
-            grid_n = 360
-            grid_qs = [perim_P * gi / grid_n for gi in range(grid_n)]
-            grid_pts = [_stadium_eval(gq) for gq in grid_qs]
-
+            # 1) Create nb pure position Pins `MCH_SawPin_*` at exact stadium coordinates
+            pin_names: list[str] = []
+            pin_world_pts: list[Vector] = []
+            pin_local_y0z0: list[tuple[float, float]] = []
             for bi, bname in enumerate(bl_bones):
-                p_loc = local_yz[bi]
-                best_gi = min(
-                    range(grid_n),
-                    key=lambda gi: (grid_pts[gi][0] - p_loc.y) ** 2 + (grid_pts[gi][1] - p_loc.z) ** 2,
+                y0, z0 = _eval_stad(q0_unif[bi], y_mid, z_mid, straight_L, rad)
+                pw = frame_mat @ Vector((0.0, y0, z0))
+                pin_nm = _unique_name(f"MCH_SawPin_{bname}")
+                _new_bone(
+                    pin_nm,
+                    pw,
+                    pw + u_ax * 0.04,
+                    fr_eb,
+                    matrix=Matrix.Translation(pw) @ frame_mat.to_3x3().to_4x4(),
+                    colls=(mch_coll,),
                 )
-                q0 = grid_qs[best_gi]
-                y0, z0, phi0 = _stadium_eval(q0)
-                bh = def_rest[bname][0]
-                t_mat = Matrix.Translation(bh) @ frame_mat.to_3x3().to_4x4()
+                pin_names.append(pin_nm)
+                pin_world_pts.append(pw)
+                pin_local_y0z0.append((y0, z0))
+
+            # 2) Create nb linked Blade bones `MCH_SawTooth_*` whose +Y aims DIRECTLY at neighbor pin `(bi + nbr_off) % nb`!
+            for bi, bname in enumerate(bl_bones):
+                pw = pin_world_pts[bi]
+                nbr_w = pin_world_pts[(bi + nbr_off) % nb]
+                y_t = (nbr_w - pw).normalized() if (nbr_w - pw).length > 1e-4 else u_ax
+                z_t = n_ax.cross(y_t).normalized()
+                t_mat = Matrix((
+                    (n_ax.x, y_t.x, z_t.x, pw.x),
+                    (n_ax.y, y_t.y, z_t.y, pw.y),
+                    (n_ax.z, y_t.z, z_t.z, pw.z),
+                    (0.0, 0.0, 0.0, 1.0),
+                ))
                 t_nm = _unique_name(f"MCH_SawTooth_{bname}")
-                t_eb = _new_bone(t_nm, bh, bh + u_ax * 0.05, fr_eb, matrix=t_mat, colls=(mch_coll,))
+                t_eb = _new_bone(t_nm, pw, nbr_w, fr_eb, matrix=t_mat, colls=(mch_coll,))
                 _make_bind_child(bname, t_eb, "hfw_rig_weapons", "TRANSFORM", prefix="MCH_BindSaw_", con_name="HFW_Saw")
+                y0, z0 = pin_local_y0z0[bi]
                 saw_driver_setups.append(
                     {
+                        "pin_bone": pin_names[bi],
+                        "nbr_pin_bone": pin_names[(bi + nbr_off) % nb],
                         "tooth_bone": t_nm,
                         "dial_ctrl": saw_master_ctrl,
-                        "q0": q0,
+                        "side_dial_ctrl": side_dial_nm,
+                        "side_speed_prop": saw_spd_prop,
+                        "q0": q0_unif[bi],
                         "y0": y0,
                         "z0": z0,
-                        "phi0": phi0,
                         "y_mid": y_mid,
                         "z_mid": z_mid,
                         "half_a": half_a,
@@ -4555,86 +5093,153 @@ def build_control_rig(
                     }
                 )
 
-    # --- 9c. Universal PCA-Axis Rotary Drills, Grinders, Rotors, Turbines & Tidal Discs Spin Rig! ---
+    # --- 9c. Universal Circularity-Axis Per-Group Rotary Drills, Grinders, Rotors, Turbines & Tidal Discs Spin Rig! ---
     if all_spinners and spin_coll is not None:
         valid_spinners = [sp for sp in all_spinners if sp["bone"] in def_rest and sp["bone"] not in driven_def_bones]
         if valid_spinners:
-            # Always create ONE unmistakable master gear wheel `CTRL_Spin_Drills` cleanly offset above/beside the rig!
-            sp_pts = [def_rest[sp["bone"]][0] for sp in valid_spinners]
-            sp_ctr = sum(sp_pts, Vector((0.0, 0.0, 0.0))) / len(sp_pts)
+            # Group spinners into clean functional banks (e.g., Tideripper: Mouth Drills + Tidal Disc; Slitherfang: Hood/Mouth/Drum/Body Grinders!)
+            grouped_spinners: dict[str, list[dict[str, Any]]] = {}
+            group_labels_map: dict[str, str] = {}
+            for sp in valid_spinners:
+                gid = str(sp.get("group_id") or sp.get("kind") or "drills")
+                glbl = str(sp.get("group_label") or gid.replace("_", " ").title())
+                grouped_spinners.setdefault(gid, []).append(sp)
+                group_labels_map[gid] = glbl
+
+            # Master gear wheel `CTRL_Spin_All` (or `CTRL_Spin_Grinders` / `CTRL_Spin_Drills`) when 2+ banks exist (or single bank)
+            sp_pts_all = [def_rest[sp["bone"]][0] for sp in valid_spinners]
+            sp_ctr_all = sum(sp_pts_all, Vector((0.0, 0.0, 0.0))) / len(sp_pts_all)
             sp_kind_main = "Grinders" if all(sp["kind"] == "grinder" for sp in valid_spinners) else "Drills"
             master_sp_nm = f"CTRL_Spin_{sp_kind_main}"
-            sp_dial_pos = sp_ctr + Vector((0.0, 0.0, max(0.35, rig_h * 0.20)))
+            sp_dial_pos = sp_ctr_all + Vector((0.0, 0.0, max(0.55, rig_h * 0.24)))
             sp_dial_par = ctrl_cog if sp_kind_main == "Grinders" else (ctrl_head if len(valid_spinners) <= 8 else ctrl_cog)
             _new_bone(master_sp_nm, sp_dial_pos, sp_dial_pos + Vector((0.0, 0.25, 0.0)), sp_dial_par, colls=(spin_coll,))
             ctrl_styles[master_sp_nm] = {
                 "widget": "gear",
-                "scale": max(0.18, min(0.55, rig_h * 0.14)),
+                "scale": max(0.20, min(0.55, rig_h * 0.14)),
                 "side": "C",
                 "is_root": False,
                 "is_detail": False,
                 "category": "spin",
                 "lock_loc": True,
-                "lock_rot": (True, False, True),  # Rotate Y ONLY -> instant smooth drill/grinder spin!
+                "lock_rot": (True, False, True),
                 "rot_mode": "XYZ",
             }
             spin_ctrls.append(master_sp_nm)
             cat_counts["spinners"] += 1
 
-            make_individual_dials = len(valid_spinners) <= 10
-            for sp in valid_spinners:
-                bname = sp["bone"]
-                bh, bt, bm, bl = def_rest[bname]
-                p_def = sp.get("parent_def")
-                sp_par = def_to_driver_eb.get(p_def) if p_def else None
-                if sp_par is None:
-                    sp_par = _find_parent_driver(bname, ctrl_cog)
+            # Create ONE independent gear dial + speed property PER functional bank!
+            n_groups = len(grouped_spinners)
+            for gi_idx, (gid, grp_list) in enumerate(grouped_spinners.items()):
+                glbl = group_labels_map[gid]
+                g_pts = [def_rest[sp["bone"]][0] for sp in grp_list]
+                g_ctr = sum(g_pts, Vector((0.0, 0.0, 0.0))) / len(g_pts)
+                g_spd_prop = f"hfw_spin_{gid}_speed"
 
-                # Compute exact 3D mechanical spin axis in armature space (from PCA of real drill/disc mesh!)
-                loc_ax_t = spinner_axes.get(bname, (0.0, 1.0, 0.0))
-                ax_world = (bm.to_3x3() @ Vector(loc_ax_t)).normalized()
-                if ax_world.length < 1e-4:
-                    ax_world = Vector((0.0, 1.0, 0.0))
-                # Build clean right-handed matrix whose +Y axis IS the exact mechanical spin axis!
-                ref_up = Vector((0.0, 0.0, 1.0)) if abs(ax_world.z) < 0.92 else Vector((1.0, 0.0, 0.0))
-                x_sp = ax_world.cross(ref_up).normalized()
-                z_sp = x_sp.cross(ax_world).normalized()
-                sp_mat = Matrix((
-                    (x_sp.x, ax_world.x, z_sp.x, bh.x),
-                    (x_sp.y, ax_world.y, z_sp.y, bh.y),
-                    (x_sp.z, ax_world.z, z_sp.z, bh.z),
-                    (0.0, 0.0, 0.0, 1.0),
-                ))
-
-                local_dial_nm = ""
-                mch_par = sp_par
-                if make_individual_dials:
-                    local_dial_nm = _unique_name(f"CTRL_Spin_{sp['name']}")
-                    d_eb = _new_bone(local_dial_nm, bh, bh + ax_world * max(0.12, bl), sp_par, matrix=sp_mat, colls=(spin_coll,))
-                    ctrl_styles[local_dial_nm] = {
+                if n_groups == 1:
+                    grp_dial_nm = master_sp_nm
+                else:
+                    clean_g = re.sub(r"[^A-Za-z0-9]+", "", glbl)[:16] or f"Bank{gi_idx}"
+                    grp_dial_nm = _unique_name(f"CTRL_Spin_{clean_g}")
+                    # Position Tidal Disc / Drum / Mouth / Hood dials cleanly OUTSIDE their actual mechanism!
+                    if gid == "tidal_disc":
+                        g_b0 = grp_list[0]["bone"]
+                        g_par_eb = _find_parent_driver(g_b0, ctrl_cog)
+                        g_pos = g_ctr + Vector((0.0, 0.0, max(0.55, _fit_scale(g_b0, 0.8, 0.3, 1.5, 0.65))))
+                        g_tail = g_pos + Vector((0.0, 0.0, 0.35))
+                    elif gid in ("mouth_drills", "mouth_grinders", "jaw_drills", "head_drills"):
+                        g_par_eb = ctrl_head if ctrl_head is not None else ctrl_cog
+                        g_pos = g_ctr + Vector((0.0, 0.0, max(0.45, rig_h * 0.14)))
+                        g_tail = g_pos + fwd_vec * 0.25
+                    else:
+                        g_par_eb = ctrl_cog
+                        g_pos = g_ctr + Vector((0.0, 0.0, max(0.50, rig_h * 0.16) + 0.35 * (gi_idx % 2)))
+                        g_tail = g_pos + Vector((0.0, 0.25, 0.0))
+                    _new_bone(grp_dial_nm, g_pos, g_tail, g_par_eb, colls=(spin_coll,))
+                    ctrl_styles[grp_dial_nm] = {
                         "widget": "gear",
-                        "scale": _fit_scale(bname, max(0.10, rig_h * 0.07), 0.08, 0.50, 1.25),
-                        "side": sp["side"],
+                        "scale": max(0.16, min(0.48, rig_h * 0.11)),
+                        "side": "C",
                         "is_root": False,
-                        "is_detail": True,
+                        "is_detail": False,
                         "category": "spin",
                         "lock_loc": True,
                         "lock_rot": (True, False, True),
                         "rot_mode": "XYZ",
                     }
-                    spin_ctrls.append(local_dial_nm)
+                    spin_ctrls.append(grp_dial_nm)
                     cat_counts["spinners"] += 1
-                    mch_par = d_eb
 
-                m_sp_nm = _unique_name(f"MCH_Spin_{bname}")
-                m_sp_eb = _new_bone(m_sp_nm, bh, bh + ax_world * max(0.08, bl), mch_par, matrix=sp_mat, colls=(mch_coll,))
-                _make_bind_child(bname, m_sp_eb, "hfw_rig_weapons", "ROTATION", prefix="MCH_BindSpin_", con_name="HFW_Spin")
-                def_to_driver_eb[bname] = m_sp_eb
-                spin_driver_setups.append(
+                unit_dials: list[str] = []
+                make_unit_dials = len(grp_list) <= 6 and not (n_groups > 1 and len(grp_list) == 1)
+                for sp in grp_list:
+                    bname = sp["bone"]
+                    bh, bt, bm, bl = def_rest[bname]
+                    p_def = sp.get("parent_def")
+                    sp_par = def_to_driver_eb.get(p_def) if p_def else None
+                    if sp_par is None:
+                        sp_par = _find_parent_driver(bname, ctrl_cog)
+
+                    # Exact 3D mechanical spin axis from descendant-aggregated 2D circularity + pivot concentricity!
+                    loc_ax_t = spinner_axes.get(bname, (0.0, 1.0, 0.0))
+                    ax_world = (bm.to_3x3() @ Vector(loc_ax_t)).normalized()
+                    if ax_world.length < 1e-4:
+                        ax_world = Vector((0.0, 1.0, 0.0))
+                    ref_up = Vector((0.0, 0.0, 1.0)) if abs(ax_world.z) < 0.92 else Vector((1.0, 0.0, 0.0))
+                    x_sp = ax_world.cross(ref_up).normalized()
+                    z_sp = x_sp.cross(ax_world).normalized()
+                    sp_mat = Matrix((
+                        (x_sp.x, ax_world.x, z_sp.x, bh.x),
+                        (x_sp.y, ax_world.y, z_sp.y, bh.y),
+                        (x_sp.z, ax_world.z, z_sp.z, bh.z),
+                        (0.0, 0.0, 0.0, 1.0),
+                    ))
+
+                    mch_par = sp_par
+                    if make_unit_dials:
+                        local_dial_nm = _unique_name(f"CTRL_Spin_{sp['name']}")
+                        d_eb = _new_bone(local_dial_nm, bh, bh + ax_world * max(0.12, bl), sp_par, matrix=sp_mat, colls=(spin_coll,))
+                        ctrl_styles[local_dial_nm] = {
+                            "widget": "gear",
+                            "scale": _fit_scale(bname, max(0.10, rig_h * 0.07), 0.08, 0.45, 1.18),
+                            "side": sp["side"],
+                            "is_root": False,
+                            "is_detail": True,
+                            "category": "spin",
+                            "lock_loc": True,
+                            "lock_rot": (True, False, True),
+                            "rot_mode": "XYZ",
+                        }
+                        spin_ctrls.append(local_dial_nm)
+                        unit_dials.append(local_dial_nm)
+                        cat_counts["spinners"] += 1
+                        mch_par = d_eb
+
+                    m_sp_nm = _unique_name(f"MCH_Spin_{bname}")
+                    m_sp_eb = _new_bone(m_sp_nm, bh, bh + ax_world * max(0.08, bl), mch_par, matrix=sp_mat, colls=(mch_coll,))
+                    _make_bind_child(bname, m_sp_eb, "hfw_rig_weapons", "ROTATION", prefix="MCH_BindSpin_", con_name="HFW_Spin")
+                    def_to_driver_eb[bname] = m_sp_eb
+                    spin_driver_setups.append(
+                        {
+                            "mch_bone": m_sp_nm,
+                            "master_ctrl": master_sp_nm,
+                            "group_ctrl": grp_dial_nm if grp_dial_nm != master_sp_nm else "",
+                            "group_speed_prop": g_spd_prop,
+                            "sign": -1.0 if sp["side"] == "R" else 1.0,
+                        }
+                    )
+
+                spinner_groups_meta.append(
                     {
-                        "mch_bone": m_sp_nm,
+                        "id": gid,
+                        "group_id": gid,
+                        "label": glbl,
+                        "dial_ctrl": grp_dial_nm,
                         "master_ctrl": master_sp_nm,
-                        "sign": -1.0 if sp["side"] == "R" else 1.0,
+                        "speed_prop": g_spd_prop,
+                        "count": len(grp_list),
+                        "def_bones": [sp["bone"] for sp in grp_list],
+                        "unit_dials": unit_dials,
                     }
                 )
 
@@ -4710,43 +5315,204 @@ def build_control_rig(
         con.chain_count = int(iks["chain_len"])
         con.use_stretch = False
 
-    # 1c. Cycle-Free B-Bone Spline IK Constraints (`STRETCH_TO` bridge + `COPY_TRANSFORMS(use_bbone_shape=True)` + rigid scale!)
+    # 1c. ZERO-STRETCH Cycle-Free Sliding B-Bone Spline IK Constraints & Drivers!
     for ss in spline_setups:
-        if ss["type"] == "seg":
-            pb_s = pbones.get(ss["bone"])
-            if pb_s is None:
+        if ss["type"] != "sliding_chain":
+            continue
+        slide_ctrl = ss["slide_ctrl"]
+        knot_ctrls = ss["knot_ctrls"]
+        seg_bones = ss["seg_bones"]
+        seg_arc_lens = ss["seg_arc_lens"]
+        seg_arc_ratios = ss["seg_arc_ratios"]
+        seg_cum_starts = ss["seg_cum_starts"]
+        ext_bone = ss["ext_bone"]
+        ext_len = float(ss["ext_len"])
+        pt_bones = ss["pt_bones"]
+        tgt_bones = ss["tgt_bones"]
+        up_bones = ss["up_bones"]
+        link_bones = ss["link_bones"]
+        cum_s = ss["cum_s"]
+        k_segs = len(seg_bones)
+
+        # Lock Slide control to 1D local +Y translation so dragging it smoothly slides the body along the spline!
+        pb_sl = pbones.get(slide_ctrl)
+        if pb_sl is not None:
+            pb_sl.lock_location = (True, False, True)
+
+        # Segment STRETCH_TO + live LOC_DIFF arc distance ["d"] + cumulative arc-length ["c"] (0 dependency cycles!)
+        for k in range(k_segs):
+            pbs = pbones.get(seg_bones[k])
+            if pbs is None:
                 continue
-            st = pb_s.constraints.new(type="STRETCH_TO")
+            st = pbs.constraints.new(type="STRETCH_TO")
             st.name = "HFW_SplineStretch"
             st.target = arm_obj
-            st.subtarget = ss["end_ctrl"]
+            st.subtarget = knot_ctrls[k + 1]
             st.volume = "NO_VOLUME"
             st.keep_axis = "PLANE_Z"
-        elif ss["type"] == "sample":
-            pb_pt = pbones.get(ss["pt_bone"])
-            pb_rg = pbones.get(ss["rigid_bone"])
-            if pb_pt is not None:
-                ct = pb_pt.constraints.new(type="COPY_TRANSFORMS")
-                ct.name = "HFW_BBoneSample"
+
+            pbs["d"] = float(seg_arc_lens[k])
+            drv_d = pbs.driver_add('["d"]').driver
+            drv_d.type = "SCRIPTED"
+            vd = drv_d.variables.new()
+            vd.name = "d"
+            vd.type = "LOC_DIFF"
+            vd.targets[0].id = arm_obj
+            vd.targets[0].bone_target = knot_ctrls[k]
+            vd.targets[1].id = arm_obj
+            vd.targets[1].bone_target = knot_ctrls[k + 1]
+            r_arc = float(seg_arc_ratios[k])
+            drv_d.expression = f"max(d*{r_arc:.5f}, 0.001)"
+
+            pbs["c"] = float(seg_cum_starts[k])
+            if k > 0:
+                drv_c = pbs.driver_add('["c"]').driver
+                drv_c.type = "SCRIPTED"
+                vc = drv_c.variables.new()
+                vc.name = "pc"
+                vc.type = "SINGLE_PROP"
+                vc.targets[0].id = arm_obj
+                vc.targets[0].data_path = f'pose.bones["{seg_bones[k - 1]}"]["c"]'
+                vd0 = drv_c.variables.new()
+                vd0.name = "pd"
+                vd0.type = "SINGLE_PROP"
+                vd0.targets[0].id = arm_obj
+                vd0.targets[0].data_path = f'pose.bones["{seg_bones[k - 1]}"]["d"]'
+                drv_c.expression = "pc + pd"
+
+        pb_ext = pbones.get(ext_bone)
+        if pb_ext is not None:
+            pb_ext["c"] = float(cum_s[-1])
+            drv_tot = pb_ext.driver_add('["c"]').driver
+            drv_tot.type = "SCRIPTED"
+            vc = drv_tot.variables.new()
+            vc.name = "pc"
+            vc.type = "SINGLE_PROP"
+            vc.targets[0].id = arm_obj
+            vc.targets[0].data_path = f'pose.bones["{seg_bones[k_segs - 1]}"]["c"]'
+            vd0 = drv_tot.variables.new()
+            vd0.name = "pd"
+            vd0.type = "SINGLE_PROP"
+            vd0.targets[0].id = arm_obj
+            vd0.targets[0].data_path = f'pose.bones["{seg_bones[k_segs - 1]}"]["d"]'
+            drv_tot.expression = "pc + pd"
+
+        # Arc-length-parameterized sample points `MCH_SplinePt_0..N` (auto-slides along curve without stretching!)
+        for idx_p, pt_nm in enumerate(pt_bones):
+            pbp = pbones.get(pt_nm)
+            if pbp is None:
+                continue
+            s_i = float(cum_s[idx_p])
+            for k in range(k_segs):
+                ct = pbp.constraints.new(type="COPY_TRANSFORMS")
+                ct.name = f"HFW_BBoneSeg_{k:02d}"
                 ct.target = arm_obj
-                ct.subtarget = ss["seg_bone"]
-                ct.head_tail = float(ss["head_tail"])
+                ct.subtarget = seg_bones[k]
                 ct.use_bbone_shape = True
                 ct.target_space = "WORLD"
                 ct.owner_space = "WORLD"
-            if pb_rg is not None:
-                cl = pb_rg.constraints.new(type="COPY_LOCATION")
-                cl.name = "HFW_SplineLoc"
-                cl.target = arm_obj
-                cl.subtarget = ss["pt_bone"]
-                cl.target_space = "WORLD"
-                cl.owner_space = "WORLD"
-                cr_s = pb_rg.constraints.new(type="COPY_ROTATION")
-                cr_s.name = "HFW_SplineRot"
-                cr_s.target = arm_obj
-                cr_s.subtarget = ss["pt_bone"]
-                cr_s.target_space = "WORLD"
-                cr_s.owner_space = "WORLD"
+
+                f_ht = ct.driver_add("head_tail").driver
+                f_ht.type = "SCRIPTED"
+                v_sl = f_ht.variables.new()
+                v_sl.name = "sl"
+                v_sl.type = "TRANSFORMS"
+                v_sl.targets[0].id = arm_obj
+                v_sl.targets[0].bone_target = slide_ctrl
+                v_sl.targets[0].transform_type = "LOC_Y"
+                v_sl.targets[0].transform_space = "LOCAL_SPACE"
+                v_c = f_ht.variables.new()
+                v_c.name = "c"
+                v_c.type = "SINGLE_PROP"
+                v_c.targets[0].id = arm_obj
+                v_c.targets[0].data_path = f'pose.bones["{seg_bones[k]}"]["c"]'
+                v_d = f_ht.variables.new()
+                v_d.name = "d"
+                v_d.type = "SINGLE_PROP"
+                v_d.targets[0].id = arm_obj
+                v_d.targets[0].data_path = f'pose.bones["{seg_bones[k]}"]["d"]'
+                f_ht.expression = f"min(max(({s_i:.5f}+sl-c)/d,0),1)"
+                if k == 0:
+                    ct.influence = 1.0
+                else:
+                    f_inf = ct.driver_add("influence").driver
+                    f_inf.type = "SCRIPTED"
+                    v_sl2 = f_inf.variables.new()
+                    v_sl2.name = "sl"
+                    v_sl2.type = "TRANSFORMS"
+                    v_sl2.targets[0].id = arm_obj
+                    v_sl2.targets[0].bone_target = slide_ctrl
+                    v_sl2.targets[0].transform_type = "LOC_Y"
+                    v_sl2.targets[0].transform_space = "LOCAL_SPACE"
+                    v_c2 = f_inf.variables.new()
+                    v_c2.name = "c"
+                    v_c2.type = "SINGLE_PROP"
+                    v_c2.targets[0].id = arm_obj
+                    v_c2.targets[0].data_path = f'pose.bones["{seg_bones[k]}"]["c"]'
+                    f_inf.expression = f"1.0 if ({s_i:.5f}+sl)>=(c-0.0001) else 0.0"
+
+            # Smooth tangent continuation past final knot ONLY when body actually exceeds compressed curve length!
+            ct_e = pbp.constraints.new(type="COPY_TRANSFORMS")
+            ct_e.name = "HFW_BBoneExt"
+            ct_e.target = arm_obj
+            ct_e.subtarget = ext_bone
+            ct_e.target_space = "WORLD"
+            ct_e.owner_space = "WORLD"
+            f_hte = ct_e.driver_add("head_tail").driver
+            f_hte.type = "SCRIPTED"
+            v_sle = f_hte.variables.new()
+            v_sle.name = "sl"
+            v_sle.type = "TRANSFORMS"
+            v_sle.targets[0].id = arm_obj
+            v_sle.targets[0].bone_target = slide_ctrl
+            v_sle.targets[0].transform_type = "LOC_Y"
+            v_sle.targets[0].transform_space = "LOCAL_SPACE"
+            v_ce = f_hte.variables.new()
+            v_ce.name = "c"
+            v_ce.type = "SINGLE_PROP"
+            v_ce.targets[0].id = arm_obj
+            v_ce.targets[0].data_path = f'pose.bones["{ext_bone}"]["c"]'
+            f_hte.expression = f"min(max(({s_i:.5f}+sl-c)/{ext_len:.4f},0),1)"
+            f_infe = ct_e.driver_add("influence").driver
+            f_infe.type = "SCRIPTED"
+            v_sle2 = f_infe.variables.new()
+            v_sle2.name = "sl"
+            v_sle2.type = "TRANSFORMS"
+            v_sle2.targets[0].id = arm_obj
+            v_sle2.targets[0].bone_target = slide_ctrl
+            v_sle2.targets[0].transform_type = "LOC_Y"
+            v_sle2.targets[0].transform_space = "LOCAL_SPACE"
+            v_ce2 = f_infe.variables.new()
+            v_ce2.name = "c"
+            v_ce2.type = "SINGLE_PROP"
+            v_ce2.targets[0].id = arm_obj
+            v_ce2.targets[0].data_path = f'pose.bones["{ext_bone}"]["c"]'
+            f_infe.expression = f"1.0 if ({s_i:.5f}+sl)>(c+0.0005) else 0.0"
+
+        # CONNECTED fixed-length rigid links `MCH_SplineLink_0..N-1` aiming at zero-drift `MCH_SplineTgt_*` + `MCH_SplineUp_*`!
+        pb_l0 = pbones.get(link_bones[0])
+        if pb_l0 is not None:
+            cl0 = pb_l0.constraints.new(type="COPY_LOCATION")
+            cl0.name = "HFW_SplineAnchor"
+            cl0.target = arm_obj
+            cl0.subtarget = tgt_bones[0]
+            cl0.target_space = "WORLD"
+            cl0.owner_space = "WORLD"
+        for i, ln_nm in enumerate(link_bones):
+            pbl = pbones.get(ln_nm)
+            if pbl is None:
+                continue
+            dt = pbl.constraints.new(type="DAMPED_TRACK")
+            dt.name = "HFW_SplineAim"
+            dt.target = arm_obj
+            dt.subtarget = tgt_bones[i + 1]
+            dt.track_axis = "TRACK_Y"
+            lt = pbl.constraints.new(type="LOCKED_TRACK")
+            lt.name = "HFW_SplineTwist"
+            lt.target = arm_obj
+            lt.subtarget = up_bones[i]
+            lt.track_axis = "TRACK_Z"
+            lt.lock_axis = "LOCK_Y"
 
     # 1d. Master Finger / Toe / Talon Additive Curl Constraints (`CTRL_Curl_*` -> `MCH_Curl_*` in LOCAL space!)
     for cs in curl_setups:
@@ -4766,12 +5532,36 @@ def build_control_rig(
             cr_c.mix_mode = "ADD"
         cr_c.influence = float(cs.get("influence", 1.0))
 
-    # 1e. Exact Closed-Loop Parametric Stadium Chainsaw Drivers (2-stage Simple Expressions, <=175 chars, 0 cycles!)
+    # Create independent per-saw and per-drill-bank speed Custom Properties cleanly on the Armature!
+    for cg in chainsaw_groups_meta:
+        sp_p = cg["speed_prop"]
+        if sp_p not in arm_obj:
+            arm_obj[sp_p] = 0.0
+        try:
+            arm_obj.id_properties_ui(sp_p).update(
+                min=-5.0, max=5.0, soft_min=-3.0, soft_max=3.0,
+                description=f"{cg['label']} continuous playback spin speed (0 = manual keyframe via {cg['dial_ctrl']})",
+            )
+        except Exception:
+            pass
+    for sg in spinner_groups_meta:
+        sp_p = sg["speed_prop"]
+        if sp_p not in arm_obj:
+            arm_obj[sp_p] = 0.0
+        try:
+            arm_obj.id_properties_ui(sp_p).update(
+                min=-5.0, max=5.0, soft_min=-3.0, soft_max=3.0,
+                description=f"{sg['label']} continuous playback spin speed (0 = manual keyframe via {sg['dial_ctrl']})",
+            )
+        except Exception:
+            pass
+
+    # 1e. Physically-Linked Closed-Loop Stadium Chainsaw Drivers + LOCKED_TRACK Link Chain!
     for sd in saw_driver_setups:
+        pb_pin = pbones.get(sd["pin_bone"])
         pb_t = pbones.get(sd["tooth_bone"])
-        if pb_t is None:
+        if pb_pin is None or pb_t is None:
             continue
-        pb_t.rotation_mode = "XYZ"
         P_v = sd["P"]
         h_v = sd["h"]
         L_v = sd["L"]
@@ -4784,31 +5574,32 @@ def build_control_rig(
         z_mid_v = sd["z_mid"]
         y0_v = sd["y0"]
         z0_v = sd["z0"]
-        phi0_v = sd["phi0"]
         dial_nm = sd["dial_ctrl"]
+        side_dial_nm = sd["side_dial_ctrl"]
+        side_spd_prop = sd["side_speed_prop"]
 
-        # Stage 1: wrapped phase `q` in [0, P) stored on hidden `MCH_SawTooth_*["q"]` (~110 chars, pure C Simple Expression!)
-        pb_t["q"] = float(q0_v)
-        fc_q = pb_t.driver_add('["q"]')
-        drv_q = fc_q.driver
+        # Stage 1: wrapped phase `q` in [0, P) driven by Master Dial + Per-Saw Dial + Master/Per-Saw Auto-Spin Speed!
+        pb_pin["q"] = float(q0_v)
+        drv_q = pb_pin.driver_add('["q"]').driver
         drv_q.type = "SCRIPTED"
-        v_sp = drv_q.variables.new()
-        v_sp.name = "s"
-        v_sp.type = "SINGLE_PROP"
-        v_sp.targets[0].id_type = "OBJECT"
-        v_sp.targets[0].id = arm_obj
-        v_sp.targets[0].data_path = '["hfw_saw_speed"]'
-        v_dl = drv_q.variables.new()
-        v_dl.name = "d"
-        v_dl.type = "TRANSFORMS"
-        v_dl.targets[0].id = arm_obj
-        v_dl.targets[0].bone_target = dial_nm
-        v_dl.targets[0].transform_type = "ROT_Y"
-        v_dl.targets[0].transform_space = "LOCAL_SPACE"
-        ph = f"{q0_v:.5f}+d*{P_v / (2.0 * math.pi):.5f}+frame*s*{P_v / 18.0:.5f}"
+        for vn, dp in (("ms", '["hfw_saw_speed"]'), ("ls", f'["{side_spd_prop}"]')):
+            vv = drv_q.variables.new()
+            vv.name = vn
+            vv.type = "SINGLE_PROP"
+            vv.targets[0].id_type = "OBJECT"
+            vv.targets[0].id = arm_obj
+            vv.targets[0].data_path = dp
+        for vn, bn_t in (("md", dial_nm), ("ld", side_dial_nm)):
+            vv = drv_q.variables.new()
+            vv.name = vn
+            vv.type = "SINGLE_PROP"
+            vv.targets[0].id_type = "OBJECT"
+            vv.targets[0].id = arm_obj
+            vv.targets[0].data_path = f'pose.bones["{bn_t}"].rotation_euler[1]'
+        ph = f"{q0_v:.5f}+(md+ld)*{P_v / (2.0 * math.pi):.5f}+frame*(ms+ls)*{P_v / 18.0:.5f}"
         drv_q.expression = f"({ph})-{P_v:.5f}*floor(({ph})/{P_v:.5f})"
 
-        # Stage 2: closed-form stadium `(y, z, rx)` deltas reading single variable `q` (<= 175 chars, way under 255-char C limit!)
+        # Stage 2: pure closed-form stadium `(y, z)` position ONLY (<= 175 chars, NO Euler rotation wrap!)
         c_y = (y_mid_v - a_v) - y0_v
         c_z = (z_mid_v + r_v) - z0_v
         a1 = f"min(max(q-{L_v:.5f},0),{pi_r:.5f})*{r_inv:.4f}"
@@ -4818,16 +5609,9 @@ def build_control_rig(
             f"+{r_v:.5f}*(sin({a1})-sin({a2}))"
         )
         expr_z = f"{c_z:.5f}+{r_v:.5f}*(cos({a1})-cos({a2}))"
-        expr_rx = f"-({a1}+{a2})-{phi0_v:.5f}"
-        q_dpath = f'pose.bones["{pb_t.name}"]["q"]'
-
-        for dpath, axis_i, expr_s in (
-            ("location", 1, expr_y),
-            ("location", 2, expr_z),
-            ("rotation_euler", 0, expr_rx),
-        ):
-            fc = pb_t.driver_add(dpath, axis_i)
-            drv = fc.driver
+        q_dpath = f'pose.bones["{pb_pin.name}"]["q"]'
+        for axis_i, expr_s in ((1, expr_y), (2, expr_z)):
+            drv = pb_pin.driver_add("location", axis_i).driver
             drv.type = "SCRIPTED"
             vq = drv.variables.new()
             vq.name = "q"
@@ -4837,30 +5621,55 @@ def build_control_rig(
             vq.targets[0].data_path = q_dpath
             drv.expression = expr_s
 
-    # 1f. Universal PCA-Axis Drill / Grinder / Rotor / Tidal-Disc Spin Drivers (Simple Expression!)
+        # Physically hinge `MCH_SawTooth_i` onto `Pin_i` & aim directly at neighbor `Pin_{(i+nbr)%N}` locked strictly to saw plane X!
+        cl_s = pb_t.constraints.new(type="COPY_LOCATION")
+        cl_s.name = "HFW_SawPinLoc"
+        cl_s.target = arm_obj
+        cl_s.subtarget = sd["pin_bone"]
+        lt_s = pb_t.constraints.new(type="LOCKED_TRACK")
+        lt_s.name = "HFW_SawLinkAim"
+        lt_s.target = arm_obj
+        lt_s.subtarget = sd["nbr_pin_bone"]
+        lt_s.track_axis = "TRACK_Y"
+        lt_s.lock_axis = "LOCK_X"
+
+    # 1f. Universal Circularity-Axis Per-Group Rotary Drill / Grinder / Rotor / Tidal-Disc Spin Drivers!
     for spd_item in spin_driver_setups:
         pb_sp = pbones.get(spd_item["mch_bone"])
         if pb_sp is None:
             continue
         pb_sp.rotation_mode = "XYZ"
-        fc = pb_sp.driver_add("rotation_euler", 1)
-        drv = fc.driver
+        drv = pb_sp.driver_add("rotation_euler", 1).driver
         drv.type = "SCRIPTED"
         v_sp = drv.variables.new()
-        v_sp.name = "spd"
+        v_sp.name = "ms"
         v_sp.type = "SINGLE_PROP"
         v_sp.targets[0].id_type = "OBJECT"
         v_sp.targets[0].id = arm_obj
         v_sp.targets[0].data_path = '["hfw_drill_speed"]'
+        v_gs = drv.variables.new()
+        v_gs.name = "gs"
+        v_gs.type = "SINGLE_PROP"
+        v_gs.targets[0].id_type = "OBJECT"
+        v_gs.targets[0].id = arm_obj
+        v_gs.targets[0].data_path = f'["{spd_item["group_speed_prop"]}"]'
         v_dl = drv.variables.new()
-        v_dl.name = "dial"
-        v_dl.type = "TRANSFORMS"
+        v_dl.name = "md"
+        v_dl.type = "SINGLE_PROP"
+        v_dl.targets[0].id_type = "OBJECT"
         v_dl.targets[0].id = arm_obj
-        v_dl.targets[0].bone_target = spd_item["master_ctrl"]
-        v_dl.targets[0].transform_type = "ROT_Y"
-        v_dl.targets[0].transform_space = "LOCAL_SPACE"
+        v_dl.targets[0].data_path = f'pose.bones["{spd_item["master_ctrl"]}"].rotation_euler[1]'
+        dial_sum = "md"
+        if spd_item.get("group_ctrl"):
+            v_gd = drv.variables.new()
+            v_gd.name = "gd"
+            v_gd.type = "SINGLE_PROP"
+            v_gd.targets[0].id_type = "OBJECT"
+            v_gd.targets[0].id = arm_obj
+            v_gd.targets[0].data_path = f'pose.bones["{spd_item["group_ctrl"]}"].rotation_euler[1]'
+            dial_sum = "(md+gd)"
         sgn = float(spd_item.get("sign", 1.0))
-        drv.expression = f"{sgn:.1f} * (dial + frame * spd * 0.45)"
+        drv.expression = f"{sgn:.1f} * ({dial_sum} + frame * (ms + gs) * 0.45)"
 
     # 2. Dual-space follow sockets (`MCH_Follow_*`) for fingers/toes so they track FK OR IK seamlessly!
     for fs in follow_setups:
@@ -5076,11 +5885,12 @@ def build_control_rig(
     bpy.context.view_layer.update()
 
     # Drop any empty dynamic collection (e.g., if every plate helper was filtered out) so the Bone Collections list stays spotless!
+    all_c_prune = getattr(arm_data, "collections_all", arm_data.collections)
     for skey in list(active_slots.keys()):
         if skey in ("body", "mechanism", "wings"):
             continue
         cname = active_slots[skey]
-        bc = arm_data.collections.get(cname)
+        bc = all_c_prune.get(cname)
         if bc is not None and len(bc.bones) == 0:
             try:
                 arm_data.collections.remove(bc)
@@ -5089,6 +5899,21 @@ def build_control_rig(
                 pass
     if "wings_fk" not in active_slots and "wings" in active_slots:
         del active_slots["wings"]
+
+    # Prune any empty hierarchical parent folder (e.g., if a character has no chainsaws/drills/weapons!)
+    for folder_nm in (
+        "01. Main Controls",
+        "02. Hands, Feet & Appendages",
+        "03. Chainsaws, Drills & Weapons",
+        "04. Secondary & Armor",
+        "05. Mechanism (Hidden)",
+    ):
+        fc_obj = arm_data.collections.get(folder_nm)
+        if fc_obj is not None and len(fc_obj.bones) == 0 and len(getattr(fc_obj, "children", ())) == 0:
+            try:
+                arm_data.collections.remove(fc_obj)
+            except Exception:
+                pass
 
     rig_meta = {
         "archetype": spec["archetype"],
@@ -5099,6 +5924,8 @@ def build_control_rig(
         "spline_ik": spline_ik_meta,
         "has_chainsaws": bool(saw_driver_setups),
         "has_spinners": bool(spin_driver_setups),
+        "chainsaw_groups": chainsaw_groups_meta,
+        "spinner_groups": spinner_groups_meta,
         "collection_slots": active_slots,
         "ctrl_bones": list(ctrl_styles.keys()),
         "fk_pairs": bake_fk_pairs,
@@ -5116,6 +5943,22 @@ def build_control_rig(
         "category_counts": cat_counts,
     }
     arm_obj["hfw_ctrl_rig_meta"] = json.dumps(rig_meta)
+
+    # Embed self-contained native Blender UI (`hfw_rig_ui.py`, `use_module=True`) so the rig works 100% WITHOUT the add-on!
+    try:
+        ui_src = Path(__file__).resolve().with_name("rig_ui_embedded.py")
+        if ui_src.is_file():
+            code_txt = ui_src.read_text(encoding="utf-8")
+            tb = bpy.data.texts.get("hfw_rig_ui.py") or bpy.data.texts.new("hfw_rig_ui.py")
+            tb.clear()
+            tb.write(code_txt)
+            tb.use_module = True
+            ns_ui: dict[str, Any] = {"__name__": "hfw_rig_ui"}
+            exec(compile(code_txt, "hfw_rig_ui.py", "exec"), ns_ui)
+            if callable(ns_ui.get("register")):
+                ns_ui["register"]()
+    except Exception:
+        pass
 
     return {
         "archetype": spec["archetype"],
@@ -5717,7 +6560,7 @@ def sync_ik_fk_layer_visibility(arm_obj: Any) -> None:
     """Sync Torso/Chest, Head IK, Spline IK, Legs, Front Legs, Arms/Forelimbs & Wings dynamic Bone Collection visibility."""
     if bpy is None or arm_obj is None or arm_obj.type != "ARMATURE":
         return
-    colls = arm_obj.data.collections
+    colls = getattr(arm_obj.data, "collections_all", arm_obj.data.collections)
     slots = _get_rig_collection_slots(arm_obj)
     meta = {}
     try:
@@ -5742,18 +6585,18 @@ def sync_ik_fk_layer_visibility(arm_obj: Any) -> None:
         ("wings_ik", wings_ik),
         ("wings_fk", not wings_ik),
     ]
-    if slots.get("torso_ik") in colls:
-        fk_slot = "hood_fk" if (slots.get("hood_fk") in colls) else "spine_fk"
+    if slots.get("torso_ik", "") in colls:
+        fk_slot = "hood_fk" if (slots.get("hood_fk", "") in colls) else "spine_fk"
         pairs.extend([("torso_ik", torso_ik), (fk_slot, not torso_ik)])
-    if slots.get("spline_ik") in colls:
+    if slots.get("spline_ik", "") in colls:
         pairs.append(("spline_ik", spline_ik))
         for sp_info in meta.get("spline_ik") or []:
             sk = sp_info.get("kind")
-            if sk == "spine" and slots.get("spine_fk") in colls:
+            if sk in ("spine", "serpent_full") and slots.get("spine_fk", "") in colls:
                 pairs.append(("spine_fk", not spline_ik))
-            elif sk == "tail" and slots.get("tail") in colls:
+            elif sk == "tail" and slots.get("tail", "") in colls:
                 pairs.append(("tail", not spline_ik))
-            elif sk == "appendage" and slots.get("appendages") in colls:
+            elif sk == "appendage" and slots.get("appendages", "") in colls:
                 pairs.append(("appendages", not spline_ik))
     for skey, vis in pairs:
         cname = slots.get(skey)
@@ -6073,28 +6916,37 @@ def pose_serpent_wave(
         side_dir = axis_dir.cross(Vector((0.0, 0.0, 1.0)))
         side_dir = side_dir.normalized() if side_dir.length > 1e-4 else Vector((1.0, 0.0, 0.0))
 
-        # Compute target knot world positions along a smooth sinusoidal slither wave OR spiral ground coil!
+        # Compute target knot world positions along a smooth sinusoidal slither wave OR raised-hood ambush coil!
         n_k = len(knots)
+        is_full_serp = sp.get("kind") == "serpent_full"
         new_pts: list[Vector] = []
         for ki in range(n_k):
             u = ki / max(1, n_k - 1)
             if style == "coil":
-                # Smooth ground-hugging spiral coil tucked around the base!
-                theta = u * math.pi * 2.15 + phase
-                rad = chain_len * (0.14 + 0.16 * u) * max(0.3, amplitude)
-                if ki == 0:
-                    pt = p0.copy()
+                # Smooth ground-hugging spiral coil with reared front cobra hood (zero hips kink!)
+                if is_full_serp and ki == 0:
+                    pt = Vector((p0.x, p0.y - chain_len * 0.08, p0.z + chain_len * 0.14 * max(0.4, amplitude)))
+                elif is_full_serp and ki == 1:
+                    pt = Vector((p0.x + side_dir.x * chain_len * 0.04, p0.y - chain_len * 0.14, p0.z + chain_len * 0.07 * max(0.4, amplitude)))
                 else:
+                    u_c = (u - 0.18) / 0.82 if is_full_serp else u
+                    theta = max(0.0, u_c) * math.pi * 2.15 + phase
+                    rad = chain_len * (0.12 + 0.15 * max(0.0, u_c)) * max(0.3, amplitude)
                     cx = p0.x + side_dir.x * (rad * math.sin(theta)) + axis_dir.x * (rad * (1.0 - math.cos(theta)))
                     cy = p0.y + side_dir.y * (rad * math.sin(theta)) + axis_dir.y * (rad * (1.0 - math.cos(theta)))
-                    cz = max(0.45, p0.z * (1.0 - 0.18 * u))
+                    cz = max(0.55, p0.z * (1.0 - 0.12 * u))
                     pt = Vector((cx, cy, cz))
             else:
-                # Classic lateral sinusoidal S-wave with gentle vertical undulation & natural foreshortening!
+                # Classic lateral sinusoidal S-wave with reared cobra hood flowing smoothly through hips into body!
                 ang = u * math.pi * 2.0 * cycles + phase
-                amp_lat = chain_len * 0.11 * amplitude * math.sin(u * math.pi * 0.85)
-                amp_z = chain_len * 0.015 * amplitude * math.sin(ang * 2.0) * u
-                fwd_dist = chain_len * u * (1.0 - 0.08 * min(1.5, abs(amplitude)))
+                amp_lat = chain_len * 0.105 * amplitude * math.sin(max(0.08, u) * math.pi * 0.90)
+                hood_lift = (
+                    chain_len * 0.10 * amplitude * math.exp(-((u / 0.22) ** 2))
+                    if is_full_serp
+                    else 0.0
+                )
+                amp_z = hood_lift + chain_len * 0.012 * amplitude * math.sin(ang * 2.0) * u
+                fwd_dist = chain_len * u * (1.0 - 0.09 * min(1.5, abs(amplitude)))
                 pt = p0 + axis_dir * fwd_dist + side_dir * (amp_lat * math.sin(ang)) + Vector((0.0, 0.0, amp_z))
             new_pts.append(pt)
 
@@ -6213,51 +7065,39 @@ def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
     if bpy.context.mode != "POSE":
         bpy.ops.object.mode_set(mode="POSE")
     slots = _get_rig_collection_slots(arm_obj)
+    all_c = getattr(arm_obj.data, "collections_all", arm_obj.data.collections)
+    def _show_c(cname: str | None) -> None:
+        if cname and cname in all_c:
+            bc = all_c[cname]
+            bc.is_visible = True
+            if getattr(bc, "parent", None) is not None:
+                bc.parent.is_visible = True
+
     if group == "tail":
-        tc = slots.get("tail", "Tail")
-        if tc in arm_obj.data.collections:
-            arm_obj.data.collections[tc].is_visible = True
+        _show_c(slots.get("tail", "Tail"))
     elif group == "spline":
-        sc = slots.get("spline_ik")
-        if sc and sc in arm_obj.data.collections:
-            arm_obj.data.collections[sc].is_visible = True
+        _show_c(slots.get("spline_ik"))
     elif group == "head":
         for sk in ("head_ik", "body"):
-            c = slots.get(sk)
-            if c and c in arm_obj.data.collections:
-                arm_obj.data.collections[c].is_visible = True
+            _show_c(slots.get(sk))
     elif group == "curls":
-        hc = slots.get("hands_feet")
-        if hc and hc in arm_obj.data.collections:
-            arm_obj.data.collections[hc].is_visible = True
+        _show_c(slots.get("hands_feet"))
     elif group == "spinners":
-        sp = slots.get("spinners")
-        if sp and sp in arm_obj.data.collections:
-            arm_obj.data.collections[sp].is_visible = True
+        _show_c(slots.get("spinners"))
     elif group == "chest":
         for sk in ("torso_ik", "hood_fk", "spine_fk", "body") if names[0] == "CTRL_FK_Chest" else ("torso_ik", "body"):
-            c = slots.get(sk)
-            if c and c in arm_obj.data.collections:
-                arm_obj.data.collections[c].is_visible = True
+            _show_c(slots.get(sk))
     elif group == "neck":
         for sk in ("hood_fk", "body"):
-            c = slots.get(sk)
-            if c and c in arm_obj.data.collections:
-                arm_obj.data.collections[c].is_visible = True
+            _show_c(slots.get(sk))
     elif group == "spine":
         for sk in ("spine_fk", "body"):
-            c = slots.get(sk)
-            if c and c in arm_obj.data.collections:
-                arm_obj.data.collections[c].is_visible = True
+            _show_c(slots.get(sk))
     elif group == "wings":
         sk = "wings_ik" if float(arm_obj.get("hfw_ik_fk_wings", 0.0)) >= 0.5 else "wings_fk"
-        wc = slots.get(sk) or slots.get("wings")
-        if wc and wc in arm_obj.data.collections:
-            arm_obj.data.collections[wc].is_visible = True
+        _show_c(slots.get(sk) or slots.get("wings"))
     elif group == "appendages":
-        ac = slots.get("appendages")
-        if ac and ac in arm_obj.data.collections:
-            arm_obj.data.collections[ac].is_visible = True
+        _show_c(slots.get("appendages"))
 
     for pb in arm_obj.pose.bones:
         try:
