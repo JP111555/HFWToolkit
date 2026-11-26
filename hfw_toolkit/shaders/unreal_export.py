@@ -2332,7 +2332,7 @@ def build_ue5_control_rig(mesh_asset):
                 sp_parent = k_chest
 
         nk_parent = sp_parent
-        for idx, nb in enumerate(_sample(RIG_SPEC.get("neck") or [], 4)):
+        for idx, nb in enumerate(_sample(RIG_SPEC.get("neck") or [], 8)):
             k = _add_ctrl(f"CR_Neck_{{idx:02d}}", nb, nk_parent, "Circle_Thin", "C", 1.4)
             if k:
                 ctrl_to_bone.append((f"CR_Neck_{{idx:02d}}", nb))
@@ -2367,28 +2367,57 @@ def build_ue5_control_rig(mesh_asset):
                     ctrl_to_bone.append((cn, ab))
                     ap = k
 
+        end_bone_to_ctrl = {{}}
         for winfo in RIG_SPEC.get("wings") or []:
             wp = sp_parent
+            wside = winfo.get("side", "C")
             for idx, wb in enumerate(_sample(winfo.get("bones") or [], 6)):
                 cn = f"CR_{{winfo['name']}}_{{idx:02d}}"
-                k = _add_ctrl(cn, wb, wp, "Circle_Thin", winfo.get("side", "C"), 1.8)
+                k = _add_ctrl(cn, wb, wp, "Circle_Thin", wside, 1.8)
                 if k:
                     ctrl_to_bone.append((cn, wb))
                     wp = k
+            w_tip = winfo.get("tip_bone")
+            w_iks = [b for b in (winfo.get("ik_bones") or []) if _has_bone(b)]
+            if w_tip and _has_bone(w_tip) and len(w_iks) >= 2:
+                w_ik_nm = f"CR_IK_{{winfo['name']}}"
+                k_wik = _add_ctrl(w_ik_nm, w_tip, k_cog or k_root, "Box_Thick", wside, 1.8)
+                if k_wik:
+                    ik_chains.append({{"ctrl_name": w_ik_nm, "ik_bones": w_iks, "end_bone": w_tip, "is_leg": False}})
+                    end_bone_to_ctrl[w_tip] = k_wik
 
-        # Legs & Arms IK Controls (Parented to CR_Root so feet stay planted!)
-        end_bone_to_ctrl = {{}}
+        # Legs (Quadruped Shoulders/Scapulae + IK + Flipper Blade FK) & Arms (Clavicles + IK + Flipper Blade FK)
         for limb in list(RIG_SPEC.get("legs") or []) + list(RIG_SPEC.get("arms") or []):
             end_b = limb.get("foot_bone") or limb.get("hand_bone")
             ik_bs = [b for b in (limb.get("ik_bones") or []) if _has_bone(b)]
             if not end_b or not _has_bone(end_b) or len(ik_bs) < 2:
                 continue
             side = limb.get("side", "C")
+            sh_b = limb.get("shoulder")
+            if sh_b and _has_bone(sh_b):
+                sh_par = sp_parent if str(limb.get("name", "")).startswith("FrontLeg_") else (k_cog or k_root)
+                sh_nm = f"CR_Shoulder_{{limb['name']}}"
+                k_sh = _add_ctrl(sh_nm, sh_b, sh_par, "Circle_Thin", side, 1.4)
+                if k_sh:
+                    ctrl_to_bone.append((sh_nm, sh_b))
+            cl_b = limb.get("clavicle")
+            if cl_b and _has_bone(cl_b):
+                cl_nm = f"CR_Clavicle_{{side}}"
+                k_cl = _add_ctrl(cl_nm, cl_b, sp_parent, "Circle_Thin", side, 1.3)
+                if k_cl:
+                    ctrl_to_bone.append((cl_nm, cl_b))
             cname = f"CR_IK_{{limb['name']}}"
             k_ik = _add_ctrl(cname, end_b, k_root, "Box_Thick", side, 1.8)
             if k_ik:
                 ik_chains.append({{"ctrl_name": cname, "ik_bones": ik_bs, "end_bone": end_b, "is_leg": "foot_bone" in limb}})
                 end_bone_to_ctrl[end_b] = k_ik
+                ex_par = k_ik
+                for eidx, eb in enumerate(limb.get("extra_fk_bones") or []):
+                    ex_nm = f"CR_FK_{{limb['name']}}_Blade_{{eidx:02d}}"
+                    k_ex = _add_ctrl(ex_nm, eb, ex_par, "Circle_Thin", side, 1.1)
+                    if k_ex:
+                        ctrl_to_bone.append((ex_nm, eb))
+                        ex_par = k_ex
 
         # Hands / Fingers, Feet / Toes / Talons, and Secondary Articulated Machine Details FK Controls
         detail_groups = (

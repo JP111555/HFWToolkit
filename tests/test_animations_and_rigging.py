@@ -137,7 +137,13 @@ def test_ea08_humanoid_remap_onto_aloy_1881j(game_and_catalog):
         ("clawstrider", "theropod", 2),
         ("slaughterspine", "theropod", 2),
         ("behemoth", "quadruped", 4),
+        ("ravager", "quadruped", 4),
+        ("tremortusk", "quadruped", 4),
+        ("bilegut", "quadruped", 4),
         ("sunwing", "flyer", 2),
+        ("dreadwing", "flyer", 2),
+        ("shell-walker", "hexapod", 6),
+        ("tideripper", "aquatic", 2),
         ("slitherfang", "serpentine", 0),
     ],
 )
@@ -160,12 +166,34 @@ def test_universal_control_rig_chain_detection(game_and_catalog, query, expected
         assert dyn["wings_ik"] == "Wings IK"
     if expected_archetype == "serpentine":
         assert len(spec["spine"]) >= 20
-        assert "Chest" in dyn["body"]
+        assert spec["torso_ik_mode"] == "hood"
+        assert dyn["torso_ik"] == "Cobra Hood IK"
+        assert dyn["hood_fk"] == "Cobra Hood FK"
+        assert dyn["frills"] == "Hood Feathers"
     if query == "behemoth":
         assert spec["chest"] == "C_Chest_sjnt_0"
         assert dyn["front_legs_ik"] == "Front Legs IK"
         assert dyn["legs_ik"] == "Rear Legs IK"
         assert dyn["hands_feet"] == "Hooves"
+    if query == "ravager":
+        assert len(spec["legs"]) == 4
+        assert any(lg.get("shoulder") for lg in spec["legs"])
+        assert dyn["front_legs_ik"] == "Front Legs IK"
+    if query == "tremortusk":
+        assert spec["appendages"] and spec["appendages"][0]["name"] == "Trunk"
+        assert dyn["appendages"] == "Trunk FK"
+    if query == "bilegut":
+        assert spec["appendages"] and spec["appendages"][0]["name"] == "Tongue"
+        assert dyn["frills"] == "Vocal Sacs"
+    if query == "shell-walker":
+        assert len(spec["legs"]) == 6
+        assert len(spec["arms"]) == 2
+        assert dyn["arms_ik"] == "Claw & Gun Arms IK"
+    if query == "tideripper":
+        assert all(lg.get("is_flipper") for lg in spec["legs"])
+        assert all(ar.get("is_flipper") for ar in spec["arms"])
+        assert dyn["arms_ik"] == "Front Flippers IK"
+        assert dyn["legs_ik"] == "Rear Flippers IK"
     if query == "clawstrider":
         assert spec["chest"] == "C_spine_sjnt_6"
         assert dyn["frills"] == "Feathers & Blades"
@@ -200,11 +228,14 @@ def test_blender_control_rig_and_bidirectional_bake_and_ue5_ast(game_and_catalog
     assert manifest["rig_spec"]["archetype"] == "theropod"
     assert len(manifest["animations"]) == 1
 
-    # Verify UE5 Control Rig + AnimSequence Python importer AST (including FK finger/toe/detail controls)
+    # Verify UE5 Control Rig + AnimSequence Python importer AST (including shoulders/wings/flippers/detail controls)
     ue5_script = (bdir / "ue5_import_machine.py").read_text(encoding="utf-8")
     ast.parse(ue5_script)
     assert "build_ue5_control_rig" in ue5_script
     assert "CR_Chest" in ue5_script
+    assert "CR_Shoulder_" in ue5_script
+    assert "CR_Clavicle_" in ue5_script
+    assert "_Blade_" in ue5_script
     assert "RigUnit_InverseExecution" in ue5_script
     assert "import_animations_fbx" in ue5_script
     assert "detail_groups" in ue5_script
@@ -297,9 +328,10 @@ for skey, expected_nm in (
     assert expected_nm in arm.data.collections, f"Missing dynamic collection {{expected_nm}}"
 assert "plates" in slots and slots["plates"] in arm.data.collections
 
-# Verify Multi-Bone CTRL_Chest Move (G) arches LOWER + MID + UPPER SPINE AND switches cleanly to Pure Spine FK!
+# Verify Multi-Bone CTRL_Chest Move (G) arches LOWER + MID + UPPER SPINE, `hfw_rig_chest = 0.0` disables Chest IK cleanly, AND switches cleanly to Pure Spine FK!
 arm["hfw_rig_master"] = 1.0
 arm["hfw_ik_fk_torso"] = 1.0
+arm["hfw_rig_chest"] = 1.0
 arm.update_tag()
 bpy.context.view_layer.update()
 mid_sp0 = arm.pose.bones["C_spine_sjnt_3"].matrix.to_translation().copy()
@@ -312,6 +344,14 @@ mid_sp1 = arm.pose.bones["C_spine_sjnt_3"].matrix.to_translation().copy()
 head_c1 = arm.pose.bones["C_head_sjnt_0"].matrix.to_translation().copy()
 assert (mid_sp1 - mid_sp0).length > 0.06, f"Multi-bone Chest IK did not arch mid-spine! ({{(mid_sp1 - mid_sp0).length}}m)"
 assert (head_c1 - head_c0).length > 0.25
+# Dragging `hfw_rig_chest = 0.0` must smoothly disable Chest IK back to Spine FK rest pose!
+arm["hfw_rig_chest"] = 0.0
+arm.update_tag()
+bpy.context.view_layer.update()
+assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - head_c0).length < 0.005
+arm["hfw_rig_chest"] = 1.0
+arm.update_tag()
+bpy.context.view_layer.update()
 # Turn Chest IK OFF -> Spine FK (zero-pop snap + hides Chest IK + shows Spine FK!)
 cr.switch_limb_ik_fk(arm, group="torso", to_ik=False, snap_pose=True)
 assert float(arm["hfw_ik_fk_torso"]) == 0.0
@@ -319,6 +359,16 @@ assert arm.data.collections[slots["spine_fk"]].is_visible is True
 assert arm.data.collections[slots["torso_ik"]].is_visible is False
 assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - head_c1).length < 0.01
 cr.switch_limb_ik_fk(arm, group="torso", to_ik=True, snap_pose=True)
+cr.reset_control_rig_pose(arm)
+
+# Verify exact L->R Mirror Pose across IK legs AND sequenced feathers!
+arm.pose.bones["CTRL_IK_Leg_L"].location = (0.18, 0.25, 0.42)
+bpy.context.view_layer.update()
+n_mir = cr.mirror_control_rig_pose(arm, source_side="L")
+assert n_mir >= 80
+p_ll = arm.pose.bones["L_leg_sjnt_3"].matrix.to_translation()
+p_lr = arm.pose.bones["R_leg_sjnt_3"].matrix.to_translation()
+assert abs(p_ll.x + p_lr.x) < 0.015 and abs(p_ll.y - p_lr.y) < 0.015 and abs(p_ll.z - p_lr.z) < 0.015
 cr.reset_control_rig_pose(arm)
 
 # Move IK Leg and assert thigh armor plate + dewclaw + foot move together, then zero-pop snap to FK!

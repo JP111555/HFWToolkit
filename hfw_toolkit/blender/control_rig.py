@@ -591,23 +591,24 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 for n in names
                 if not _is_ignored_bone(n)
                 and _extract_side(n) == side
-                and not any(bk in n.lower() for bk in ("back", "rear", "hind", "mid"))
+                and not any(bk in n.lower() for bk in ("back", "rear", "hind", "mid", "flap"))
                 and (
                     any(k in n.lower() for k in ("frontleg", "frontfoot", "fronthoof", "frontankle", "fronthip", "_front_shoulder", "_front_knee", "_front_ankle", "_front_foot", "scapula", "shoulder"))
                     or n.lower().startswith((f"{s_pref}fleg", f"{s_pref}f_leg", f"{s_pref}f_shoulder"))
                 )
             ]
+            fchain = _longest_parent_chain(front_cands, parent_map)
             # Wolf/Cat HZD/HFW quadrupeds (Ravager, Scorcher, Scrapper, Scrounger, Stalker): front legs are `L/R_scapula -> L/R_Leg -> L/R_Foot` alongside `L/R_backLeg`!
-            if not front_cands:
+            if len(fchain) < 3:
                 front_cands = [
                     n
                     for n in names
                     if not _is_ignored_bone(n)
                     and _extract_side(n) == side
-                    and not any(bk in n.lower() for bk in ("back", "rear", "hind", "mid"))
-                    and any(k in n.lower() for k in ("_leg_", "leg_sjnt", "_foot_", "foot_sjnt", "scapula"))
+                    and not any(bk in n.lower() for bk in ("back", "rear", "hind", "mid", "flap"))
+                    and any(k in n.lower() for k in ("_leg_", "leg_sjnt", "_foot_", "foot_sjnt", "scapula", "shoulder"))
                 ]
-            fchain = _longest_parent_chain(front_cands, parent_map)
+                fchain = _longest_parent_chain(front_cands, parent_map)
             if len(fchain) > 4 and any("hoof_sjnt_0" in b.lower() for b in fchain):
                 idx_h = next(i for i, b in enumerate(fchain) if "hoof_sjnt_0" in b.lower())
                 fchain = fchain[: idx_h + 1]
@@ -957,7 +958,19 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         neck_chain = [b for b in neck_chain if b != chest_bone]
 
     # Multi-bone Torso/Chest IK is supported whenever chest_bone sits directly at the top of spine_chain (`spine_0..k -> chest`)!
-    torso_ik_supported = bool(spine_chain and chest_bone and parent_map.get(chest_bone) == spine_chain[-1])
+    # Serpentine rigs (Slitherfang) instead support Cobra Hood IK across `chest_bone -> neck_0..N` (`torso_ik_mode = "hood"`)!
+    spine_torso_ik = bool(spine_chain and chest_bone and parent_map.get(chest_bone) == spine_chain[-1])
+    hood_torso_ik = bool(
+        not spine_torso_ik
+        and len(legs) == 0
+        and len(spine_chain) >= 8
+        and chest_bone
+        and len(neck_chain) >= 4
+        and parent_map.get(neck_chain[0]) == chest_bone
+        and all(parent_map.get(neck_chain[i]) == neck_chain[i - 1] for i in range(1, len(neck_chain)))
+    )
+    torso_ik_mode = "spine" if spine_torso_ik else ("hood" if hood_torso_ik else "none")
+    torso_ik_supported = torso_ik_mode != "none"
 
     # 8. Smaller Articulated FK Chains: Hand Fingers/Claws, Wing Ribs/Fingers, Foot Toes/Talons/Hooves, Secondary Machine Details!
     primary_used: set[str] = set()
@@ -1009,7 +1022,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 for k in children_map.get(wb, [])
                 if k not in primary_used
                 and not _is_detail_forbidden(k)
-                and any(tk in k.lower() for tk in ("wingrib", "winghandhinge", "armhandhinge", "handfinger", "wingfinger", "claw", "thumb"))
+                and any(tk in k.lower() for tk in ("wingrib", "gliderrib", "winghandhinge", "armhandhinge", "handfinger", "wingfinger", "claw", "thumb"))
             ]
             for ci, ch in enumerate(_collect_sub_chains(w_kids, children_map, head_map, primary_used, max_depth=5)):
                 stem = re.sub(r"^[LlRrCc]_", "", ch[0])
@@ -1281,6 +1294,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         "spine": spine_chain,
         "chest": chest_bone,
         "torso_ik_supported": torso_ik_supported,
+        "torso_ik_mode": torso_ik_mode,
         "neck": neck_chain,
         "head": head_bone,
         "jaws": jaw_bones,
@@ -1537,8 +1551,8 @@ def compute_dynamic_collection_labels(
             return hits[0][0]
         return f"{hits[0][1]} & {hits[1][1]}"
 
-    # 1. Body / Torso / Chest / Head + Multi-Bone Torso IK / Spine FK + Appendages
-    has_torso_ik = bool(spec.get("torso_ik_supported"))
+    # 1. Body / Torso / Chest / Head + Multi-Bone Torso IK / Cobra Hood IK / Spine FK + Appendages
+    torso_ik_mode = str(spec.get("torso_ik_mode") or ("spine" if spec.get("torso_ik_supported") else "none"))
     if arch == "serpentine":
         body_lbl = "Body, Chest & Hood" if has_chest else "Serpent Body & Head"
     elif has_chest and has_spine:
@@ -1548,7 +1562,8 @@ def compute_dynamic_collection_labels(
     else:
         body_lbl = "Body & Head"
 
-    torso_ik_lbl = "Chest & Back IK"
+    torso_ik_lbl = "Cobra Hood IK" if torso_ik_mode == "hood" else "Chest & Back IK"
+    hood_fk_lbl = "Cobra Hood FK"
     spine_fk_lbl = "Serpent Body FK" if arch == "serpentine" else "Spine & Chest FK"
 
     # 2. Tail, Appendages (Trunk/Tongue) & Wings (Dual IK / FK!)
@@ -1627,7 +1642,14 @@ def compute_dynamic_collection_labels(
         fr_low,
         (
             (("plasmaspike", "frontguide", "guidespike"), "Plasma Intakes", "Plasma Intakes"),
-            (("feather", "plume"), "Tail Feathers" if all("tail" in nm for nm in fr_low if "feather" in nm) and fr_low else "Feathers", "Feathers"),
+            (("ribbit",), "Vocal Sacs", "Vocal Sacs"),
+            (
+                ("feather", "plume"),
+                "Hood Feathers"
+                if arch == "serpentine"
+                else ("Tail Feathers" if all("tail" in nm for nm in fr_low if "feather" in nm) and fr_low else "Feathers"),
+                "Hood Feathers" if arch == "serpentine" else "Feathers",
+            ),
             (("headfan", "fan"), "Head Fans", "Head Fans"),
             (("engine",), "Wing Engines", "Engines"),
             (("rearwing", "reartopwing", "fronttopwing", "sidewing", "anklewing", "wingknife"), "Aux Wings", "Aux Wings"),
@@ -1695,6 +1717,7 @@ def compute_dynamic_collection_labels(
     slots: dict[str, str] = {
         "body": body_lbl,
         "torso_ik": torso_ik_lbl,
+        "hood_fk": hood_fk_lbl,
         "spine_fk": spine_fk_lbl,
         "tail": tail_lbl,
         "appendages": app_lbl,
@@ -1761,6 +1784,7 @@ def _add_influence_driver(
     *,
     ik_prop: str | None = None,
     ik_invert: bool = False,
+    extra_prop: str | None = None,
     use_master: bool = True,
 ) -> None:
     """Drive `constraint.influence` using Blender's safe Simple Expression evaluator (works without autoexec!)."""
@@ -1787,6 +1811,9 @@ def _add_influence_driver(
     if ik_prop:
         _add_var("ik", ik_prop)
         terms.append("(1.0 - ik)" if ik_invert else "ik")
+    if extra_prop:
+        _add_var("ext", extra_prop)
+        terms.append("ext")
 
     drv.expression = " * ".join(terms) if terms else "1.0"
 
@@ -1902,6 +1929,7 @@ _ALL_CTRL_COLLECTION_NAMES = (
 _LEGACY_SLOT_DEFAULTS = {
     "body": "Body_Main",
     "torso_ik": "Chest & Back IK",
+    "hood_fk": "Cobra Hood FK",
     "spine_fk": "Spine & Chest FK",
     "tail": "Tail",
     "appendages": "Appendage FK",
@@ -2071,14 +2099,16 @@ def build_control_rig(
         active_slots[slot_key] = cname
         return _get_coll(cname, visible)
 
-    has_torso_ik_spec = bool(spec.get("torso_ik_supported"))
+    torso_ik_mode = str(spec.get("torso_ik_mode") or ("spine" if spec.get("torso_ik_supported") else "none"))
+    has_torso_ik_spec = torso_ik_mode != "none"
     has_front_legs = any(lg["name"].startswith("FrontLeg_") for lg in spec["legs"])
     has_other_legs = any(not lg["name"].startswith("FrontLeg_") for lg in spec["legs"])
     has_wing_ik = any(len(w.get("ik_bones") or ()) >= 2 for w in spec["wings"])
 
     body_coll = _slot_coll("body", True, True)
     torso_ik_coll = _slot_coll("torso_ik", has_torso_ik_spec, True)
-    spine_fk_coll = _slot_coll("spine_fk", bool(spec["spine"]), not has_torso_ik_spec)
+    hood_fk_coll = _slot_coll("hood_fk", torso_ik_mode == "hood", False)
+    spine_fk_coll = _slot_coll("spine_fk", bool(spec["spine"]), torso_ik_mode != "spine")
     tail_coll = _slot_coll("tail", bool(spec["tails"]), True)
     app_coll = _slot_coll("appendages", bool(spec.get("appendages")), True)
     wings_ik_coll = _slot_coll("wings_ik", has_wing_ik, default_wings_ik >= 0.5)
@@ -2127,7 +2157,9 @@ def build_control_rig(
     torso_ik_meta: dict[str, Any] = {}
     tail_ctrls: list[str] = []
     spine_ctrls: list[str] = []
+    neck_ctrls: list[str] = []
     wing_ctrls: list[str] = []
+    wing_ik_ctrls: list[str] = []
     appendage_ctrls: list[str] = []
     driven_def_bones: set[str] = set()
     core_def_bones: set[str] = set()
@@ -2175,6 +2207,7 @@ def build_control_rig(
         prefix: str = "MCH_Bind_",
         ik_prop: str | None = None,
         ik_invert: bool = False,
+        extra_prop: str | None = None,
         con_name: str = "HFW_CTRL",
     ) -> str:
         h, t, m, l = def_rest[def_name]
@@ -2189,6 +2222,7 @@ def build_control_rig(
                 "mode": mode,
                 "ik_prop": ik_prop,
                 "ik_invert": ik_invert,
+                "extra_prop": extra_prop,
                 "con_name": con_name,
             }
         )
@@ -2255,42 +2289,67 @@ def build_control_rig(
 
     # Helper to attach dual-space `MCH_Follow_<bname>` to EVERY spine/chest/wing/limb segment so ALL child controls
     # (shoulders, wings, neck, head, dorsal spikes, plasma intakes, armor plates, toes, fingers) track BOTH IK & FK!
-    def _make_dual_follow_socket(bname: str, fk_bind: str, ik_bind: str, ik_prop: str) -> Any:
+    def _make_dual_follow_socket(
+        bname: str,
+        fk_bind: str,
+        ik_bind: str,
+        ik_prop: str,
+        *,
+        extra_prop: str | None = None,
+    ) -> Any:
         bh, bt, bm, bl = def_rest[bname]
         mf = _new_bone(_unique_name(f"MCH_Follow_{bname}"), bh, bt, ctrl_root, matrix=bm, colls=(mch_coll,))
         mf.length = max(0.02, bl)
-        follow_setups.append({"follow_mch": mf.name, "fk_mch": fk_bind, "ik_mch": ik_bind, "ik_prop": ik_prop})
+        follow_setups.append(
+            {
+                "follow_mch": mf.name,
+                "fk_mch": fk_bind,
+                "ik_mch": ik_bind,
+                "ik_prop": ik_prop,
+                "extra_prop": extra_prop,
+            }
+        )
         def_to_driver_eb[bname] = mf
         return mf
 
-    # --- 3. Multi-Bone Chest / Back IK <-> Pure Spine FK (`hfw_ik_fk_torso`) ---
+    # --- 3. Multi-Bone Chest / Back IK <-> Pure Spine FK (AND Serpentine Cobra Hood IK <-> Hood FK!) ---
     spine_full = [b for b in spec["spine"] if b in def_rest]
+    neck_full = [b for b in spec["neck"] if b in def_rest]
     chest_def = spec.get("chest")
-    use_torso_ik = bool(has_torso_ik_spec and spine_full and chest_def and chest_def in def_rest)
+    use_spine_ik = bool(torso_ik_mode == "spine" and spine_full and chest_def and chest_def in def_rest)
+    use_hood_ik = bool(torso_ik_mode == "hood" and chest_def and chest_def in def_rest and len(neck_full) >= 4)
+    use_torso_ik = use_spine_ik or use_hood_ik
     spine_parent_eb = ctrl_cog
     chest_ctrl_name = ""
+    skip_standard_neck = False
 
-    if use_torso_ik:
-        # 3a. Pure FK Spine + Chest Chain (`CTRL_FK_Spine_00..k-1`, `CTRL_FK_Chest` in `Spine & Chest FK`)
-        #     Available whenever the user switches Torso -> Spine FK (turns Chest IK controller completely OFF!)
-        fk_t_parent = ctrl_cog
+    def _build_multi_bone_ik_block(
+        chain_bones: list[str],
+        tip_bone: str,
+        *,
+        anchor_parent: Any,
+        grp_prop: str,
+        fk_coll: Any,
+        fk_prefix: str,
+        fk_ctrl_list: list[str],
+        nxt_after_tip: str | None,
+    ) -> Any:
+        nonlocal chest_ctrl_name, torso_ik_meta
+        fk_t_parent = anchor_parent
         fk_binds_t: dict[str, str] = {}
         torso_fk_pairs: list[dict[str, str]] = []
-        torso_full = list(spine_full) + [chest_def]
+        torso_full = list(chain_bones) + [tip_bone]
         for idx, tb in enumerate(torso_full):
             core_def_bones.add(tb)
             h_pos = def_rest[tb][0]
-            if idx + 1 < len(torso_full):
-                nxt_b = torso_full[idx + 1]
-            else:
-                nxt_b = spec["neck"][0] if spec["neck"] else spec["head"]
+            nxt_b = torso_full[idx + 1] if (idx + 1 < len(torso_full)) else nxt_after_tip
             if nxt_b and nxt_b in def_rest and (def_rest[nxt_b][0] - h_pos).length > 0.02:
                 t_pos = def_rest[nxt_b][0]
             else:
                 t_pos = h_pos + Vector((0.0, 0.0, max(0.14, rig_h * 0.10)))
             is_ch = idx == len(torso_full) - 1
-            fk_nm = "CTRL_FK_Chest" if is_ch else f"CTRL_FK_Spine_{idx:02d}"
-            fk_eb = _new_bone(fk_nm, h_pos, t_pos, fk_t_parent, colls=(spine_fk_coll or body_coll,))
+            fk_nm = "CTRL_FK_Chest" if is_ch else f"{fk_prefix}_{idx:02d}"
+            fk_eb = _new_bone(fk_nm, h_pos, t_pos, fk_t_parent, colls=(fk_coll or body_coll,))
             ctrl_styles[fk_nm] = {
                 "widget": "chest" if is_ch else "fk_ring",
                 "scale": (
@@ -2305,26 +2364,25 @@ def build_control_rig(
                 "lock_loc": True,
             }
             fk_binds_t[tb] = _make_bind_child(
-                tb, fk_eb, "hfw_rig_spine", "TRANSFORM",
+                tb, fk_eb, grp_prop, "TRANSFORM",
                 prefix="MCH_BindFK_", ik_prop="hfw_ik_fk_torso", ik_invert=True, con_name="HFW_FK_Xform",
             )
             pair = {"ctrl": fk_nm, "def_bone": tb, "mode": "ROTATION"}
             bake_fk_pairs.append(pair)
             torso_fk_pairs.append(pair)
-            spine_ctrls.append(fk_nm)
+            fk_ctrl_list.append(fk_nm)
             fk_t_parent = fk_eb
         limb_fk_chains["torso"].append({"name": "Torso", "fk_pairs": torso_fk_pairs})
 
-        # 3b. Multi-Bone Chest / Back IK Solver (`CTRL_Chest` + `CTRL_Spine_Mid` in `Chest & Back IK`!)
-        #     Moving (G) OR Rotating (R) `CTRL_Chest` arches the ENTIRE back smoothly across all spine bones!
-        pts_t = [def_rest[b][0] for b in spine_full] + [def_rest[chest_def][0]]
+        # Multi-Bone Chest / Cobra Hood IK Solver (`CTRL_Chest` + `CTRL_Spine_Mid`)
+        # Moving (G) OR Rotating (R) `CTRL_Chest` arches the ENTIRE back or cobra hood smoothly!
+        pts_t = [def_rest[b][0] for b in chain_bones] + [def_rest[tip_bone][0]]
         ch_pos = pts_t[-1]
-        nxt_ch = spec["neck"][0] if spec["neck"] else spec["head"]
-        if nxt_ch and nxt_ch in def_rest and (def_rest[nxt_ch][0] - ch_pos).length > 0.02:
-            ch_tail = def_rest[nxt_ch][0]
+        if nxt_after_tip and nxt_after_tip in def_rest and (def_rest[nxt_after_tip][0] - ch_pos).length > 0.02:
+            ch_tail = def_rest[nxt_after_tip][0]
         else:
             ch_tail = ch_pos + Vector((0.0, 0.0, max(0.18, rig_h * 0.14)))
-        ctrl_chest = _new_bone("CTRL_Chest", ch_pos, ch_tail, ctrl_cog, colls=(torso_ik_coll or body_coll,))
+        ctrl_chest = _new_bone("CTRL_Chest", ch_pos, ch_tail, anchor_parent, colls=(torso_ik_coll or body_coll,))
         ctrl_styles["CTRL_Chest"] = {
             "widget": "chest",
             "scale": max(0.21, rig_h * 0.14) if is_humanoid else max(0.36, rig_h * 0.27),
@@ -2332,29 +2390,29 @@ def build_control_rig(
             "is_root": False,
             "is_detail": False,
             "category": "chest",
-            "lock_loc": False,  # UNLOCKED so Move (G) & Rotate (R) arch the entire back!
+            "lock_loc": False,  # UNLOCKED so Move (G) & Rotate (R) arch the entire back/hood!
         }
         chest_ctrl_name = "CTRL_Chest"
 
-        k_sp = len(spine_full)
+        k_sp = len(chain_bones)
         mch_t_chain: list[Any] = []
         ik_binds_t: dict[str, str] = {}
-        for idx, sb in enumerate(spine_full):
+        for idx, sb in enumerate(chain_bones):
             m_eb = _new_bone(
                 f"MCH_TorsoIK_{idx}",
                 pts_t[idx],
                 pts_t[idx + 1],
-                ctrl_cog if idx == 0 else mch_t_chain[-1],
+                anchor_parent if idx == 0 else mch_t_chain[-1],
                 colls=(mch_coll,),
                 use_connect=(idx > 0),
             )
             mch_t_chain.append(m_eb)
             ik_binds_t[sb] = _make_bind_child(
-                sb, m_eb, "hfw_rig_spine", "TRANSFORM",
-                prefix="MCH_BindIK_", ik_prop="hfw_ik_fk_torso", ik_invert=False, con_name="HFW_IK_Xform",
+                sb, m_eb, grp_prop, "TRANSFORM",
+                prefix="MCH_BindIK_", ik_prop="hfw_ik_fk_torso", ik_invert=False,
+                extra_prop="hfw_rig_chest", con_name="HFW_IK_Xform",
             )
 
-        # Chest tip MCH pinned to top of curved spine, copying CTRL_Chest world rotation cleanly!
         mch_t_chest = _new_bone(
             "MCH_TorsoIK_Chest",
             ch_pos,
@@ -2366,9 +2424,10 @@ def build_control_rig(
         extra_constraints.append(
             {"bone": "MCH_TorsoIK_Chest", "type": "COPY_ROTATION", "target": "CTRL_Chest", "influence": 1.0}
         )
-        ik_binds_t[chest_def] = _make_bind_child(
-            chest_def, mch_t_chest, "hfw_rig_spine", "TRANSFORM",
-            prefix="MCH_BindIK_", ik_prop="hfw_ik_fk_torso", ik_invert=False, con_name="HFW_IK_Xform",
+        ik_binds_t[tip_bone] = _make_bind_child(
+            tip_bone, mch_t_chest, grp_prop, "TRANSFORM",
+            prefix="MCH_BindIK_", ik_prop="hfw_ik_fk_torso", ik_invert=False,
+            extra_prop="hfw_rig_chest", con_name="HFW_IK_Xform",
         )
 
         # Exact-rest-aligned upper IK target child of CTRL_Chest (guarantees 0.000mm / 0.000° rest drift!)
@@ -2386,13 +2445,13 @@ def build_control_rig(
         mid_def_name = ""
         if k_sp >= 2:
             mid_idx = k_sp // 2
-            mid_def_name = spine_full[mid_idx]
+            mid_def_name = chain_bones[mid_idx]
             mid_pos = pts_t[mid_idx]
             mid_rot4 = mch_t_chain[mid_idx - 1].matrix.to_3x3().to_4x4()
             mid_mat = Matrix.Translation(mid_pos) @ mid_rot4
             mid_dir = (pts_t[mid_idx] - pts_t[mid_idx - 1]).normalized() * 0.12
 
-            _new_bone("MCH_COG_MidRef", mid_pos, mid_pos + mid_dir, ctrl_cog, matrix=mid_mat, colls=(mch_coll,))
+            _new_bone("MCH_COG_MidRef", mid_pos, mid_pos + mid_dir, anchor_parent, matrix=mid_mat, colls=(mch_coll,))
             _new_bone("MCH_Chest_MidRef", mid_pos, mid_pos + mid_dir, ctrl_chest, matrix=mid_mat, colls=(mch_coll,))
             m_anc = _new_bone("MCH_TorsoMidAnchor", mid_pos, mid_pos + mid_dir, ctrl_root, matrix=mid_mat, colls=(mch_coll,))
             extra_constraints.append({"bone": m_anc.name, "type": "COPY_TRANSFORMS", "target": "MCH_COG_MidRef", "influence": 1.0})
@@ -2455,19 +2514,31 @@ def build_control_rig(
                 }
             )
 
-        # Dual-space follow sockets on EVERY spine bone + chest so arms, wings, neck, head, spikes & plates follow BOTH Chest IK & Spine FK!
         for tb in torso_full:
-            _make_dual_follow_socket(tb, fk_binds_t[tb], ik_binds_t[tb], "hfw_ik_fk_torso")
-        spine_parent_eb = def_to_driver_eb[chest_def]
+            _make_dual_follow_socket(tb, fk_binds_t[tb], ik_binds_t[tb], "hfw_ik_fk_torso", extra_prop="hfw_rig_chest")
         torso_ik_meta = {
+            "mode": torso_ik_mode,
             "chest_ctrl": "CTRL_Chest",
-            "chest_def": chest_def,
+            "chest_def": tip_bone,
             "mid_ctrl": mid_ctrl_name,
             "mid_def": mid_def_name,
             "mid_anchor": "MCH_TorsoMidAnchor" if mid_ctrl_name else "",
         }
+        return def_to_driver_eb[tip_bone]
+
+    if use_spine_ik:
+        spine_parent_eb = _build_multi_bone_ik_block(
+            spine_full,
+            chest_def,
+            anchor_parent=ctrl_cog,
+            grp_prop="hfw_rig_spine",
+            fk_coll=spine_fk_coll,
+            fk_prefix="CTRL_FK_Spine",
+            fk_ctrl_list=spine_ctrls,
+            nxt_after_tip=spec["neck"][0] if spec["neck"] else spec["head"],
+        )
     else:
-        # Pure FK Spine (e.g. Slitherfang 40-bone serpent body, Rockbreaker/Snapmaw backward spine) + direct CTRL_Chest
+        # Pure FK Spine (e.g. Slitherfang 40-bone serpent body, Rockbreaker/Snapmaw backward spine)
         spine_handles = _sample_chain_handles(spine_full, max_handles=14)
         for i, sb in enumerate(spine_full):
             core_def_bones.add(sb)
@@ -2476,7 +2547,7 @@ def build_control_rig(
                 nxt_b = (
                     spine_full[i + 1]
                     if (i + 1 < len(spine_full))
-                    else (chest_def or (spec["neck"][0] if spec["neck"] else spec["head"]))
+                    else (chest_def if not use_hood_ik else None)
                 )
                 if nxt_b and nxt_b in def_rest and (def_rest[nxt_b][0] - h_pos).length > 0.02:
                     t_pos = def_rest[nxt_b][0]
@@ -2496,7 +2567,21 @@ def build_control_rig(
             else:
                 def_to_driver_eb[sb] = spine_parent_eb
 
-        if chest_def and chest_def in def_rest:
+        if use_hood_ik:
+            # Serpentine Cobra Hood IK <-> Hood FK across `chest_def -> neck_0..N-1 -> neck_N` (12-bone arching cobra hood!)
+            hood_anchor = _find_parent_driver(chest_def, ctrl_cog)
+            spine_parent_eb = _build_multi_bone_ik_block(
+                [chest_def] + neck_full[:-1],
+                neck_full[-1],
+                anchor_parent=hood_anchor,
+                grp_prop="hfw_rig_head",
+                fk_coll=hood_fk_coll,
+                fk_prefix="CTRL_FK_Hood",
+                fk_ctrl_list=neck_ctrls,
+                nxt_after_tip=spec["head"],
+            )
+            skip_standard_neck = True
+        elif chest_def and chest_def in def_rest:
             core_def_bones.add(chest_def)
             ch_pos = def_rest[chest_def][0]
             ch_parent = _find_parent_driver(chest_def, spine_parent_eb)
@@ -2518,30 +2603,33 @@ def build_control_rig(
             chest_ctrl_name = "CTRL_Chest"
 
     # --- 4. Neck, Head & Jaws FK ---
-    neck_full = [b for b in spec["neck"] if b in def_rest]
-    neck_handles = _sample_chain_handles(neck_full, max_handles=8)
-    neck_parent_eb = _find_parent_driver(neck_full[0], spine_parent_eb) if neck_full else spine_parent_eb
-    for i, nb in enumerate(neck_full):
-        core_def_bones.add(nb)
-        if nb in neck_handles:
-            h_pos = def_rest[nb][0]
-            nxt_b = neck_full[i + 1] if (i + 1 < len(neck_full)) else spec["head"]
-            if nxt_b and nxt_b in def_rest and (def_rest[nxt_b][0] - h_pos).length > 0.02:
-                t_pos = def_rest[nxt_b][0]
+    if skip_standard_neck:
+        neck_parent_eb = spine_parent_eb
+    else:
+        neck_handles = _sample_chain_handles(neck_full, max_handles=8)
+        neck_parent_eb = _find_parent_driver(neck_full[0], spine_parent_eb) if neck_full else spine_parent_eb
+        for i, nb in enumerate(neck_full):
+            core_def_bones.add(nb)
+            if nb in neck_handles:
+                h_pos = def_rest[nb][0]
+                nxt_b = neck_full[i + 1] if (i + 1 < len(neck_full)) else spec["head"]
+                if nxt_b and nxt_b in def_rest and (def_rest[nxt_b][0] - h_pos).length > 0.02:
+                    t_pos = def_rest[nxt_b][0]
+                else:
+                    t_pos = h_pos + Vector((0.0, 0.0, max(0.10, rig_h * 0.08)))
+                cname = f"CTRL_Neck_{neck_handles.index(nb):02d}"
+                c_eb = _new_bone(cname, h_pos, t_pos, neck_parent_eb, colls=(body_coll,))
+                ctrl_styles[cname] = {
+                    "widget": "fk_ring", "scale": max(0.12, rig_h * 0.08) if is_humanoid else max(0.24, rig_h * 0.17), "side": "C",
+                    "is_root": False, "is_detail": False, "category": "body", "lock_loc": True,
+                }
+                _make_bind_child(nb, c_eb, "hfw_rig_head", "ROTATION")
+                bake_fk_pairs.append({"ctrl": cname, "def_bone": nb, "mode": "ROTATION"})
+                neck_ctrls.append(cname)
+                neck_parent_eb = c_eb
+                def_to_driver_eb[nb] = c_eb
             else:
-                t_pos = h_pos + Vector((0.0, 0.0, max(0.10, rig_h * 0.08)))
-            cname = f"CTRL_Neck_{neck_handles.index(nb):02d}"
-            c_eb = _new_bone(cname, h_pos, t_pos, neck_parent_eb, colls=(body_coll,))
-            ctrl_styles[cname] = {
-                "widget": "fk_ring", "scale": max(0.12, rig_h * 0.08) if is_humanoid else max(0.24, rig_h * 0.17), "side": "C",
-                "is_root": False, "is_detail": False, "category": "body", "lock_loc": True,
-            }
-            _make_bind_child(nb, c_eb, "hfw_rig_head", "ROTATION")
-            bake_fk_pairs.append({"ctrl": cname, "def_bone": nb, "mode": "ROTATION"})
-            neck_parent_eb = c_eb
-            def_to_driver_eb[nb] = c_eb
-        else:
-            def_to_driver_eb[nb] = neck_parent_eb
+                def_to_driver_eb[nb] = neck_parent_eb
 
     head_def = spec["head"]
     ctrl_head = neck_parent_eb
@@ -2730,6 +2818,7 @@ def build_control_rig(
 
             ctrl_wtip_nm = f"CTRL_IK_{wname}"
             ctrl_wtip = _new_bone(ctrl_wtip_nm, tip_pos, tip_tail, ctrl_cog, colls=(wings_ik_coll or body_coll,))
+            wing_ik_ctrls.append(ctrl_wtip_nm)
             ctrl_styles[ctrl_wtip_nm] = {
                 "widget": "box", "scale": max(0.24, rig_h * 0.16), "side": side,
                 "is_root": False, "is_detail": False, "category": "body", "lock_loc": False,
@@ -3309,7 +3398,15 @@ def build_control_rig(
         c_ik.subtarget = fs["ik_mch"]
         c_ik.target_space = "WORLD"
         c_ik.owner_space = "WORLD"
-        _add_influence_driver(arm_obj, c_ik, "", ik_prop=fs["ik_prop"], ik_invert=False, use_master=False)
+        _add_influence_driver(
+            arm_obj,
+            c_ik,
+            "",
+            ik_prop=fs["ik_prop"],
+            ik_invert=False,
+            extra_prop=fs.get("extra_prop"),
+            use_master=False,
+        )
 
     # 3. Driven constraints onto controlled DEF bones (supports both single FK and dual IK/FK limbs!)
     rot_only_defs: set[str] = set()
@@ -3330,7 +3427,7 @@ def build_control_rig(
         con.subtarget = bd["target_mch"]
         con.target_space = "WORLD"
         con.owner_space = "WORLD"
-        # For dual FK+IK limbs, FK runs first at `master * grp` and IK runs second at `master * grp * ik`
+        # For dual FK+IK limbs, FK runs first at `master * grp` and IK runs second at `master * grp * ik (* ext)`
         # so even mid-blend (ik=0.5) interpolates cleanly FK<->IK with ZERO raw game-anim leak!
         use_ik_prop = None if (bd["ik_prop"] and bd["ik_invert"]) else bd["ik_prop"]
         _add_influence_driver(
@@ -3339,6 +3436,7 @@ def build_control_rig(
             bd["group_prop"],
             ik_prop=use_ik_prop,
             ik_invert=False,
+            extra_prop=bd.get("extra_prop"),
             use_master=True,
         )
 
@@ -3443,12 +3541,12 @@ def build_control_rig(
                 pb_c = arm_obj.pose.bones[cn]
                 err += (pb_c.head - rest_heads[idx_c]).length
                 err += (pb_c.tail - rest_tails[idx_c]).length
-                err += 0.15 * (pb_c.matrix.to_3x3().col[0] - rest_x[idx_c]).length
+                err += 0.30 * (pb_c.matrix.to_3x3().col[0] - rest_x[idx_c]).length
             return err
 
         best_ang = con.pole_angle
         best_err = _chain_rest_err()
-        if best_err > 0.005:
+        if best_err > 0.002:
             for deg in range(0, 360, 15):
                 cand = math.radians(deg) - math.pi
                 con.pole_angle = cand
@@ -3460,6 +3558,15 @@ def build_control_rig(
             center_ang = best_ang
             for d_deg in range(-14, 15, 2):
                 cand = center_ang + math.radians(d_deg)
+                con.pole_angle = cand
+                bpy.context.view_layer.update()
+                e = _chain_rest_err()
+                if e < best_err:
+                    best_err = e
+                    best_ang = cand
+            fine_ang = best_ang
+            for step in range(-8, 9):
+                cand = fine_ang + math.radians(step * 0.25)
                 con.pole_angle = cand
                 bpy.context.view_layer.update()
                 e = _chain_rest_err()
@@ -3496,6 +3603,7 @@ def build_control_rig(
     rig_meta = {
         "archetype": spec["archetype"],
         "chest_ctrl": chest_ctrl_name,
+        "torso_ik_mode": torso_ik_mode,
         "torso_ik": torso_ik_meta,
         "collection_slots": active_slots,
         "ctrl_bones": list(ctrl_styles.keys()),
@@ -3504,7 +3612,9 @@ def build_control_rig(
         "limb_fk_chains": limb_fk_chains,
         "tail_ctrls": tail_ctrls,
         "spine_ctrls": spine_ctrls,
+        "neck_ctrls": neck_ctrls,
         "wing_ctrls": wing_ctrls,
+        "wing_ik_ctrls": wing_ik_ctrls,
         "appendage_ctrls": appendage_ctrls,
         "category_counts": cat_counts,
     }
@@ -4042,9 +4152,10 @@ def sync_ik_fk_layer_visibility(arm_obj: Any) -> None:
         ("wings_ik", wings_ik),
         ("wings_fk", not wings_ik),
     ]
-    # Only toggle torso_ik / spine_fk if this rig actually has a torso_ik collection!
+    # Only toggle torso_ik / spine_fk (or hood_fk on serpentine!) if this rig actually has a torso_ik collection!
     if slots.get("torso_ik") in colls:
-        pairs.extend([("torso_ik", torso_ik), ("spine_fk", not torso_ik)])
+        fk_slot = "hood_fk" if (slots.get("hood_fk") in colls) else "spine_fk"
+        pairs.extend([("torso_ik", torso_ik), (fk_slot, not torso_ik)])
     for skey, vis in pairs:
         cname = slots.get(skey)
         if cname and cname in colls:
@@ -4276,7 +4387,7 @@ def switch_limb_ik_fk(
 
 
 def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
-    """Select Chest, Spine, Tail, Wings, or Trunk/Tongue controls in Pose Mode with Individual Origins for smooth multi-bend!"""
+    """Select Chest/Hood, Neck, Spine, Tail, Wings (IK or FK), or Trunk/Tongue controls in Pose Mode with Individual Origins!"""
     if bpy is None or arm_obj is None or arm_obj.type != "ARMATURE":
         return 0
     meta_raw = arm_obj.get("hfw_ctrl_rig_meta")
@@ -4284,10 +4395,20 @@ def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
         return 0
     meta = json.loads(meta_raw)
     if group == "chest":
-        cc = meta.get("chest_ctrl") or ("CTRL_Chest" if "CTRL_Chest" in arm_obj.pose.bones else "")
+        use_fk_ch = (
+            bool(meta.get("torso_ik"))
+            and float(arm_obj.get("hfw_ik_fk_torso", 1.0)) < 0.5
+            and "CTRL_FK_Chest" in arm_obj.pose.bones
+        )
+        cc = "CTRL_FK_Chest" if use_fk_ch else (meta.get("chest_ctrl") or ("CTRL_Chest" if "CTRL_Chest" in arm_obj.pose.bones else ""))
         names = [cc] if cc else []
+    elif group == "neck":
+        names = list(meta.get("neck_ctrls") or [])
     elif group == "wings":
-        names = list(meta.get("wing_ctrls") or [])
+        if float(arm_obj.get("hfw_ik_fk_wings", 0.0)) >= 0.5 and meta.get("wing_ik_ctrls"):
+            names = list(meta.get("wing_ik_ctrls") or [])
+        else:
+            names = list(meta.get("wing_ctrls") or [])
     elif group == "appendages":
         names = list(meta.get("appendage_ctrls") or [])
     else:
@@ -4304,7 +4425,12 @@ def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
         if tc in arm_obj.data.collections:
             arm_obj.data.collections[tc].is_visible = True
     elif group == "chest":
-        for sk in ("torso_ik", "body"):
+        for sk in ("torso_ik", "hood_fk", "spine_fk", "body") if names[0] == "CTRL_FK_Chest" else ("torso_ik", "body"):
+            c = slots.get(sk)
+            if c and c in arm_obj.data.collections:
+                arm_obj.data.collections[c].is_visible = True
+    elif group == "neck":
+        for sk in ("hood_fk", "body"):
             c = slots.get(sk)
             if c and c in arm_obj.data.collections:
                 arm_obj.data.collections[c].is_visible = True
@@ -4314,7 +4440,8 @@ def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
             if c and c in arm_obj.data.collections:
                 arm_obj.data.collections[c].is_visible = True
     elif group == "wings":
-        wc = slots.get("wings_fk") or slots.get("wings")
+        sk = "wings_ik" if float(arm_obj.get("hfw_ik_fk_wings", 0.0)) >= 0.5 else "wings_fk"
+        wc = slots.get(sk) or slots.get("wings")
         if wc and wc in arm_obj.data.collections:
             arm_obj.data.collections[wc].is_visible = True
     elif group == "appendages":
@@ -4338,6 +4465,202 @@ def select_ctrl_chain(arm_obj: Any, group: str = "tail") -> int:
     except Exception:
         pass
     return len(names)
+
+
+def _find_mirror_ctrl_pairs(arm_obj: Any, source_side: str = "L") -> list[tuple[str, str]]:
+    """Pair left/right `CTRL_*` bones cleanly by exact name swap AND geometric + stem fallback (handles sequenced frills/plates!)."""
+    src_s = "L" if str(source_side).upper().startswith("L") else "R"
+    dst_s = "R" if src_s == "L" else "L"
+    bones = arm_obj.data.bones
+    ctrl_names = [b.name for b in bones if b.name.startswith("CTRL_")]
+    ctrl_set = set(ctrl_names)
+
+    def _side_of_ctrl(nm: str) -> str:
+        if re.search(r"_L(?:_|$)", nm):
+            return "L"
+        if re.search(r"_R(?:_|$)", nm):
+            return "R"
+        return "C"
+
+    def _swap_name(nm: str) -> str:
+        return re.sub(rf"_{src_s}(?=_|$)", f"_{dst_s}", nm)
+
+    pairs: list[tuple[str, str]] = []
+    used_src: set[str] = set()
+    used_dst: set[str] = set()
+
+    # Pass 1: Direct exact name swap (`CTRL_IK_Leg_L` <-> `CTRL_IK_Leg_R`, `CTRL_FK_Wing_L_0` <-> `CTRL_FK_Wing_R_0`, etc.)
+    for nm in ctrl_names:
+        if _side_of_ctrl(nm) != src_s:
+            continue
+        cand = _swap_name(nm)
+        if cand != nm and cand in ctrl_set and cand not in used_dst:
+            pairs.append((nm, cand))
+            used_src.add(nm)
+            used_dst.add(cand)
+
+    # Pass 2: Geometric + stem match for sequenced secondary controls (`CTRL_Frill_feather_L_00_00` <-> `CTRL_Frill_feather_R_01_00`)
+    def _norm_stem(nm: str) -> str:
+        s = re.sub(r"_[LR]_\d+(?=_|$)", "_X", nm)
+        s = re.sub(r"_[LR](?=_|$)", "_X", s)
+        return s.lower()
+
+    rem_src = [nm for nm in ctrl_names if _side_of_ctrl(nm) == src_s and nm not in used_src]
+    rem_dst = [nm for nm in ctrl_names if _side_of_ctrl(nm) == dst_s and nm not in used_dst]
+    if rem_src and rem_dst:
+        dst_by_stem: dict[str, list[str]] = {}
+        for d in rem_dst:
+            dst_by_stem.setdefault(_norm_stem(d), []).append(d)
+        for s in rem_src:
+            cands = [d for d in dst_by_stem.get(_norm_stem(s), []) if d not in used_dst]
+            if not cands:
+                continue
+            hs = bones[s].head_local
+            mir_hs = Vector((-hs.x, hs.y, hs.z))
+            best_d = min(cands, key=lambda d: (bones[d].head_local - mir_hs).length)
+            if (bones[best_d].head_local - mir_hs).length < 0.35:
+                pairs.append((s, best_d))
+                used_src.add(s)
+                used_dst.add(best_d)
+
+    # Sort parent-to-child so mirrored parent FK joints are solved before their child joints!
+    def _depth(nm: str) -> int:
+        d = 0
+        cur = bones[nm].parent
+        while cur is not None:
+            d += 1
+            cur = cur.parent
+        return d
+
+    pairs.sort(key=lambda pr: _depth(pr[1]))
+    return pairs
+
+
+def mirror_control_rig_pose(arm_obj: Any, source_side: str = "L") -> int:
+    """Mirror all paired `CTRL_*` pose transforms cleanly across X=0 (`L -> R` or `R -> L`), invariant to Decima bone rolls!
+
+    Runs in two dependency-safe passes:
+      1. Primary/limb/wing/shoulder controls (everything not under an `MCH_Follow_*` socket), followed by a depsgraph update
+         so every right/left `MCH_Follow_*` socket lands at its exact new mirrored pose.
+      2. Child controls (fingers, toes, talons, wing ribs, flipper blades, frills, weapons, armor plates), preserving
+         untouched Identity controls cleanly and reflecting controls sharing a posed Center parent (`CTRL_Head`/`CTRL_Chest`)
+         across that parent's own symmetry plane so turned heads/chests never detach plates or frills!
+    """
+    if bpy is None or arm_obj is None or arm_obj.type != "ARMATURE":
+        return 0
+    pairs = _find_mirror_ctrl_pairs(arm_obj, source_side=source_side)
+    if not pairs:
+        return 0
+
+    bpy.context.view_layer.update()
+    bones = arm_obj.data.bones
+    pbones = arm_obj.pose.bones
+    S3 = Matrix.Diagonal((-1.0, 1.0, 1.0))
+
+    def _under_follow_socket(bname: str) -> bool:
+        cur = bones[bname].parent if bname in bones else None
+        while cur is not None:
+            if cur.name.startswith("MCH_Follow_"):
+                return True
+            cur = cur.parent
+        return False
+
+    def _is_identity_basis(pb: Any) -> bool:
+        loc, rot, _scl = pb.matrix_basis.decompose()
+        return loc.length < 1e-5 and abs(rot.angle) < 1e-5
+
+    pass1 = [pr for pr in pairs if not _under_follow_socket(pr[1])]
+    pass2 = [pr for pr in pairs if _under_follow_socket(pr[1])]
+
+    mirrored = 0
+    for batch in (pass1, pass2):
+        if not batch:
+            continue
+        bpy.context.view_layer.update()
+        src_mats = {s: pbones[s].matrix.copy() for s, _ in batch if s in pbones}
+        src_is_ident = {s: _is_identity_basis(pbones[s]) for s, _ in batch if s in pbones}
+        solved_dst: dict[str, Matrix] = {}
+
+        for s, d in batch:
+            if s not in src_mats or d not in pbones:
+                continue
+            bone_s = bones[s]
+            bone_d = bones[d]
+            pb_d = pbones[d]
+
+            # If source control was never moved/rotated from rest AND has the same or mirrored parent, reset destination cleanly!
+            if src_is_ident[s] and (
+                bone_s.parent is not None
+                and bone_d.parent is not None
+                and (bone_s.parent.name == bone_d.parent.name or bone_d.parent.name.startswith("MCH_Follow_") or bone_d.parent.name in solved_dst)
+            ):
+                pb_d.rotation_mode = "QUATERNION"
+                pb_d.matrix_basis = Matrix.Identity(4)
+                p_mat = solved_dst.get(bone_d.parent.name, pbones[bone_d.parent.name].matrix)
+                rest_local = bone_d.parent.matrix_local.inverted() @ bone_d.matrix_local
+                solved_dst[d] = p_mat @ rest_local
+                mirrored += 1
+                continue
+
+            r_s = bone_s.matrix_local
+            r_d = bone_d.matrix_local
+            m_s = src_mats[s]
+
+            # If both L & R share the exact same Center parent (e.g. turned CTRL_Head / arched CTRL_Chest / tilted CTRL_COG),
+            # reflect in that Center parent's own rest-aligned symmetry frame so turned heads/chests never throw plates off-axis!
+            shared_center = (
+                bone_s.parent is not None
+                and bone_d.parent is not None
+                and bone_s.parent.name == bone_d.parent.name
+                and bone_s.parent.name in pbones
+            )
+            if shared_center:
+                pc_name = bone_s.parent.name
+                r_c = bones[pc_name].matrix_local
+                p_c = pbones[pc_name].matrix
+                m_s_ref = r_c @ p_c.inverted() @ m_s
+            else:
+                m_s_ref = m_s
+
+            # Exact SO(3) reflection of rotation delta: det(S3 @ dR @ S3) = +1 (zero handedness flip!)
+            delta_rot_s = m_s_ref.to_3x3() @ r_s.to_3x3().inverted()
+            delta_rot_d = S3 @ delta_rot_s @ S3
+            target_rot_d = delta_rot_d @ r_d.to_3x3()
+
+            delta_pos_s = m_s_ref.to_translation() - r_s.to_translation()
+            target_pos_d = r_d.to_translation() + (S3 @ delta_pos_s)
+            target_mat_d = Matrix.Translation(target_pos_d) @ target_rot_d.to_4x4()
+            if shared_center:
+                target_mat_d = p_c @ r_c.inverted() @ target_mat_d
+
+            if bone_d.parent is not None:
+                p_mat = solved_dst.get(bone_d.parent.name, pbones[bone_d.parent.name].matrix)
+                rest_local = bone_d.parent.matrix_local.inverted() @ bone_d.matrix_local
+                basis_d = (p_mat @ rest_local).inverted() @ target_mat_d
+            else:
+                basis_d = bone_d.matrix_local.inverted() @ target_mat_d
+
+            loc_d, rot_d, _scl_d = basis_d.decompose()
+            if all(pb_d.lock_location):
+                basis_d = rot_d.to_matrix().to_4x4()
+            else:
+                basis_d = Matrix.Translation(loc_d) @ rot_d.to_matrix().to_4x4()
+
+            pb_d.rotation_mode = "QUATERNION"
+            pb_d.matrix_basis = basis_d
+
+            if bone_d.parent is not None:
+                p_mat = solved_dst.get(bone_d.parent.name, pbones[bone_d.parent.name].matrix)
+                rest_local = bone_d.parent.matrix_local.inverted() @ bone_d.matrix_local
+                solved_dst[d] = p_mat @ rest_local @ basis_d
+            else:
+                solved_dst[d] = bone_d.matrix_local @ basis_d
+            mirrored += 1
+
+        arm_obj.update_tag()
+        bpy.context.view_layer.update()
+
+    return mirrored
 
 
 def reset_control_rig_pose(arm_obj: Any) -> None:

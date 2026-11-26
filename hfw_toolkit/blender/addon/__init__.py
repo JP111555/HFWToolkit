@@ -29,12 +29,12 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 bl_info = {
     "name": "HFW Toolkit — Machines, Characters, Animations, Control Rig & Live Shaders",
     "author": "HFWToolkit",
-    "version": (0, 9, 0),
+    "version": (0, 9, 5),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-Panel) > HFW Toolkit",
     "description": (
-        "One-click import rigged Horizon Forbidden West machines (all archetypes: theropods, quadrupeds, flyers, hexapods, aquatic, serpentine), "
-        "characters, ALL/per-category EA08 animations, multi-bone Chest IK/Spine FK, Wing & Quadruped IK/FK, dynamic part-named bone groups, and live shaders."
+        "One-click import rigged Horizon Forbidden West machines (all 8 archetypes: theropods, quadrupeds, flyers, hexapods, aquatic, serpentine), "
+        "characters, ALL/per-category EA08 animations, multi-bone Chest & Cobra Hood IK/FK, Wing & Quadruped IK/FK, pose mirroring, dynamic bone groups, and live shaders."
     ),
     "category": "Import-Export",
 }
@@ -1289,6 +1289,30 @@ class HFW_OT_ResetControlRigPose(Operator):
         return {"FINISHED"}
 
 
+class HFW_OT_MirrorControlRigPose(Operator):
+    bl_idname = "hfw_toolkit.mirror_ctrl_pose"
+    bl_label = "Mirror Control Rig Pose"
+    bl_description = "Mirror paired Left/Right Control Rig poses symmetrically across X=0 (wings, legs, arms, fingers, feathers, plasma intakes)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    source_side: StringProperty(default="L")
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an HFW Armature first.")
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        n = cr.mirror_control_rig_pose(arm, source_side=self.source_side)
+        arrow = "L -> R" if self.source_side.upper().startswith("L") else "R -> L"
+        if n == 0:
+            self.report({"WARNING"}, f"No paired L/R controls found on '{arm.name}'.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Mirrored {n} control poses ({arrow}) on '{arm.name}'!")
+        return {"FINISHED"}
+
+
 class HFW_OT_ScanAnimations(Operator):
     bl_idname = "hfw_toolkit.scan_animations"
     bl_label = "Scan Available Animations"
@@ -1480,7 +1504,9 @@ class HFW_OT_SelectCtrlChain(Operator):
             self.report({"WARNING"}, f"No {self.group} controls found on '{arm.name}'.")
             return {"CANCELLED"}
         if self.group == "chest":
-            self.report({"INFO"}, f"Selected CTRL_Chest on '{arm.name}' (press R to twist/lean upper torso!).")
+            self.report({"INFO"}, f"Selected chest/hood controller on '{arm.name}' (press G to arch or R to twist/lean!).")
+        elif self.group == "wings" and float(arm.get("hfw_ik_fk_wings", 0.0)) >= 0.5:
+            self.report({"INFO"}, f"Selected {n} Wing IK tip controls (press G to position wingtips!).")
         else:
             self.report({"INFO"}, f"Selected {n} {self.group} FK controls (Individual Origins ON — press R to bend smoothly!).")
         return {"FINISHED"}
@@ -1735,14 +1761,15 @@ class HFW_PT_MainPanel(Panel):
                     ikbox = rbox.box()
                     ikbox.label(text="IK / FK Switches (Auto-Snaps Pose)", icon="CON_KINEMATIC")
                     if has_torso_ik:
+                        is_hood_mode = rig_meta.get("torso_ik_mode") == "hood"
                         t_is_ik = float(arm["hfw_ik_fk_torso"]) >= 0.5
                         trow = ikbox.row(align=True)
-                        trow.label(text="Torso:")
-                        ot1 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Chest IK", depress=t_is_ik)
+                        trow.label(text="Hood:" if is_hood_mode else "Torso:")
+                        ot1 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Hood IK" if is_hood_mode else "Chest IK", depress=t_is_ik)
                         ot1.group = "torso"; ot1.to_ik = True; ot1.snap_pose = True
-                        ot2 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Spine FK", depress=not t_is_ik)
+                        ot2 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Hood FK" if is_hood_mode else "Spine FK", depress=not t_is_ik)
                         ot2.group = "torso"; ot2.to_ik = False; ot2.snap_pose = True
-                        ikbox.prop(arm, '["hfw_ik_fk_torso"]', text="Spine FK <-> Chest IK", slider=True)
+                        ikbox.prop(arm, '["hfw_ik_fk_torso"]', text="Hood FK <-> Hood IK" if is_hood_mode else "Spine FK <-> Chest IK", slider=True)
                     if has_flegs and "hfw_ik_fk_front_legs" in arm:
                         fl_is_ik = float(arm["hfw_ik_fk_front_legs"]) >= 0.5
                         flrow = ikbox.row(align=True)
@@ -1789,7 +1816,7 @@ class HFW_PT_MainPanel(Panel):
                 cat_grid = cbox_cat.grid_flow(columns=2, align=True)
                 shown_colls: set[str] = set()
                 for skey in (
-                    "body", "torso_ik", "spine_fk", "tail", "appendages",
+                    "body", "torso_ik", "hood_fk", "spine_fk", "tail", "appendages",
                     "wings_ik", "wings_fk", "hands_feet", "frills", "weapons", "plates",
                     "front_legs_ik", "front_legs_fk", "legs_ik", "legs_fk", "arms_ik", "arms_fk",
                 ):
@@ -1827,10 +1854,14 @@ class HFW_PT_MainPanel(Panel):
 
                 # 4. Quick Multi-Bend Chain & Chest Selection + Rest-Lock
                 has_chest = bool(rig_meta.get("chest_ctrl")) or ("CTRL_Chest" in arm.pose.bones)
+                is_hood_mode = rig_meta.get("torso_ik_mode") == "hood"
                 qrow = rbox.row(align=True)
                 if has_chest:
-                    op_ch = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Chest", icon="MESH_TORUS")
+                    op_ch = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Hood" if is_hood_mode else "Chest", icon="MESH_TORUS")
                     op_ch.group = "chest"
+                if len(rig_meta.get("neck_ctrls") or ()) >= 2:
+                    op_nk = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Neck", icon="CURVE_BEZCURVE")
+                    op_nk.group = "neck"
                 if "tail" in rig_slots:
                     op_t = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Tail", icon="CURVE_BEZCURVE")
                     op_t.group = "tail"
@@ -1889,6 +1920,11 @@ class HFW_PT_MainPanel(Panel):
             col_ops = rbox.column(align=True)
             col_ops.operator("hfw_toolkit.bake_anim_to_ctrl", icon="KEYFRAME_HLT")
             col_ops.operator("hfw_toolkit.bake_ctrl_to_def", icon="EXPORT")
+            row_mir = rbox.row(align=True)
+            om_lr = row_mir.operator("hfw_toolkit.mirror_ctrl_pose", text="Mirror L->R", icon="MOD_MIRROR")
+            om_lr.source_side = "L"
+            om_rl = row_mir.operator("hfw_toolkit.mirror_ctrl_pose", text="Mirror R->L", icon="MOD_MIRROR")
+            om_rl.source_side = "R"
             row_ops = rbox.row(align=True)
             row_ops.operator("hfw_toolkit.build_control_rig", text="Rebuild Rig", icon="ARMATURE_DATA")
             row_ops.operator("hfw_toolkit.reset_ctrl_pose", text="Reset Pose", icon="LOOP_BACK")
@@ -1972,6 +2008,7 @@ _CLASSES = (
     HFW_OT_BakeAnimToControlRig,
     HFW_OT_BakeControlRigToDeform,
     HFW_OT_ResetControlRigPose,
+    HFW_OT_MirrorControlRigPose,
     HFW_OT_ScanAnimations,
     HFW_OT_SelectVisibleAnimations,
     HFW_OT_ImportAnimationsToActiveRig,
