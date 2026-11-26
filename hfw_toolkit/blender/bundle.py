@@ -1254,6 +1254,7 @@ def export_assembly_bundle(
     unpack_textures: bool = False,
     asset_kind: str = "machine",
     extra_metadata: dict[str, Any] | None = None,
+    animations: int | list[str] | str | None = None,
 ) -> Path:
     """Write a complete self-contained Canonical Assembly Bundle (`assembly.json` + `geometry.npz` + `textures/`).
 
@@ -1490,8 +1491,80 @@ def export_assembly_bundle(
         for j in assembly.skeleton.joints
     ]
 
+    # Analyze universal HFW Control Rig chains (shared identically by Blender & UE5!)
+    rig_spec: dict[str, Any] | None = None
+    if len(assembly.skeleton.joints) >= 8:
+        try:
+            from hfw_toolkit.blender.control_rig import analyze_rig_chains
+
+            joint_specs = [
+                {
+                    "name": j.name,
+                    "parent_name": assembly.skeleton.joints[j.parent_index].name
+                    if 0 <= j.parent_index < len(assembly.skeleton.joints)
+                    else None,
+                    "head": j.world_matrix[:3, 3].tolist(),
+                }
+                for j in assembly.skeleton.joints
+            ]
+            rig_spec = analyze_rig_chains(joint_specs)
+        except Exception:
+            rig_spec = None
+
+    # Optional decoded HFW in-game animations (`animations.npz` + `manifest["animations"]`)
+    animations_manifest: list[dict[str, Any]] = []
+    if animations and assembly.skeleton.joints:
+        try:
+            from hfw_toolkit.extract.animations import resolve_animations_for_export
+
+            ent_gid: int | None = None
+            if assembly.entity_id and ":" in assembly.entity_id:
+                try:
+                    ent_gid = ObjectId.parse(assembly.entity_id).group_id
+                except Exception:
+                    ent_gid = None
+            gender_hint = "male" if "male" in f"{assembly.display_name} {assembly.variant_label}".lower() and "female" not in f"{assembly.display_name} {assembly.variant_label}".lower() else "female"
+            decoded_clips = resolve_animations_for_export(
+                game,
+                assembly.skeleton,
+                entity_group_id=ent_gid,
+                asset_kind=asset_kind,
+                animations_spec=animations,
+                gender=gender_hint,
+            )
+            if decoded_clips:
+                anim_arrays: dict[str, np.ndarray] = {}
+                for ai, clip in enumerate(decoded_clips):
+                    akey = f"a{ai}"
+                    anim_arrays[f"{akey}_loc"] = clip["loc"]
+                    anim_arrays[f"{akey}_rot"] = clip["rot_wxyz"]
+                    anim_arrays[f"{akey}_scale"] = clip["scale"]
+                    anim_arrays[f"{akey}_has_loc"] = clip["has_loc"]
+                    anim_arrays[f"{akey}_has_rot"] = clip["has_rot"]
+                    anim_arrays[f"{akey}_has_scale"] = clip["has_scale"]
+                    animations_manifest.append(
+                        {
+                            "key": akey,
+                            "anim_id": clip["anim_id"],
+                            "name": clip["name"],
+                            "category": clip["category"],
+                            "description": clip.get("description", ""),
+                            "skeleton_id": clip["skeleton_id"],
+                            "duration": round(float(clip["duration"]), 4),
+                            "sample_rate": round(float(clip["sample_rate"]), 3),
+                            "num_frames": int(clip["num_frames"]),
+                            "joint_names": clip["joint_names"],
+                            "locomotion_delta_t": clip["locomotion_delta_t"],
+                            "events": clip["events"],
+                            "fbx_filename": f"HFW_{_safe_name(clip['name'], 52)}.fbx",
+                        }
+                    )
+                np.savez_compressed(bundle_dir / "animations.npz", **anim_arrays)
+        except Exception:
+            animations_manifest = []
+
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "asset_kind": asset_kind,
         "texture_mode": "unpacked" if unpack_textures else "packed",
         "entity_id": assembly.entity_id,
@@ -1516,6 +1589,8 @@ def export_assembly_bundle(
         "skeleton_id": assembly.skeleton.object_id,
         "joints": joints_manifest,
         "helpers": helpers_manifest,
+        "rig_spec": rig_spec,
+        "animations": animations_manifest,
         "parts": parts_manifest,
         "materials": materials_manifest,
     }
@@ -1539,7 +1614,7 @@ def export_assembly_bundle(
         if script_name != "ue5_import_machine.py":
             # Also provide canonical alias so any automated UE5 pipeline finds it seamlessly
             (bundle_dir / "ue5_import_machine.py").write_text(ue5_py, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[HFWToolkit] Warning: UE5 script generation failed: {exc}")
 
     return bundle_dir

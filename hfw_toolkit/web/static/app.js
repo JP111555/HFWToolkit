@@ -10,6 +10,9 @@
   }
 
   let currentMachine = null;
+  let currentMachineAnims = null;
+  let currentAnimCategory = "";
+  let selectedMachineAnimIds = new Set();
   let currentSubTab = "materials";
   let currentReport = null;
   let activeWsTab = "explain";
@@ -101,10 +104,14 @@
     try {
       const data = await api(`/api/machine/${encodeURIComponent(entityId)}?variant=${variantIdx}`);
       currentMachine = data;
+      currentMachineAnims = null;
+      currentAnimCategory = "";
+      selectedMachineAnimIds = new Set();
       $("#m-title").textContent = `${data.display_name} (${data.codename})`;
       $("#m-meta").textContent = `${data.entity_id} • ${data.skeleton.joint_count} joints • ${data.skeleton.helper_count} helpers`;
       $("#m-mat-count").textContent = data.materials.length;
       $("#m-part-count").textContent = data.parts.length;
+      if ($("#m-anim-total")) $("#m-anim-total").textContent = "…";
 
       const sel = $("#m-variant");
       sel.innerHTML = "";
@@ -117,6 +124,7 @@
       });
 
       renderMidList();
+      loadMachineAnimations(data.entity_id);
       // Auto-open the richest material for immediate visual delight!
       if (data.materials.length && (!currentReport || !location.hash.startsWith("#/material/"))) {
         selectMaterial(data.materials[0].material_id);
@@ -126,11 +134,34 @@
     }
   }
 
+  async function loadMachineAnimations(entityId) {
+    try {
+      const adata = await api(`/api/animations/machine/${encodeURIComponent(entityId)}?limit=0`);
+      if (!currentMachine || currentMachine.entity_id !== entityId) return;
+      currentMachineAnims = adata;
+      if ($("#m-anim-total")) $("#m-anim-total").textContent = adata.total;
+      if (currentSubTab === "animations") renderMidList();
+    } catch (_) {
+      if ($("#m-anim-total")) $("#m-anim-total").textContent = "0";
+    }
+  }
+
+  function updateMachineSelectedModeOption() {
+    const sel = $("#m-anim-mode");
+    if (!sel) return;
+    const opt = sel.querySelector('option[value="selected"]');
+    if (opt) {
+      opt.textContent = `Anims: Checked Clips (${selectedMachineAnimIds.size})`;
+    }
+  }
+
   function renderMidList() {
     if (!currentMachine) return;
     const filter = ($("#mid-filter").value || "").trim().toLowerCase();
     const list = $("#mid-list");
+    const animBar = $("#mid-anim-bar");
     list.innerHTML = "";
+    if (animBar) animBar.classList.toggle("hidden", currentSubTab !== "animations");
 
     if (currentSubTab === "materials") {
       currentMachine.materials
@@ -150,7 +181,7 @@
           el.addEventListener("click", () => selectMaterial(m.material_id));
           list.appendChild(el);
         });
-    } else {
+    } else if (currentSubTab === "parts") {
       currentMachine.parts
         .filter((p) => !filter || p.name.toLowerCase().includes(filter) || p.collection.toLowerCase().includes(filter) || (p.parent_joint || "").toLowerCase().includes(filter))
         .forEach((p) => {
@@ -169,6 +200,95 @@
           });
           list.appendChild(el);
         });
+    } else {
+      if (!currentMachineAnims) {
+        list.innerHTML = `<div class="empty-state">Scanning HFW in-game animations...</div>`;
+        return;
+      }
+      const counts = currentMachineAnims.category_counts || {};
+      const catsMeta = currentMachineAnims.categories_meta || [];
+      const visible = (currentMachineAnims.items || []).filter((c) => {
+        if (currentAnimCategory && c.category !== currentAnimCategory) return false;
+        if (filter) {
+          const hay = `${c.name} ${c.description} ${c.anim_id} ${(c.events || []).join(" ")}`.toLowerCase();
+          if (!hay.includes(filter)) return false;
+        }
+        return true;
+      });
+      if (animBar) {
+        const pills = [`<button class="ch-btn ${!currentAnimCategory ? "active" : ""}" data-acat="">All (${counts.all || 0})</button>`];
+        catsMeta.forEach((cm) => {
+          const n = counts[cm.key] || 0;
+          if (n > 0) {
+            const shortLbl = cm.label.split("&")[0].trim();
+            pills.push(`<button class="ch-btn ${currentAnimCategory === cm.key ? "active" : ""}" data-acat="${esc(cm.key)}">${esc(shortLbl)} (${n})</button>`);
+          }
+        });
+        animBar.innerHTML = `
+          <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:5px;">${pills.join("")}</div>
+          <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;font-size:11px;color:#94a3b8;">
+            <span>Showing ${visible.length} • Checked: <strong>${selectedMachineAnimIds.size}</strong></span>
+            <span style="display:flex;gap:4px;">
+              <button class="ch-btn" id="btn-ma-sel-vis">Check Visible</button>
+              <button class="ch-btn" id="btn-ma-clr">Clear</button>
+            </span>
+          </div>
+        `;
+        animBar.querySelectorAll("[data-acat]").forEach((b) => {
+          b.addEventListener("click", () => {
+            currentAnimCategory = b.dataset.acat;
+            renderMidList();
+          });
+        });
+        animBar.querySelector("#btn-ma-sel-vis")?.addEventListener("click", () => {
+          visible.forEach((c) => selectedMachineAnimIds.add(c.anim_id));
+          updateMachineSelectedModeOption();
+          if ($("#m-anim-mode")) $("#m-anim-mode").value = "selected";
+          renderMidList();
+        });
+        animBar.querySelector("#btn-ma-clr")?.addEventListener("click", () => {
+          selectedMachineAnimIds.clear();
+          updateMachineSelectedModeOption();
+          renderMidList();
+        });
+      }
+      if (!visible.length) {
+        list.innerHTML = `<div class="empty-state">No animations match this filter.</div>`;
+        return;
+      }
+      visible.forEach((c) => {
+        const el = document.createElement("div");
+        el.className = "list-item" + (selectedMachineAnimIds.has(c.anim_id) ? " active" : "");
+        const chk = selectedMachineAnimIds.has(c.anim_id) ? "checked" : "";
+        el.innerHTML = `
+          <div style="display:flex;align-items:flex-start;gap:7px;">
+            <input type="checkbox" ${chk} style="margin-top:3px;flex-shrink:0;" />
+            <div style="min-width:0;flex:1;">
+              <div class="list-item-title" style="font-size:12.5px;">${esc(c.name)}</div>
+              <div class="list-item-sub">
+                <span><span class="badge">${esc(c.category)}</span> ${c.duration.toFixed(2)}s (${c.num_frames}f)</span>
+                <span>${esc(c.anim_id)}</span>
+              </div>
+              <div style="font-size:11px;color:#94a3b8;margin-top:3px;line-height:1.3;">${esc(c.description || "")}</div>
+            </div>
+          </div>
+        `;
+        el.addEventListener("click", (ev) => {
+          const cb = el.querySelector("input[type=checkbox]");
+          if (ev.target !== cb) cb.checked = !cb.checked;
+          if (cb.checked) {
+            selectedMachineAnimIds.add(c.anim_id);
+            if ($("#m-anim-mode")) $("#m-anim-mode").value = "selected";
+          } else {
+            selectedMachineAnimIds.delete(c.anim_id);
+          }
+          el.classList.toggle("active", cb.checked);
+          updateMachineSelectedModeOption();
+          const cntSpan = animBar?.querySelector("strong");
+          if (cntSpan) cntSpan.textContent = String(selectedMachineAnimIds.size);
+        });
+        list.appendChild(el);
+      });
     }
   }
 
@@ -601,6 +721,15 @@
     $("#btn-quick-assets").addEventListener("click", () => switchSidebarMode("assets"));
   }
 
+  function resolveMachineAnimSpec() {
+    const mode = ($("#m-anim-mode")?.value || "").trim();
+    if (!mode) return null;
+    if (mode === "selected") {
+      return selectedMachineAnimIds.size ? Array.from(selectedMachineAnimIds).join(",") : null;
+    }
+    return mode;
+  }
+
   async function runMachineExport(exportFbx) {
     if (!currentMachine) return;
     const stEl = $("#export-status");
@@ -618,6 +747,8 @@
           unpack_textures: $("#chk-unpack") ? $("#chk-unpack").checked : false,
           pack_textures: $("#chk-pack").checked,
           export_fbx: Boolean(exportFbx),
+          build_control_rig: $("#chk-ctrl-rig") ? $("#chk-ctrl-rig").checked : true,
+          animations: resolveMachineAnimSpec(),
         }),
       });
       const poll = setInterval(async () => {

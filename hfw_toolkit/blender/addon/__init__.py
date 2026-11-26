@@ -5,6 +5,7 @@ Uses only Blender's built-in Python (`bpy`, `sqlite3`, `subprocess`, `webbrowser
 """
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -16,23 +17,24 @@ from pathlib import Path
 import bpy
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
     StringProperty,
 )
-from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
 bl_info = {
-    "name": "HFW Toolkit — Machines, Characters, Assets & Live Shaders",
+    "name": "HFW Toolkit — Machines, Characters, Animations, Control Rig & Live Shaders",
     "author": "HFWToolkit",
-    "version": (0, 5, 0),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-Panel) > HFW Toolkit",
     "description": (
-        "One-click import rigged Horizon Forbidden West machines, characters (natural-language prompt + outfits + "
-        "hair + unified rig), and Guerrilla dev-directory assets — with live Muscle/Eye/Liquid/Plasma shader controls."
+        "One-click import rigged Horizon Forbidden West machines (all archetypes: theropods, quadrupeds, flyers, hexapods, aquatic, serpentine), "
+        "characters, ALL/per-category EA08 animations, multi-bone Chest IK/Spine FK, Wing & Quadruped IK/FK, dynamic part-named bone groups, and live shaders."
     ),
     "category": "Import-Export",
 }
@@ -112,7 +114,33 @@ def _find_toolkit_python(toolkit_dir: Path) -> Path | None:
     return Path(sys_py) if sys_py else None
 
 
-def _import_bundle_direct(toolkit_dir: Path, bundle_dir: Path, enable_detail: bool, pack_tex: bool):
+def _load_control_rig_module(toolkit_dir: Path):
+    cr_path = toolkit_dir / "hfw_toolkit" / "blender" / "control_rig.py"
+    spec = importlib.util.spec_from_file_location("hfw_control_rig_addon", str(cr_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _find_active_hfw_armature(context):
+    obj = context.active_object
+    if obj is not None and obj.type == "ARMATURE":
+        return obj
+    if obj is not None and obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    for o in context.scene.objects:
+        if o.type == "ARMATURE" and (o.get("hfw_entity_id") or o.get("hfw_has_control_rig")):
+            return o
+    return None
+
+
+def _import_bundle_direct(
+    toolkit_dir: Path,
+    bundle_dir: Path,
+    enable_detail: bool,
+    pack_tex: bool,
+    build_control_rig: bool = True,
+):
     builder_path = toolkit_dir / "hfw_toolkit" / "blender" / "blender_builder.py"
     spec = importlib.util.spec_from_file_location("hfw_blender_builder", str(builder_path))
     mod = importlib.util.module_from_spec(spec)
@@ -121,6 +149,8 @@ def _import_bundle_direct(toolkit_dir: Path, bundle_dir: Path, enable_detail: bo
         bundle_dir,
         enable_detail_nodes=enable_detail,
         pack_textures=pack_tex,
+        build_control_rig_layer=build_control_rig,
+        import_animations=True,
     )
 
 
@@ -559,6 +589,107 @@ def _on_char_changed(self, context):
 
 
 # ----------------------------------------------------------------------
+# Live In-Blender Animation Browser Item & UIList
+# ----------------------------------------------------------------------
+_ANIM_CATEGORY_ENUM_ITEMS = [
+    ("combat", "Combat & Attacks", "Melee strikes, bites, stomps, tail whips, ranged weapon fire & hit reactions"),
+    ("movement", "Movement & Locomotion", "Walk, trot, run, sprint, strafe, turns, crouch, stealth & climbs"),
+    ("idle", "Idle & Stances", "Idle loops, alert stances, look-arounds & transitions"),
+    ("jump", "Jumps, Leaps & Vaults", "Jumps, leaps, vaults, takeoff, airborne & landings"),
+    ("emote", "Emotes, Roars & Gestures", "Roars, snarls, grazing, calls, eating/drinking & gestures"),
+    ("mounted", "Mount / Rider & Special", "Mount, rider, swim & special actions"),
+]
+
+_ANIM_FILTER_ENUM_ITEMS = [
+    ("ALL", "All Categories", "Show every animation category"),
+] + _ANIM_CATEGORY_ENUM_ITEMS
+
+
+class HFWAnimationBrowserItem(PropertyGroup):
+    selected: BoolProperty(name="Import", default=False)
+    anim_id: StringProperty(name="ID", default="")
+    name: StringProperty(name="Name", default="")
+    category: StringProperty(name="Category", default="")
+    duration: FloatProperty(name="Duration", default=0.0)
+    num_frames: IntProperty(name="Frames", default=0)
+    description: StringProperty(name="Description", default="")
+    events: StringProperty(name="Events", default="")
+
+
+def _anim_item_matches_filter(item, props) -> bool:
+    cat_f = props.anim_browser_category
+    if cat_f and cat_f != "ALL" and item.category != cat_f:
+        return False
+    q = (props.anim_browser_search or "").strip().lower()
+    if q:
+        hay = f"{item.name} {item.description} {item.events} {item.anim_id}".lower()
+        if q not in hay:
+            return False
+    return True
+
+
+class HFW_UL_AnimationList(UIList):
+    bl_idname = "HFW_UL_AnimationList"
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname)
+        props = context.scene.hfw_toolkit
+        flt_flags = [
+            self.bitflag_filter_item if _anim_item_matches_filter(it, props) else 0
+            for it in items
+        ]
+        return flt_flags, []
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "selected", text="")
+        sub = row.split(factor=0.64, align=True)
+        sub.label(text=item.name)
+        meta = f"[{item.category[:4].upper()}] {item.duration:.1f}s/{item.num_frames}f"
+        sub.label(text=meta)
+
+
+def _resolve_addon_anim_arg(props) -> str | None:
+    mode = props.anim_import_mode
+    if mode == "NONE":
+        return None
+    if mode == "ALL":
+        return "all"
+    if mode == "CATEGORY":
+        return f"category:{props.anim_category}"
+    if mode == "SHOWCASE":
+        return str(max(1, int(props.import_anim_count)))
+    if mode == "SELECTED":
+        ids = [it.anim_id for it in props.anim_browser_items if it.selected and it.anim_id]
+        return ",".join(ids) if ids else None
+    return None
+
+
+def _resolve_anim_scan_target(context) -> tuple[str, str, str]:
+    """Return `(kind, cli_arg_value, display_label)` for scanning or fast-importing animations."""
+    props = context.scene.hfw_toolkit
+    arm = _find_active_hfw_armature(context)
+    if props.import_mode == "MACHINES":
+        oid = props.selected_entity
+        if oid and oid != "NONE" and ":" in oid:
+            return ("machine", oid, f"Machine {oid}")
+    elif props.import_mode == "CHARACTERS":
+        cid = props.selected_character
+        if cid and cid != "NONE":
+            return ("character", cid, f"Character {cid}")
+        if (props.char_prompt or "").strip():
+            return ("character", props.char_prompt.strip(), props.char_prompt.strip())
+    if arm is not None:
+        akind = str(arm.get("hfw_asset_kind") or "machine")
+        eid = str(arm.get("hfw_entity_id") or "")
+        if akind == "machine" and eid and ":" in eid:
+            return ("machine", eid, arm.name)
+        if akind == "character" or "aloy" in arm.name.lower():
+            return ("character", arm.name, arm.name)
+    return ("character", "Aloy", "Humanoid (Female)")
+
+
+# ----------------------------------------------------------------------
 # Scene Properties
 # ----------------------------------------------------------------------
 class HFWToolkitSceneProps(PropertyGroup):
@@ -586,6 +717,52 @@ class HFWToolkitSceneProps(PropertyGroup):
     lod_index: IntProperty(name="LOD", description="0 = Highest detail", default=0, min=0, max=4)
     include_broken_states: BoolProperty(name="Include Broken Plate States", default=True)
     enable_detail_nodes: BoolProperty(name="Wire Detail Array Nodes", default=True)
+    build_control_rig: BoolProperty(
+        name="Auto-Build IK/FK Control Rig",
+        description="Attach non-destructive DEF+MCH+CTRL Control Rig with full IK/FK limbs, fingers, toes & zero ghost animation",
+        default=True,
+    )
+    anim_import_mode: EnumProperty(
+        name="Animations",
+        description="Choose how many / which HFW EA08 in-game animations to import (no 25-clip limit!)",
+        items=[
+            ("NONE", "None (Rest Pose)", "Import mesh & Control Rig at clean rest pose without animations"),
+            ("SHOWCASE", "Quick Showcase Pack", "Import N diverse clips spanning Combat, Movement, Idle, Jump & Emote"),
+            ("CATEGORY", "All of a Category", "Import EVERY animation of one chosen category (e.g. all Combat or Movement)"),
+            ("ALL", "Import ALL Animations", "Import EVERY compatible animation clip for this machine/character (no cap!)"),
+            ("SELECTED", "Selected Clips (Browser)", "Import only the clips checked in the Live Animation Browser below"),
+        ],
+        default="NONE",
+    )
+    anim_category: EnumProperty(
+        name="Category",
+        description="Animation category to import when mode is 'All of a Category'",
+        items=_ANIM_CATEGORY_ENUM_ITEMS,
+        default="combat",
+    )
+    import_anim_count: IntProperty(
+        name="Showcase Clips",
+        description="Number of diverse showcase clips to import (no 25-clip limit!)",
+        default=5,
+        min=1,
+        max=2000,
+    )
+    anim_browser_items: CollectionProperty(type=HFWAnimationBrowserItem)
+    anim_browser_index: IntProperty(name="Active Animation", default=0)
+    anim_browser_category: EnumProperty(
+        name="Filter Category",
+        items=_ANIM_FILTER_ENUM_ITEMS,
+        default="ALL",
+    )
+    anim_browser_search: StringProperty(
+        name="Search Clips",
+        description="Filter discovered animations by name, description, or game event",
+        default="",
+    )
+    anim_browser_summary: StringProperty(name="Summary", default="")
+    anim_browser_target_label: StringProperty(name="Target", default="")
+    show_anim_browser: BoolProperty(name="Animation Browser", default=False)
+    show_rig_overrides: BoolProperty(name="Category Influences", default=False)
     unpack_textures: BoolProperty(name="Unpack Textures (Separate Maps)", default=False)
     pack_textures: BoolProperty(name="Pack Textures Into .blend", default=False)
 
@@ -841,13 +1018,22 @@ class HFW_OT_ImportMachine(Operator):
             cmd.append("--no-broken-states")
         if props.unpack_textures:
             cmd.append("--unpack-textures")
+        anim_arg = _resolve_addon_anim_arg(props)
+        if anim_arg:
+            cmd.extend(["--animations", anim_arg])
 
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             self.report({"ERROR"}, f"Bundle extraction failed: {proc.stderr[-300:] or proc.stdout[-300:]}")
             return {"CANCELLED"}
 
-        arm = _import_bundle_direct(toolkit_dir, bundle_dir, props.enable_detail_nodes, props.pack_textures)
+        arm = _import_bundle_direct(
+            toolkit_dir,
+            bundle_dir,
+            props.enable_detail_nodes,
+            props.pack_textures,
+            build_control_rig=props.build_control_rig,
+        )
         _pull_shader_controls_from_scene(props)
         self.report({"INFO"}, f"Imported {arm.name} cleanly!")
         return {"FINISHED"}
@@ -896,13 +1082,22 @@ class HFW_OT_ImportCharacterPrompt(Operator):
         ]
         if props.unpack_textures:
             cmd.append("--unpack-textures")
+        anim_arg = _resolve_addon_anim_arg(props)
+        if anim_arg:
+            cmd.extend(["--animations", anim_arg])
 
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             self.report({"ERROR"}, f"Character prompt import failed: {proc.stderr[-300:] or proc.stdout[-300:]}")
             return {"CANCELLED"}
 
-        arm = _import_bundle_direct(toolkit_dir, bundle_dir, False, props.pack_textures)
+        arm = _import_bundle_direct(
+            toolkit_dir,
+            bundle_dir,
+            False,
+            props.pack_textures,
+            build_control_rig=props.build_control_rig,
+        )
         _pull_shader_controls_from_scene(props)
         self.report({"INFO"}, f"Imported character rig '{arm.name}' from prompt '{prompt}'!")
         return {"FINISHED"}
@@ -949,13 +1144,22 @@ class HFW_OT_ImportCharacterSelected(Operator):
             cmd.append("--no-hair")
         if props.unpack_textures:
             cmd.append("--unpack-textures")
+        anim_arg = _resolve_addon_anim_arg(props)
+        if anim_arg:
+            cmd.extend(["--animations", anim_arg])
 
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             self.report({"ERROR"}, f"Character import failed: {proc.stderr[-300:] or proc.stdout[-300:]}")
             return {"CANCELLED"}
 
-        arm = _import_bundle_direct(toolkit_dir, bundle_dir, False, props.pack_textures)
+        arm = _import_bundle_direct(
+            toolkit_dir,
+            bundle_dir,
+            False,
+            props.pack_textures,
+            build_control_rig=props.build_control_rig,
+        )
         _pull_shader_controls_from_scene(props)
         self.report({"INFO"}, f"Imported character rig '{arm.name}' cleanly!")
         return {"FINISHED"}
@@ -1001,6 +1205,313 @@ class HFW_OT_ImportDevAsset(Operator):
         return {"FINISHED"}
 
 
+class HFW_OT_BuildControlRig(Operator):
+    bl_idname = "hfw_toolkit.build_control_rig"
+    bl_label = "Build / Rebuild Control Rig"
+    bl_description = "Generate non-destructive IK/FK Control Rig on the active HFW armature (preserves all game animations!)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an HFW Armature first.")
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        has_act = bool(arm.animation_data and arm.animation_data.action)
+        info = cr.build_control_rig(arm, default_master=0.0 if has_act else 1.0, rebuild=True)
+        self.report(
+            {"INFO"},
+            f"Built {info['archetype']} Control Rig ({info['control_count']} controls, {info['ik_limb_count']} IK limbs)!",
+        )
+        return {"FINISHED"}
+
+
+class HFW_OT_BakeAnimToControlRig(Operator):
+    bl_idname = "hfw_toolkit.bake_anim_to_ctrl"
+    bl_label = "Bake Game Anim -> Control Rig"
+    bl_description = "Transfer the active HFW game animation onto IK/FK Control Rig handles so you can edit feet, spine & head freely!"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an HFW Armature first.")
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        try:
+            baked = cr.bake_action_to_control_rig(arm, activate_baked=True)
+            self.report({"INFO"}, f"Baked editable Control Rig Action '{baked.name}' (Control Rig = 1.0)!")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Bake to Control Rig failed: {exc}")
+            return {"CANCELLED"}
+
+
+class HFW_OT_BakeControlRigToDeform(Operator):
+    bl_idname = "hfw_toolkit.bake_ctrl_to_def"
+    bl_label = "Bake Control Rig -> Game Skeleton"
+    bl_description = "Bake your Control Rig edits back onto clean DEF game skeleton keyframes (ready for FBX / UE5 export!)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an HFW Armature first.")
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        try:
+            baked = cr.bake_control_rig_to_deform(arm, activate_baked=True)
+            self.report({"INFO"}, f"Baked clean game-skeleton Action '{baked.name}' (ready for UE5/FBX)!")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Bake to Game Skeleton failed: {exc}")
+            return {"CANCELLED"}
+
+
+class HFW_OT_ResetControlRigPose(Operator):
+    bl_idname = "hfw_toolkit.reset_ctrl_pose"
+    bl_label = "Reset Control Rig Pose"
+    bl_description = "Reset all CTRL bones back to their clean bind pose"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an HFW Armature first.")
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        cr.reset_control_rig_pose(arm)
+        self.report({"INFO"}, "Reset Control Rig pose.")
+        return {"FINISHED"}
+
+
+class HFW_OT_ScanAnimations(Operator):
+    bl_idname = "hfw_toolkit.scan_animations"
+    bl_label = "Scan Available Animations"
+    bl_description = "Discover ALL compatible HFW animations with plain-English descriptions & category counts before importing"
+
+    def execute(self, context):
+        props = context.scene.hfw_toolkit
+        toolkit_dir, _ = _get_prefs(context)
+        py_exe = _find_toolkit_python(toolkit_dir)
+        if py_exe is None:
+            self.report({"ERROR"}, f"HFWToolkit Python not found in: {toolkit_dir}")
+            return {"CANCELLED"}
+
+        kind, target_val, label = _resolve_anim_scan_target(context)
+        cmd = [
+            str(py_exe), "-m", "hfw_toolkit.cli", "animations", "list",
+            "--machine" if kind == "machine" else "--character", target_val,
+            "--limit", "0",
+            "--json",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            self.report({"ERROR"}, f"Animation scan failed: {proc.stderr[-250:] or proc.stdout[-250:]}")
+            return {"CANCELLED"}
+
+        try:
+            payload = json.loads(proc.stdout)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Invalid JSON from animation scan: {exc}")
+            return {"CANCELLED"}
+
+        props.anim_browser_items.clear()
+        for row in payload.get("items") or ():
+            it = props.anim_browser_items.add()
+            it.selected = False
+            it.anim_id = str(row.get("anim_id", ""))
+            it.name = str(row.get("name", ""))
+            it.category = str(row.get("category", "mounted"))
+            it.duration = float(row.get("duration", 0.0))
+            it.num_frames = int(row.get("num_frames", 0))
+            it.description = str(row.get("description", ""))
+            it.events = ", ".join(row.get("events") or ())
+
+        props.anim_browser_index = 0
+        counts = payload.get("category_counts") or {}
+        parts = [f"{counts.get('all', len(props.anim_browser_items))} clips"]
+        for k, short_lbl in (("combat", "Combat"), ("movement", "Move"), ("idle", "Idle"), ("jump", "Jump"), ("emote", "Emote"), ("mounted", "Mount")):
+            n = int(counts.get(k, 0) or 0)
+            if n > 0:
+                parts.append(f"{short_lbl}:{n}")
+        props.anim_browser_summary = " | ".join(parts)
+        props.anim_browser_target_label = str(payload.get("target") or label)
+        props.show_anim_browser = True
+        self.report({"INFO"}, f"Found {props.anim_browser_summary} for {props.anim_browser_target_label}")
+        return {"FINISHED"}
+
+
+class HFW_OT_SelectVisibleAnimations(Operator):
+    bl_idname = "hfw_toolkit.select_visible_animations"
+    bl_label = "Select / Clear Visible Clips"
+    bl_description = "Check or uncheck all animations currently visible under the active category/search filter"
+
+    select_all: BoolProperty(default=True)
+
+    def execute(self, context):
+        props = context.scene.hfw_toolkit
+        count = 0
+        for it in props.anim_browser_items:
+            if not self.select_all or _anim_item_matches_filter(it, props):
+                it.selected = bool(self.select_all)
+                if self.select_all:
+                    count += 1
+        if self.select_all and count > 0:
+            props.anim_import_mode = "SELECTED"
+        self.report({"INFO"}, f"Selected {count} clips." if self.select_all else "Cleared animation selection.")
+        return {"FINISHED"}
+
+
+class HFW_OT_ImportAnimationsToActiveRig(Operator):
+    bl_idname = "hfw_toolkit.import_anims_to_rig"
+    bl_label = "Import Animations Onto Active Rig"
+    bl_description = "Fast-import ALL, Category, Showcase, or Checked animations straight onto the active HFW armature without re-exporting meshes!"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select an imported HFW Armature first.")
+            return {"CANCELLED"}
+        props = context.scene.hfw_toolkit
+        anim_arg = _resolve_addon_anim_arg(props)
+        if not anim_arg:
+            self.report({"ERROR"}, "Choose an animation mode (All / Category / Showcase / Selected clips) first.")
+            return {"CANCELLED"}
+
+        toolkit_dir, _ = _get_prefs(context)
+        py_exe = _find_toolkit_python(toolkit_dir)
+        if py_exe is None:
+            self.report({"ERROR"}, f"HFWToolkit Python not found in: {toolkit_dir}")
+            return {"CANCELLED"}
+
+        akind = str(arm.get("hfw_asset_kind") or "machine")
+        eid = str(arm.get("hfw_entity_id") or "")
+        if akind == "machine" and eid and ":" in eid:
+            flag, target_val = "--machine", eid
+        else:
+            kind, target_val, _ = _resolve_anim_scan_target(context)
+            flag = "--machine" if kind == "machine" else "--character"
+
+        safe_t = re.sub(r"[^A-Za-z0-9_]+", "_", f"{target_val}_{props.anim_import_mode}").strip("_")[:48] or "pack"
+        pack_dir = toolkit_dir / "exports" / "anim_packs" / safe_t
+        cmd = [
+            str(py_exe), "-m", "hfw_toolkit.cli", "animations", "export-pack",
+            flag, target_val,
+            "--animations", anim_arg,
+            "--out", str(pack_dir),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            self.report({"ERROR"}, f"Animation pack export failed: {proc.stderr[-250:] or proc.stdout[-250:]}")
+            return {"CANCELLED"}
+
+        cr = _load_control_rig_module(toolkit_dir)
+        actions = cr.import_animations_into_armature(arm, pack_dir, activate_first=True)
+        if actions and "hfw_rig_master" in arm:
+            arm["hfw_rig_master"] = 0.0
+            arm.update_tag()
+        self.report({"INFO"}, f"Imported {len(actions)} HFW animation Action(s) onto '{arm.name}'!")
+        return {"FINISHED"}
+
+
+class HFW_OT_SetRigMode(Operator):
+    bl_idname = "hfw_toolkit.set_rig_mode"
+    bl_label = "Switch Anim / Control Rig Mode"
+    bl_description = "Switch cleanly between Playing HFW Game Animation (0.0) and Full Player Control Rig Posing (1.0)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    to_control_rig: BoolProperty(default=True)
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        arm["hfw_rig_master"] = 1.0 if self.to_control_rig else 0.0
+        arm.update_tag()
+        context.view_layer.update()
+        mode_lbl = "Control Rig (Pose Mode)" if self.to_control_rig else "Game Animation Playback"
+        self.report({"INFO"}, f"Switched '{arm.name}' to {mode_lbl}.")
+        return {"FINISHED"}
+
+
+class HFW_OT_SwitchLimbIKFK(Operator):
+    bl_idname = "hfw_toolkit.switch_limb_ik_fk"
+    bl_label = "Switch Limb IK / FK (Keep Pose)"
+    bl_description = "Switch Legs or Arms between IK and FK, auto-snapping the pose (zero pop!) and showing the active controls"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group: StringProperty(default="legs")
+    to_ik: BoolProperty(default=True)
+    snap_pose: BoolProperty(default=True)
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        res = cr.switch_limb_ik_fk(arm, group=self.group, to_ik=self.to_ik, snap_pose=self.snap_pose)
+        self.report({"INFO"}, f"Switched {self.group.title()} to {res['mode']} (snapped pose cleanly!).")
+        return {"FINISHED"}
+
+
+class HFW_OT_SelectCtrlChain(Operator):
+    bl_idname = "hfw_toolkit.select_ctrl_chain"
+    bl_label = "Select Control / FK Chain"
+    bl_description = "Select the Chest controller or all Tail / Spine FK controls in Pose Mode with Individual Origins for smooth multi-bend"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group: StringProperty(default="tail")
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        n = cr.select_ctrl_chain(arm, group=self.group)
+        if n == 0:
+            self.report({"WARNING"}, f"No {self.group} controls found on '{arm.name}'.")
+            return {"CANCELLED"}
+        if self.group == "chest":
+            self.report({"INFO"}, f"Selected CTRL_Chest on '{arm.name}' (press R to twist/lean upper torso!).")
+        else:
+            self.report({"INFO"}, f"Selected {n} {self.group} FK controls (Individual Origins ON — press R to bend smoothly!).")
+        return {"FINISHED"}
+
+
+class HFW_OT_ToggleBoneCollection(Operator):
+    bl_idname = "hfw_toolkit.toggle_bone_coll"
+    bl_label = "Toggle Control Category"
+    bl_description = "Show or hide this category of Control Rig / Skeleton bones"
+
+    coll_name: StringProperty(default="Body_Main")
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        if self.coll_name == "RAW_DEF":
+            raw_colls = [arm.data.collections.get(n) for n in ("Skeleton", "Body", "Helpers")]
+            raw_colls = [c for c in raw_colls if c is not None]
+            if not raw_colls:
+                return {"CANCELLED"}
+            new_vis = not any(c.is_visible for c in raw_colls)
+            for c in raw_colls:
+                c.is_visible = new_vis
+            return {"FINISHED"}
+        bc = arm.data.collections.get(self.coll_name)
+        if bc is not None:
+            bc.is_visible = not bc.is_visible
+        return {"FINISHED"}
+
+
 class HFW_OT_InspectMaterialWeb(Operator):
     bl_idname = "hfw_toolkit.inspect_material_web"
     bl_label = "Open in Web Studio / Shader Explorer"
@@ -1023,6 +1534,97 @@ class HFW_OT_InspectMaterialWeb(Operator):
         return {"FINISHED"}
 
 
+def _draw_anim_options_block(layout, props, arm=None):
+    abox = layout.box()
+    hdr = abox.row(align=True)
+    hdr.label(text="In-Game Animations (No Cap!)", icon="ACTION")
+    hdr.operator("hfw_toolkit.scan_animations", text="Scan / Browse", icon="VIEWZOOM")
+    abox.prop(props, "anim_import_mode", text="Mode")
+    if props.anim_import_mode == "CATEGORY":
+        abox.prop(props, "anim_category", text="Type")
+    elif props.anim_import_mode == "SHOWCASE":
+        abox.prop(props, "import_anim_count", text="Clips")
+    elif props.anim_import_mode == "SELECTED":
+        n_sel = sum(1 for it in props.anim_browser_items if it.selected)
+        abox.label(text=f"Selected in Browser: {n_sel} clip(s)", icon="CHECKBOX_HLT" if n_sel else "INFO")
+
+    if len(props.anim_browser_items) > 0:
+        row_tog = abox.row(align=True)
+        row_tog.prop(
+            props,
+            "show_anim_browser",
+            icon="TRIA_DOWN" if props.show_anim_browser else "TRIA_RIGHT",
+            text=f"Browser ({props.anim_browser_summary or len(props.anim_browser_items)})",
+            emboss=False,
+        )
+        if props.show_anim_browser:
+            if props.anim_browser_target_label:
+                abox.label(text=f"Target: {props.anim_browser_target_label}", icon="ARMATURE_DATA")
+            row_f = abox.row(align=True)
+            row_f.prop(props, "anim_browser_category", text="")
+            row_f.prop(props, "anim_browser_search", text="", icon="VIEWZOOM")
+            abox.template_list(
+                "HFW_UL_AnimationList",
+                "",
+                props,
+                "anim_browser_items",
+                props,
+                "anim_browser_index",
+                rows=5,
+            )
+            if 0 <= props.anim_browser_index < len(props.anim_browser_items):
+                cur = props.anim_browser_items[props.anim_browser_index]
+                dbox = abox.box()
+                dbox.scale_y = 0.85
+                dbox.label(text=cur.description[:76] if cur.description else cur.name, icon="INFO")
+                if cur.description and len(cur.description) > 76:
+                    dbox.label(text=cur.description[76:152])
+            row_sel = abox.row(align=True)
+            op_all = row_sel.operator("hfw_toolkit.select_visible_animations", text="Check Visible", icon="CHECKBOX_HLT")
+            op_all.select_all = True
+            op_clr = row_sel.operator("hfw_toolkit.select_visible_animations", text="Clear", icon="CHECKBOX_DEHLT")
+            op_clr.select_all = False
+
+    if arm is not None and props.anim_import_mode != "NONE":
+        abox.operator("hfw_toolkit.import_anims_to_rig", icon="IMPORT")
+
+
+def _get_arm_rig_meta_and_slots(arm) -> tuple[dict, dict[str, str]]:
+    """Read `hfw_ctrl_rig_meta` and dynamically renamed Bone Collection slots (with clean legacy fallback)."""
+    meta = {}
+    raw = arm.get("hfw_ctrl_rig_meta")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                meta = parsed
+        except Exception:
+            meta = {}
+    slots: dict[str, str] = {}
+    saved = meta.get("collection_slots")
+    if isinstance(saved, dict) and saved:
+        for k, v in saved.items():
+            if isinstance(v, str) and v in arm.data.collections:
+                slots[k] = v
+    else:
+        for skey, legacy_nm in (
+            ("body", "Body_Main"),
+            ("tail", "Tail"),
+            ("wings", "Wings FK"),
+            ("legs_ik", "Legs_IK"),
+            ("legs_fk", "Legs_FK"),
+            ("arms_ik", "Arms_IK"),
+            ("arms_fk", "Arms_FK"),
+            ("hands_feet", "Hands_Feet"),
+            ("frills", "Frills_Feathers"),
+            ("weapons", "Weapons_Aux"),
+            ("plates", "Plates_Armor"),
+        ):
+            if legacy_nm in arm.data.collections:
+                slots[skey] = legacy_nm
+    return meta, slots
+
+
 # ----------------------------------------------------------------------
 # Main N-Panel UI
 # ----------------------------------------------------------------------
@@ -1036,6 +1638,7 @@ class HFW_PT_MainPanel(Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.hfw_toolkit
+        arm = _find_active_hfw_armature(context)
 
         # Mode Switcher Row
         row = layout.row(align=True)
@@ -1050,6 +1653,8 @@ class HFW_PT_MainPanel(Panel):
             box.prop(props, "lod_index")
             box.prop(props, "include_broken_states")
             box.prop(props, "enable_detail_nodes")
+            box.prop(props, "build_control_rig")
+            _draw_anim_options_block(box, props, arm=arm)
             box.prop(props, "unpack_textures")
             box.prop(props, "pack_textures")
             box.operator("hfw_toolkit.import_machine", icon="IMPORT")
@@ -1071,6 +1676,8 @@ class HFW_PT_MainPanel(Panel):
             row_opt.prop(props, "char_headgear")
             row_opt.prop(props, "char_include_hair")
             cbox.prop(props, "char_hair_lod")
+            cbox.prop(props, "build_control_rig")
+            _draw_anim_options_block(cbox, props, arm=arm)
             cbox.prop(props, "pack_textures")
             cbox.operator("hfw_toolkit.import_character_selected", icon="IMPORT")
 
@@ -1083,6 +1690,208 @@ class HFW_PT_MainPanel(Panel):
             abox.prop(props, "lod_index")
             abox.prop(props, "pack_textures")
             abox.operator("hfw_toolkit.import_dev_asset", icon="IMPORT")
+
+        # Control Rig & HFW Animations Panel (shown automatically whenever an HFW Armature is in the scene!)
+        if arm is not None:
+            rbox = layout.box()
+            arch = arm.get("hfw_rig_archetype", "")
+            rtitle = f"Control Rig & Animations ({arch})" if arch else "Control Rig & Animations"
+            rbox.label(text=rtitle, icon="POSE_HLT")
+            if arm.get("hfw_has_control_rig") and "hfw_rig_master" in arm:
+                is_ctrl_mode = float(arm["hfw_rig_master"]) >= 0.5
+                # 1. Clear Top Mode Switch: Game Animation vs Control Rig
+                mrow = rbox.row(align=True)
+                mrow.scale_y = 1.2
+                op_anim = mrow.operator("hfw_toolkit.set_rig_mode", text="Game Anim", icon="PLAY", depress=not is_ctrl_mode)
+                op_anim.to_control_rig = False
+                op_ctrl = mrow.operator("hfw_toolkit.set_rig_mode", text="Control Rig", icon="POSE_HLT", depress=is_ctrl_mode)
+                op_ctrl.to_control_rig = True
+                if not is_ctrl_mode:
+                    warn = rbox.box()
+                    warn.scale_y = 0.85
+                    warn.label(text="In Game Anim mode — click 'Control Rig' to pose!", icon="INFO")
+                rbox.prop(arm, '["hfw_rig_master"]', text="Anim (0) <-> Control Rig (1)", slider=True)
+
+                # 2. Prominent IK / FK Switches (Torso Chest IK/FK + Legs + Quad Front Legs + Arms + Flyer Wings!)
+                rig_meta, rig_slots = _get_arm_rig_meta_and_slots(arm)
+                has_torso_ik = ("torso_ik" in rig_slots) and ("hfw_ik_fk_torso" in arm)
+                flegs_ik_nm = rig_slots.get("front_legs_ik", "")
+                flegs_fk_nm = rig_slots.get("front_legs_fk", "")
+                has_flegs = bool(flegs_ik_nm in arm.data.collections or flegs_fk_nm in arm.data.collections)
+                legs_ik_nm = rig_slots.get("legs_ik", "Legs_IK")
+                legs_fk_nm = rig_slots.get("legs_fk", "Legs_FK")
+                has_legs = (legs_ik_nm in arm.data.collections) or (legs_fk_nm in arm.data.collections)
+                arms_ik_nm = rig_slots.get("arms_ik", "Arms_IK")
+                arms_fk_nm = rig_slots.get("arms_fk", "Arms_FK")
+                has_arms = (arms_ik_nm in arm.data.collections) or (arms_fk_nm in arm.data.collections)
+                wings_ik_nm = rig_slots.get("wings_ik", "")
+                wings_fk_nm = rig_slots.get("wings_fk", "")
+                has_wings_ik = bool(wings_ik_nm and wings_ik_nm in arm.data.collections and "hfw_ik_fk_wings" in arm)
+
+                flegs_lbl = re.sub(r"\s+(IK|FK)$", "", flegs_ik_nm).strip() or "Front Legs"
+                legs_lbl = re.sub(r"\s+(IK|FK)$", "", legs_ik_nm).strip() or "Legs"
+                arms_lbl = re.sub(r"\s+(IK|FK)$", "", arms_ik_nm).strip() or "Arms"
+                if has_torso_ik or has_flegs or has_legs or has_arms or has_wings_ik:
+                    ikbox = rbox.box()
+                    ikbox.label(text="IK / FK Switches (Auto-Snaps Pose)", icon="CON_KINEMATIC")
+                    if has_torso_ik:
+                        t_is_ik = float(arm["hfw_ik_fk_torso"]) >= 0.5
+                        trow = ikbox.row(align=True)
+                        trow.label(text="Torso:")
+                        ot1 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Chest IK", depress=t_is_ik)
+                        ot1.group = "torso"; ot1.to_ik = True; ot1.snap_pose = True
+                        ot2 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Spine FK", depress=not t_is_ik)
+                        ot2.group = "torso"; ot2.to_ik = False; ot2.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_torso"]', text="Spine FK <-> Chest IK", slider=True)
+                    if has_flegs and "hfw_ik_fk_front_legs" in arm:
+                        fl_is_ik = float(arm["hfw_ik_fk_front_legs"]) >= 0.5
+                        flrow = ikbox.row(align=True)
+                        flrow.label(text=f"{flegs_lbl}:")
+                        of1 = flrow.operator("hfw_toolkit.switch_limb_ik_fk", text="IK", depress=fl_is_ik)
+                        of1.group = "front_legs"; of1.to_ik = True; of1.snap_pose = True
+                        of2 = flrow.operator("hfw_toolkit.switch_limb_ik_fk", text="FK", depress=not fl_is_ik)
+                        of2.group = "front_legs"; of2.to_ik = False; of2.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_front_legs"]', text=f"{flegs_lbl} FK<->IK", slider=True)
+                    if has_legs and "hfw_ik_fk_legs" in arm:
+                        l_is_ik = float(arm["hfw_ik_fk_legs"]) >= 0.5
+                        lrow = ikbox.row(align=True)
+                        lrow.label(text=f"{legs_lbl}:")
+                        o1 = lrow.operator("hfw_toolkit.switch_limb_ik_fk", text="IK", depress=l_is_ik)
+                        o1.group = "legs"; o1.to_ik = True; o1.snap_pose = True
+                        o2 = lrow.operator("hfw_toolkit.switch_limb_ik_fk", text="FK", depress=not l_is_ik)
+                        o2.group = "legs"; o2.to_ik = False; o2.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_legs"]', text=f"{legs_lbl} FK<->IK", slider=True)
+                    if has_arms and "hfw_ik_fk_arms" in arm:
+                        a_is_ik = float(arm["hfw_ik_fk_arms"]) >= 0.5
+                        arow = ikbox.row(align=True)
+                        arow.label(text=f"{arms_lbl}:")
+                        o3 = arow.operator("hfw_toolkit.switch_limb_ik_fk", text="IK", depress=a_is_ik)
+                        o3.group = "arms"; o3.to_ik = True; o3.snap_pose = True
+                        o4 = arow.operator("hfw_toolkit.switch_limb_ik_fk", text="FK", depress=not a_is_ik)
+                        o4.group = "arms"; o4.to_ik = False; o4.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_arms"]', text=f"{arms_lbl} FK<->IK", slider=True)
+                    if has_wings_ik:
+                        w_is_ik = float(arm["hfw_ik_fk_wings"]) >= 0.5
+                        wrow = ikbox.row(align=True)
+                        wrow.label(text="Wings:")
+                        ow1 = wrow.operator("hfw_toolkit.switch_limb_ik_fk", text="IK", depress=w_is_ik)
+                        ow1.group = "wings"; ow1.to_ik = True; ow1.snap_pose = True
+                        ow2 = wrow.operator("hfw_toolkit.switch_limb_ik_fk", text="FK", depress=not w_is_ik)
+                        ow2.group = "wings"; ow2.to_ik = False; ow2.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_wings"]', text="Wings FK<->IK", slider=True)
+
+                # 3. Dynamically Named Control Categories (Show / Hide by Actual Controlled Parts!)
+                cbox_cat = rbox.box()
+                chdr = cbox_cat.row(align=True)
+                chdr.label(text="Control Groups (Show / Hide)", icon="OUTLINER_COLLECTION")
+                chdr.prop(arm, "show_in_front", text="In Front", toggle=True)
+
+                cat_grid = cbox_cat.grid_flow(columns=2, align=True)
+                shown_colls: set[str] = set()
+                for skey in (
+                    "body", "torso_ik", "spine_fk", "tail", "appendages",
+                    "wings_ik", "wings_fk", "hands_feet", "frills", "weapons", "plates",
+                    "front_legs_ik", "front_legs_fk", "legs_ik", "legs_fk", "arms_ik", "arms_fk",
+                ):
+                    cname = rig_slots.get(skey)
+                    if not cname or cname in shown_colls:
+                        continue
+                    bc = arm.data.collections.get(cname)
+                    if bc is None:
+                        continue
+                    shown_colls.add(cname)
+                    op_l = cat_grid.operator("hfw_toolkit.toggle_bone_coll", text=cname, depress=bc.is_visible)
+                    op_l.coll_name = cname
+
+                # Fallback for any legacy v0.7 rig still open in Blender
+                for legacy_nm, legacy_lbl in (
+                    ("Controls", "Controls"),
+                    ("Controls_IK", "IK"),
+                    ("Controls_FK", "FK"),
+                    ("Controls_Detail", "Detail"),
+                ):
+                    if legacy_nm in shown_colls:
+                        continue
+                    bc = arm.data.collections.get(legacy_nm)
+                    if bc is not None:
+                        shown_colls.add(legacy_nm)
+                        op_l = cat_grid.operator("hfw_toolkit.toggle_bone_coll", text=legacy_lbl, depress=bc.is_visible)
+                        op_l.coll_name = legacy_nm
+
+                raw_vis = any(
+                    (arm.data.collections.get(n) is not None and arm.data.collections.get(n).is_visible)
+                    for n in ("Skeleton", "Body", "Helpers")
+                )
+                op_raw = cat_grid.operator("hfw_toolkit.toggle_bone_coll", text="Raw DEF", depress=raw_vis)
+                op_raw.coll_name = "RAW_DEF"
+
+                # 4. Quick Multi-Bend Chain & Chest Selection + Rest-Lock
+                has_chest = bool(rig_meta.get("chest_ctrl")) or ("CTRL_Chest" in arm.pose.bones)
+                qrow = rbox.row(align=True)
+                if has_chest:
+                    op_ch = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Chest", icon="MESH_TORUS")
+                    op_ch.group = "chest"
+                if "tail" in rig_slots:
+                    op_t = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Tail", icon="CURVE_BEZCURVE")
+                    op_t.group = "tail"
+                if rig_meta.get("wing_ctrls"):
+                    op_w = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Wings", icon="MOD_WAVE")
+                    op_w.group = "wings"
+                if rig_meta.get("appendage_ctrls"):
+                    app_btn = rig_slots.get("appendages", "Trunk").replace(" FK", "")
+                    op_a = qrow.operator("hfw_toolkit.select_ctrl_chain", text=app_btn, icon="CURVE_BEZCURVE")
+                    op_a.group = "appendages"
+                op_s = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Spine", icon="MOD_CURVE")
+                op_s.group = "spine"
+
+                if "hfw_rig_lock_secondary" in arm:
+                    rbox.prop(arm, '["hfw_rig_lock_secondary"]', text="Lock Uncontrolled Bones", slider=True)
+
+                # 5. Collapsible Per-Category Influence Sliders (Dynamically Labeled to Match Bone Groups!)
+                rbox.prop(
+                    props,
+                    "show_rig_overrides",
+                    icon="TRIA_DOWN" if props.show_rig_overrides else "TRIA_RIGHT",
+                    text="Per-Group Rig Influences",
+                    emboss=False,
+                )
+                if props.show_rig_overrides:
+                    grid = rbox.grid_flow(columns=2, align=True)
+                    arms_wings_lbl = arms_lbl if has_arms else rig_slots.get("wings_fk", "Wings")
+                    infl_rows = [
+                        ("hfw_rig_spine", "COG / Spine", True),
+                        ("hfw_rig_chest", "Chest", has_chest),
+                        ("hfw_rig_head", "Neck / Head", True),
+                        ("hfw_rig_jaw", "Jaw", True),
+                        ("hfw_rig_legs_ik", "Quad Legs" if has_flegs else legs_lbl, has_legs or has_flegs),
+                        ("hfw_rig_arms_ik", arms_wings_lbl, has_arms or ("wings_fk" in rig_slots)),
+                        ("hfw_rig_tail", rig_slots.get("tail", "Tail FK"), ("tail" in rig_slots) or ("appendages" in rig_slots)),
+                        ("hfw_rig_detail", rig_slots.get("hands_feet", "Hands / Feet"), "hands_feet" in rig_slots),
+                        ("hfw_rig_frills", rig_slots.get("frills", "Frills"), "frills" in rig_slots),
+                        ("hfw_rig_weapons", rig_slots.get("weapons", "Weapons"), "weapons" in rig_slots),
+                        ("hfw_rig_plates", rig_slots.get("plates", "Armor Plates"), "plates" in rig_slots),
+                    ]
+                    for pkey, plbl, show_it in infl_rows:
+                        if show_it and pkey in arm:
+                            grid.prop(arm, f'["{pkey}"]', text=plbl, slider=True)
+
+            if arm.animation_data is not None:
+                rbox.prop(arm.animation_data, "action", text="Action")
+                act = arm.animation_data.action
+                if act is not None:
+                    adesc = str(act.get("hfw_anim_description") or "")
+                    if adesc:
+                        ib = rbox.box()
+                        ib.scale_y = 0.85
+                        ib.label(text=adesc[:72], icon="INFO")
+                        if len(adesc) > 72:
+                            ib.label(text=adesc[72:144])
+            col_ops = rbox.column(align=True)
+            col_ops.operator("hfw_toolkit.bake_anim_to_ctrl", icon="KEYFRAME_HLT")
+            col_ops.operator("hfw_toolkit.bake_ctrl_to_def", icon="EXPORT")
+            row_ops = rbox.row(align=True)
+            row_ops.operator("hfw_toolkit.build_control_rig", text="Rebuild Rig", icon="ARMATURE_DATA")
+            row_ops.operator("hfw_toolkit.reset_ctrl_pose", text="Reset Pose", icon="LOOP_BACK")
 
         # Live Machine Shader Controls (automatically shown whenever an HFW machine control group exists!)
         has_ctrl = (
@@ -1151,12 +1960,25 @@ class HFW_PT_MainPanel(Panel):
 
 _CLASSES = (
     HFWToolkitPreferences,
+    HFWAnimationBrowserItem,
+    HFW_UL_AnimationList,
     HFWToolkitSceneProps,
     HFW_OT_ImportMachine,
     HFW_OT_SyncShaderControls,
     HFW_OT_ImportCharacterPrompt,
     HFW_OT_ImportCharacterSelected,
     HFW_OT_ImportDevAsset,
+    HFW_OT_BuildControlRig,
+    HFW_OT_BakeAnimToControlRig,
+    HFW_OT_BakeControlRigToDeform,
+    HFW_OT_ResetControlRigPose,
+    HFW_OT_ScanAnimations,
+    HFW_OT_SelectVisibleAnimations,
+    HFW_OT_ImportAnimationsToActiveRig,
+    HFW_OT_SetRigMode,
+    HFW_OT_SwitchLimbIKFK,
+    HFW_OT_SelectCtrlChain,
+    HFW_OT_ToggleBoneCollection,
     HFW_OT_InspectMaterialWeb,
     HFW_PT_MainPanel,
 )

@@ -4557,10 +4557,27 @@ def _build_part_mesh_object(
     return obj
 
 
+def _load_control_rig_module():
+    """Load sibling `control_rig.py` cleanly inside Blender 5.3 with zero external dependencies."""
+    import importlib.util
+
+    cr_path = Path(__file__).resolve().parent / "control_rig.py"
+    if not cr_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("hfw_control_rig", str(cr_path))
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def import_bundle_into_scene(
     bundle_dir: str | Path,
     enable_detail_nodes: bool = True,
     pack_textures: bool = False,
+    build_control_rig_layer: bool = True,
+    import_animations: bool = True,
 ) -> bpy.types.Object:
     """Import a Canonical Assembly Bundle directly into the active Blender scene."""
     bundle_path = Path(bundle_dir)
@@ -4691,22 +4708,56 @@ def import_bundle_into_scene(
             pass
 
     npz.close()
+
+    # Build non-destructive `DEF + MCH + CTRL` Control Rig + import any extracted HFW animations!
+    has_bundle_anims = bool(manifest.get("animations")) and (bundle_path / "animations.npz").exists()
+    rig_summary_str = ""
+    anim_count = 0
+    if arm_obj.type == "ARMATURE" and (build_control_rig_layer or (import_animations and has_bundle_anims)):
+        cr_mod = _load_control_rig_module()
+        if cr_mod is not None:
+            if build_control_rig_layer and len(joint_names) >= 8 and asset_kind in ("machine", "character"):
+                try:
+                    # Default to Control Rig ON (1.0) when posing, or Game Anim ON (0.0) when clips were loaded!
+                    def_master = 0.0 if (import_animations and has_bundle_anims) else 1.0
+                    rinfo = cr_mod.build_control_rig(arm_obj, default_master=def_master, rebuild=True)
+                    rig_summary_str = (
+                        f", ControlRig({rinfo['archetype']}: {rinfo['control_count']} ctrls, "
+                        f"{rinfo['ik_limb_count']} IK limbs)"
+                    )
+                except Exception as exc:
+                    print(f"[HFWToolkit] Warning: Control Rig build skipped ({exc})")
+            if import_animations and has_bundle_anims:
+                try:
+                    acts = cr_mod.import_animations_into_armature(
+                        arm_obj,
+                        bundle_path,
+                        activate_first=True,
+                        switch_to_anim_mode=True,
+                    )
+                    anim_count = len(acts)
+                except Exception as exc:
+                    print(f"[HFWToolkit] Warning: Animation import skipped ({exc})")
+
+    anim_summary_str = f", {anim_count} HFW animations" if anim_count else ""
     print(
         f"[HFWToolkit] Imported '{disp}' ({variant}, textures={manifest.get('texture_mode', 'packed')}): "
-        f"{len(joint_names)} bones, {len(helper_bone_map)} helpers, {created} parts, {len(mat_map)} materials."
+        f"{len(joint_names)} bones, {len(helper_bone_map)} helpers, {created} parts, {len(mat_map)} materials"
+        f"{rig_summary_str}{anim_summary_str}."
     )
     return arm_obj
 
 
 def _cli_main() -> None:
     if "--" not in sys.argv:
-        print("Usage: blender --background --python blender_builder.py -- <bundle_dir> <out.blend> [--pack] [--no-detail] [--export-fbx <out.fbx>]")
+        print("Usage: blender --background --python blender_builder.py -- <bundle_dir> <out.blend> [--pack] [--no-detail] [--no-control-rig] [--export-fbx <out.fbx>]")
         sys.exit(2)
     args = sys.argv[sys.argv.index("--") + 1 :]
     bundle_dir = Path(args[0])
     out_blend = Path(args[1])
     pack = "--pack" in args
     enable_detail = "--no-detail" not in args
+    build_ctrl = "--no-control-rig" not in args
     export_fbx: Path | None = None
     if "--export-fbx" in args:
         idx = args.index("--export-fbx")
@@ -4714,7 +4765,13 @@ def _cli_main() -> None:
             export_fbx = Path(args[idx + 1])
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_bundle_into_scene(bundle_dir, enable_detail_nodes=enable_detail, pack_textures=pack)
+    arm_obj = import_bundle_into_scene(
+        bundle_dir,
+        enable_detail_nodes=enable_detail,
+        pack_textures=pack,
+        build_control_rig_layer=build_ctrl,
+        import_animations=True,
+    )
 
     out_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(out_blend.resolve()))
@@ -4722,6 +4779,19 @@ def _cli_main() -> None:
 
     if export_fbx is not None:
         export_fbx.parent.mkdir(parents=True, exist_ok=True)
+        # Export base SkeletalMesh FBX in clean bind pose using ONLY deform (`DEF`) bones (no CTRL_/MCH_ pollution!)
+        prev_action = arm_obj.animation_data.action if (arm_obj and arm_obj.animation_data) else None
+        prev_master = float(arm_obj.get("hfw_rig_master", 0.0)) if arm_obj else 0.0
+        if arm_obj and arm_obj.type == "ARMATURE":
+            if "hfw_rig_master" in arm_obj:
+                arm_obj["hfw_rig_master"] = 0.0
+            if arm_obj.animation_data:
+                arm_obj.animation_data.action = None
+            for pb in arm_obj.pose.bones:
+                pb.matrix_basis = Matrix.Identity(4)
+            arm_obj.update_tag()
+            bpy.context.view_layer.update()
+
         bpy.ops.object.select_all(action="DESELECT")
         for obj in bpy.context.scene.objects:
             if not obj.hide_viewport and not obj.hide_render:
@@ -4731,6 +4801,7 @@ def _cli_main() -> None:
                 filepath=str(export_fbx.resolve()),
                 use_selection=True,
                 object_types={"ARMATURE", "MESH"},
+                use_armature_deform_only=True,
                 add_leaf_bones=False,
                 bake_anim=False,
                 mesh_smooth_type="FACE",
@@ -4744,6 +4815,67 @@ def _cli_main() -> None:
             print(f"[HFWToolkit] Saved UE5-ready rigged FBX: {export_fbx}")
         except Exception as exc:
             print(f"[HFWToolkit] Warning: FBX export failed ({exc})")
+
+        # Export any imported HFW game animations as UE5-ready skeletal `.fbx` clips in `animations/`!
+        if arm_obj and arm_obj.type == "ARMATURE":
+            game_acts = [a for a in bpy.data.actions if a.get("hfw_anim_kind") in ("game_def", "baked_def")]
+            if game_acts:
+                cr_mod = _load_control_rig_module()
+                anim_dir = export_fbx.parent / "animations"
+                anim_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = bundle_dir / "assembly.json"
+                fbx_name_by_aid: dict[str, str] = {}
+                if manifest_path.exists():
+                    try:
+                        mjson = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        for am in mjson.get("animations") or ():
+                            fbx_name_by_aid[str(am.get("anim_id", ""))] = str(am.get("fbx_filename", ""))
+                    except Exception:
+                        pass
+
+                bpy.ops.object.select_all(action="DESELECT")
+                arm_obj.select_set(True)
+                bpy.context.view_layer.objects.active = arm_obj
+                exported_clips = 0
+                for act in game_acts:
+                    try:
+                        if cr_mod is not None:
+                            cr_mod.assign_action_to_armature(arm_obj, act)
+                        else:
+                            arm_obj.animation_data.action = act
+                        f0, f1 = act.frame_range
+                        bpy.context.scene.frame_start = int(round(f0))
+                        bpy.context.scene.frame_end = max(int(round(f0)) + 1, int(round(f1)))
+                        bpy.context.scene.frame_set(bpy.context.scene.frame_start)
+                        bpy.context.view_layer.update()
+
+                        aid = str(act.get("hfw_anim_id", ""))
+                        fname = fbx_name_by_aid.get(aid) or f"{act.name}.fbx"
+                        if not fname.lower().endswith(".fbx"):
+                            fname += ".fbx"
+                        afbx = anim_dir / fname
+                        bpy.ops.export_scene.fbx(
+                            filepath=str(afbx.resolve()),
+                            use_selection=True,
+                            object_types={"ARMATURE"},
+                            use_armature_deform_only=True,
+                            add_leaf_bones=False,
+                            bake_anim=True,
+                            bake_anim_use_all_bones=True,
+                            bake_anim_use_nla_strips=False,
+                            bake_anim_use_all_actions=False,
+                            bake_anim_force_startend_keying=True,
+                            bake_anim_simplify_factor=0.0,
+                        )
+                        exported_clips += 1
+                    except Exception as exc:
+                        print(f"[HFWToolkit] Warning: Animation FBX export failed for {act.name} ({exc})")
+                print(f"[HFWToolkit] Exported {exported_clips} UE5 AnimSequence FBX clip(s) -> {anim_dir}")
+
+        if arm_obj and prev_action is not None and arm_obj.animation_data:
+            arm_obj.animation_data.action = prev_action
+        if arm_obj and "hfw_rig_master" in arm_obj:
+            arm_obj["hfw_rig_master"] = prev_master
 
 
 if __name__ == "__main__":

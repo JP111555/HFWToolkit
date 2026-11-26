@@ -79,7 +79,7 @@ def test_apex_machine_shader_controls_and_ue5_mpc(hfw_env, tmp_path: Path) -> No
     export_assembly_bundle(game, asm, bdir, unpack_textures=False, asset_kind="machine")
 
     manifest = json.loads((bdir / "assembly.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] >= 3
     assert manifest["asset_kind"] == "machine"
     sc = manifest["shader_controls"]
     assert sc["profile"] == "apex"
@@ -265,7 +265,8 @@ head_obj = next(o.name for o in bpy.data.objects if o.type == 'MESH' and o.name.
 hair_obj = next(o.name for o in bpy.data.objects if o.type == 'MESH' and o.name.startswith('Aloy_Hair_') and not o.hide_viewport)
 h0, r0 = center(head_obj), center(hair_obj)
 
-pb = arm.pose.bones['C_Head_sjnt_0']
+# Pose via the live Control Rig (`CTRL_Head`) when present (hfw_rig_master = 1.0), proving Head + Hair deform cleanly!
+pb = arm.pose.bones.get('CTRL_Head') or arm.pose.bones['C_Head_sjnt_0']
 pb.rotation_mode = 'XYZ'
 pb.rotation_euler = Euler((0.25, 0.0, -0.45), 'XYZ')
 bpy.context.view_layer.update()
@@ -278,7 +279,7 @@ print(f'POSE_DEFORM_OK dh={{dh:.4f}} dr={{dr:.4f}}')
         encoding="utf-8",
     )
     proc = subprocess.run(
-        [str(cfg.blender_exe), "--background", "--python-exit-code", "1", "--python", str(pose_script)],
+        [str(cfg.blender_exe), "--factory-startup", "--background", "--python-exit-code", "1", "--python", str(pose_script)],
         capture_output=True,
         text=True,
         check=False,

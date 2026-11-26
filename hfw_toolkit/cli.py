@@ -18,6 +18,7 @@ from hfw_toolkit.config import ToolkitConfig
 from hfw_toolkit.decima import AssetCatalog, HFWGame, RTTISchema
 from hfw_toolkit.decima.exe_rtti import extract_rtti_from_exe, get_exe_version_string
 from hfw_toolkit.extract import (
+    ANIMATION_CATEGORIES,
     SUPPORTED_OUTPUT_FORMATS,
     AudioItemInfo,
     assemble_character,
@@ -26,11 +27,15 @@ from hfw_toolkit.extract import (
     decode_audio_object,
     detect_digital_extras_ost,
     detect_installed_languages,
+    discover_entity_animations,
+    export_animation_pack,
     extract_audio_items_to_dir,
     extract_music_cues_to_dir,
     has_pyav,
+    normalize_animation_category,
     resolve_character_prompt,
     resolve_machine_entity_id,
+    summarize_animation_categories,
     write_audio_file,
 )
 from hfw_toolkit.shaders import DXCDisassembler, ShaderHashDictionary, analyze_material_deep
@@ -247,6 +252,7 @@ def _cmd_export_bundle(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             out_dir,
             max_texture_size=args.max_tex_size,
             unpack_textures=args.unpack_textures,
+            animations=getattr(args, "animations", None),
         )
         print(
             f"Exported bundle for {disp} ({asm.variant_label}, textures={'unpacked' if args.unpack_textures else 'packed'}): "
@@ -288,6 +294,7 @@ def _cmd_export_blend(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             bundle_dir,
             max_texture_size=args.max_tex_size,
             unpack_textures=args.unpack_textures,
+            animations=getattr(args, "animations", None),
         )
         fbx_out = (bundle_dir / f"{disp.replace('/', '_').replace(' ', '_')}.fbx") if getattr(args, "export_fbx", False) else None
         print(f"[3/3] Building ready-to-use Blender 5.3 scene -> {out_blend}")
@@ -298,6 +305,7 @@ def _cmd_export_blend(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             pack_textures=args.pack,
             enable_detail_nodes=not args.no_detail,
             export_fbx=fbx_out,
+            build_control_rig=not getattr(args, "no_control_rig", False),
         )
         print(f"Success! Open directly in Blender 5.3: {out_blend}")
         if fbx_out and fbx_out.exists():
@@ -327,13 +335,14 @@ def _cmd_export_ue5(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             include_broken_states=not args.no_broken_states,
         )
         bundle_dir = Path(args.out) if args.out else (cfg.exports_dir / f"{safe_disp}_v{args.variant}_ue5_bundle")
-        print(f"[2/3] Exporting textures & UE5 animated shader script -> {bundle_dir}")
+        print(f"[2/3] Exporting textures & UE5 animated shader/Control Rig script -> {bundle_dir}")
         export_assembly_bundle(
             game,
             asm,
             bundle_dir,
             max_texture_size=args.max_tex_size,
             unpack_textures=args.unpack_textures,
+            animations=getattr(args, "animations", None),
         )
         fbx_path = bundle_dir / f"{safe_disp}.fbx"
         tmp_blend = bundle_dir / f"{safe_disp}.blend"
@@ -345,6 +354,7 @@ def _cmd_export_ue5(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             pack_textures=False,
             enable_detail_nodes=True,
             export_fbx=fbx_path,
+            build_control_rig=not getattr(args, "no_control_rig", False),
         )
         print(f"Success! Run inside Unreal Engine 5 (Tools -> Execute Python Script):")
         print(f"  {bundle_dir / 'ue5_import_machine.py'}")
@@ -758,6 +768,7 @@ def _cmd_characters(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
                     max_texture_size=args.max_tex_size,
                     unpack_textures=args.unpack_textures,
                     asset_kind="character",
+                    animations=getattr(args, "animations", None),
                 )
                 print(f"Exported character bundle -> {out_dir}")
                 return 0
@@ -772,11 +783,18 @@ def _cmd_characters(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
                     max_texture_size=args.max_tex_size,
                     unpack_textures=args.unpack_textures,
                     asset_kind="character",
+                    animations=getattr(args, "animations", None),
                 )
                 fbx_out = out_dir / f"{safe_name}.fbx"
                 blend_tmp = out_dir / f"{safe_name}.blend"
                 print(f"[3/3] Building UE5 Rigged Character FBX -> {fbx_out}")
-                build_blend_headless(out_dir, blend_tmp, config=cfg, export_fbx=fbx_out)
+                build_blend_headless(
+                    out_dir,
+                    blend_tmp,
+                    config=cfg,
+                    export_fbx=fbx_out,
+                    build_control_rig=not getattr(args, "no_control_rig", False),
+                )
                 print(f"Success! UE5 Character Importer: {out_dir / 'ue5_import_character.py'}")
                 return 0
 
@@ -792,6 +810,7 @@ def _cmd_characters(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
                 max_texture_size=args.max_tex_size,
                 unpack_textures=args.unpack_textures,
                 asset_kind="character",
+                animations=getattr(args, "animations", None),
             )
             fbx_out = (bdir / f"{safe_name}.fbx") if args.export_fbx else None
             print(f"[3/3] Building ready-to-pose Blender 5.3 character rig -> {out_blend}")
@@ -801,6 +820,7 @@ def _cmd_characters(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
                 config=cfg,
                 pack_textures=args.pack,
                 export_fbx=fbx_out,
+                build_control_rig=not getattr(args, "no_control_rig", False),
             )
             print(f"Success! Open directly in Blender 5.3: {out_blend}")
             return 0
@@ -941,6 +961,151 @@ def _cmd_assets(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
             game.close()
 
 
+def _cmd_animations(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
+    cfg.ensure_dirs()
+    game = HFWGame(cfg)
+    cat = AssetCatalog(cfg.index_db_path)
+    try:
+        sub = args.anim_cmd
+        if sub == "list":
+            if args.machine:
+                oid, _code, disp = resolve_machine_entity_id(game, cat, args.machine)
+                all_clips = discover_entity_animations(
+                    game,
+                    entity_group_id=oid.group_id,
+                    asset_kind="machine",
+                    limit=None,
+                )
+                kind_lbl = "machine"
+                target_lbl = f"{disp} ({oid})"
+            else:
+                gender = (
+                    "male"
+                    if (args.character and "male" in args.character.lower() and "female" not in args.character.lower())
+                    else "female"
+                )
+                all_clips = discover_entity_animations(
+                    game,
+                    entity_group_id=None,
+                    asset_kind="character",
+                    gender=gender,
+                    limit=None,
+                )
+                kind_lbl = "character"
+                target_lbl = f"{args.character or 'Aloy'} ({gender})"
+
+            cat_counts = summarize_animation_categories(all_clips)
+            filtered = all_clips
+            cat_arg = (getattr(args, "category", "") or "").strip()
+            if cat_arg and cat_arg.lower() != "all":
+                wanted = {normalize_animation_category(tok) for tok in cat_arg.split(",") if tok.strip()}
+                filtered = [c for c in filtered if c.category in wanted]
+            q = (getattr(args, "query", "") or "").strip().lower()
+            if q:
+                filtered = [
+                    c
+                    for c in filtered
+                    if q in c.name.lower()
+                    or q in c.description.lower()
+                    or q in c.anim_id.lower()
+                    or any(q in ev.lower() for ev in c.events)
+                ]
+            lim = int(getattr(args, "limit", 0) or 0)
+            shown = filtered[:lim] if lim > 0 else filtered
+
+            if getattr(args, "json", False):
+                payload = {
+                    "kind": kind_lbl,
+                    "target": target_lbl,
+                    "total": len(all_clips),
+                    "filtered_total": len(filtered),
+                    "count": len(shown),
+                    "category_counts": cat_counts,
+                    "categories_meta": [{"key": k, "label": lbl} for k, lbl in ANIMATION_CATEGORIES],
+                    "items": [
+                        {
+                            "anim_id": c.anim_id,
+                            "name": c.name,
+                            "category": c.category,
+                            "description": c.description,
+                            "skeleton_id": c.skeleton_id,
+                            "duration": round(c.duration, 3),
+                            "sample_rate": round(c.sample_rate, 2),
+                            "num_frames": c.num_frames,
+                            "num_joints": c.num_joints,
+                            "yaw_delta_deg": round(c.yaw_delta_deg, 1),
+                            "events": list(c.events[:8]),
+                        }
+                        for c in shown
+                    ],
+                }
+                print(json.dumps(payload))
+                return 0
+
+            summary_parts = [f"all={cat_counts['all']}"] + [
+                f"{k}={cat_counts.get(k, 0)}" for k, _ in ANIMATION_CATEGORIES if cat_counts.get(k, 0) > 0
+            ]
+            print(f"Discovered {len(all_clips)} HFW animation clip(s) for {kind_lbl} '{target_lbl}' (showing {len(shown)}):")
+            print(f"  Categories: {' | '.join(summary_parts)}")
+            for c in shown:
+                print(
+                    f"  {c.anim_id:10s} | {c.category:8s} | {c.duration:5.2f}s ({c.num_frames:3d}f) | "
+                    f"{c.name:36s} | {c.description}"
+                )
+            return 0
+
+        if sub == "export-pack":
+            from hfw_toolkit.decima import ObjectId
+            from hfw_toolkit.extract import FEMALE_HUMAN_SKELETON_ID, MALE_HUMAN_SKELETON_ID, extract_skeleton
+
+            spec = (args.animations or "all").strip()
+            if args.machine:
+                oid, code, disp = resolve_machine_entity_id(game, cat, args.machine)
+                asm = assemble_machine(
+                    game,
+                    oid,
+                    codename=code,
+                    display_name=disp,
+                    variant_index=0,
+                    lod_index=0,
+                    include_broken_states=False,
+                )
+                skel = asm.skeleton
+                ent_gid = oid.group_id
+                akind = "machine"
+                gender = "female"
+                default_stem = re.sub(r"[^A-Za-z0-9_]+", "_", disp).strip("_") or "machine"
+            else:
+                ch_txt = (args.character or "female").strip()
+                gender = "male" if ("male" in ch_txt.lower() and "female" not in ch_txt.lower()) else "female"
+                skel_id = MALE_HUMAN_SKELETON_ID if gender == "male" else FEMALE_HUMAN_SKELETON_ID
+                skel_obj = game.read_object(ObjectId.parse(skel_id), read_subgroups=True)
+                skel = extract_skeleton(game, skel_obj)
+                ent_gid = None
+                akind = "character"
+                default_stem = f"humanoid_{gender}"
+
+            out_dir = Path(args.out) if args.out else (cfg.exports_dir / "anim_packs" / f"{default_stem}_pack")
+            export_animation_pack(
+                game,
+                skel,
+                out_dir,
+                entity_group_id=ent_gid,
+                asset_kind=akind,
+                animations_spec=spec,
+                gender=gender,
+            )
+            manifest = json.loads((out_dir / "assembly.json").read_text(encoding="utf-8"))
+            n_exp = len(manifest.get("animations", ()))
+            print(f"Exported {n_exp} animation clip(s) (spec={spec!r}) -> {out_dir}")
+            return 0
+
+        return 1
+    finally:
+        cat.close()
+        game.close()
+
+
 def _cmd_web(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
     import uvicorn
     from hfw_toolkit.web import create_app
@@ -996,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
     p_b.add_argument("--lod", type=int, default=0)
     p_b.add_argument("--no-broken-states", action="store_true")
     p_b.add_argument("--unpack-textures", action="store_true", help="Unpack TextureSets into individual semantic PNG maps instead of native game-packed textures")
+    p_b.add_argument("--animations", default=None, help="Include HFW animations: 'all', 'category:combat', 'category:movement,jump', N diverse clips (e.g. '10'), or comma-separated ObjectIds")
     p_b.add_argument("--max-tex-size", type=int, default=None)
     p_b.add_argument("--out", default=None)
 
@@ -1005,20 +1171,40 @@ def main(argv: list[str] | None = None) -> int:
     p_bl.add_argument("--lod", type=int, default=0)
     p_bl.add_argument("--no-broken-states", action="store_true")
     p_bl.add_argument("--no-detail", action="store_true")
+    p_bl.add_argument("--no-control-rig", action="store_true", help="Skip automatic non-destructive IK/FK Control Rig generation")
+    p_bl.add_argument("--animations", default=None, help="Include HFW animations: 'all', 'category:combat', 'category:movement', N diverse clips, or comma-separated ObjectIds")
     p_bl.add_argument("--unpack-textures", action="store_true", help="Unpack TextureSets into individual semantic PNG maps instead of native game-packed textures")
     p_bl.add_argument("--pack", action="store_true", help="Pack textures inside .blend")
     p_bl.add_argument("--export-fbx", action="store_true", help="Also export a UE5-ready rigged .fbx alongside ue5_import_machine.py")
     p_bl.add_argument("--max-tex-size", type=int, default=None)
     p_bl.add_argument("--out", default=None)
 
-    p_ue = sub.add_parser("export-ue5", help="Export rigged FBX + textures + animated Unreal Engine 5 Python import script")
+    p_ue = sub.add_parser("export-ue5", help="Export rigged FBX + Control Rig + animations + textures + Unreal Engine 5 Python import script")
     p_ue.add_argument("--machine", required=True, help="Machine name, codename, or 'group:idx'")
     p_ue.add_argument("--variant", type=int, default=0)
     p_ue.add_argument("--lod", type=int, default=0)
     p_ue.add_argument("--no-broken-states", action="store_true")
+    p_ue.add_argument("--no-control-rig", action="store_true")
+    p_ue.add_argument("--animations", default=None, help="Include HFW animations: 'all', 'category:combat', 'category:movement', N diverse clips, or comma-separated ObjectIds")
     p_ue.add_argument("--unpack-textures", action="store_true", help="Unpack semantic PNG maps instead of native packed textures")
     p_ue.add_argument("--max-tex-size", type=int, default=None)
     p_ue.add_argument("--out", default=None)
+
+    p_an = sub.add_parser("animations", help="Discover, filter & export HFW in-game SkeletonAnimationResource clips for machines or characters")
+    an_sub = p_an.add_subparsers(dest="anim_cmd", required=True)
+    p_an_ls = an_sub.add_parser("list", help="List available EA08 animation clips with categories & plain-English descriptions")
+    p_an_ls.add_argument("--machine", default="", help="Machine name, codename, or 'group:idx'")
+    p_an_ls.add_argument("--character", default="", help="Character name/gender (e.g. Aloy, Erend, male)")
+    p_an_ls.add_argument("--category", default="", help="Filter by category (combat, movement, idle, jump, emote, mounted; comma-separated or 'all')")
+    p_an_ls.add_argument("--query", "-q", default="", help="Search text across clip names, descriptions & event names")
+    p_an_ls.add_argument("--limit", type=int, default=0, help="Max rows to show (0 = show ALL clips)")
+    p_an_ls.add_argument("--json", action="store_true", help="Emit structured JSON (used by Blender N-Panel Live Browser)")
+
+    p_an_pk = an_sub.add_parser("export-pack", help="Fast animation-only pack export (assembly.json + animations.npz) for adding clips onto an existing Blender rig")
+    p_an_pk.add_argument("--machine", default="", help="Machine name, codename, or 'group:idx'")
+    p_an_pk.add_argument("--character", default="", help="Character name/gender (e.g. Aloy, female, male)")
+    p_an_pk.add_argument("--animations", default="all", help="Animation selection: 'all', 'category:combat', 'category:movement,jump', N clips, or comma-separated ObjectIds")
+    p_an_pk.add_argument("--out", default=None, help="Output directory for assembly.json + animations.npz")
 
     p_im = sub.add_parser("inspect-material", help="Deep-analyze a RenderEffectResource & export UE5/HLSL reports")
     p_im.add_argument("material_id", help="RenderEffectResource ObjectId ('group:idx')")
@@ -1104,6 +1290,8 @@ def main(argv: list[str] | None = None) -> int:
         p_cx.add_argument("--no-hair", action="store_true", help="Skip external braided HairResource")
         p_cx.add_argument("--hair-lod", type=int, default=2, help="HairResource LOD (0=ultra, 2=balanced default, 3=light)")
         p_cx.add_argument("--lod", type=int, default=0)
+        p_cx.add_argument("--animations", default=None, help="Include HFW humanoid animations: 'all', 'category:combat', 'category:movement', N diverse clips, or comma-separated ObjectIds")
+        p_cx.add_argument("--no-control-rig", action="store_true", help="Skip automatic non-destructive IK/FK Control Rig generation")
         p_cx.add_argument("--unpack-textures", action="store_true")
         p_cx.add_argument("--max-tex-size", type=int, default=None)
         p_cx.add_argument("--out", default=None)
@@ -1160,6 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
         "inspect-material": _cmd_inspect_material,
         "install-blender-addon": _cmd_install_addon,
         "audio": _cmd_audio,
+        "animations": _cmd_animations,
         "characters": _cmd_characters,
         "assets": _cmd_assets,
         "web": _cmd_web,

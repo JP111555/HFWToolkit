@@ -17,6 +17,7 @@ def build_blend_headless(
     pack_textures: bool = False,
     enable_detail_nodes: bool = True,
     export_fbx: Path | None = None,
+    build_control_rig: bool = True,
 ) -> Path:
     """Invoke Blender 5.3 in `--background` mode to assemble `bundle_dir` into `output_blend` (and optional rigged `.fbx`)."""
     cfg = config or ToolkitConfig.load()
@@ -40,6 +41,8 @@ def build_blend_headless(
         cmd.append("--pack")
     if not enable_detail_nodes:
         cmd.append("--no-detail")
+    if not build_control_rig:
+        cmd.append("--no-control-rig")
     if export_fbx is not None:
         cmd.extend(["--export-fbx", str(Path(export_fbx).resolve())])
 

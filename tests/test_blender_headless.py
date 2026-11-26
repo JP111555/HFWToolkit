@@ -147,6 +147,11 @@ if arms and bone_parented and skinned:
         return acc / max(len(vidxs), 1)
 
     if tested_bone is not None:
+        # Switch to Raw Game-Skeleton mode (`hfw_rig_master = 0.0`) so raw DEF bone posing/lockstep is verified
+        # even with the non-destructive Control Rig layer attached!
+        if "hfw_rig_master" in arm:
+            arm["hfw_rig_master"] = 0.0
+            arm.update_tag()
         bpy.context.view_layer.update()
         body_before = _eval_center(tested_body, tested_vidxs)
         plate_before = tested_plate.matrix_world.translation.copy()

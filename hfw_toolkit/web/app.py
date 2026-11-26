@@ -22,6 +22,7 @@ from hfw_toolkit.cli import install_blender_addon_files
 from hfw_toolkit.config import ToolkitConfig, auto_detect_blender_exe, auto_detect_game_dir
 from hfw_toolkit.decima import AssetCatalog, HFWGame, ObjectId
 from hfw_toolkit.extract import (
+    ANIMATION_CATEGORIES,
     SPOKEN_LANGUAGE_LABELS,
     SUPPORTED_OUTPUT_FORMATS,
     AudioItemInfo,
@@ -33,14 +34,17 @@ from hfw_toolkit.extract import (
     decode_texture,
     detect_digital_extras_ost,
     detect_installed_languages,
+    discover_entity_animations,
     encode_audio_bytes,
     extract_audio_items_to_dir,
     extract_music_cues_to_dir,
     has_pyav,
+    normalize_animation_category,
     render_channel_image,
     render_music_cue_mix,
     resolve_character_prompt,
     resolve_machine_entity_id,
+    summarize_animation_categories,
     unpack_texture_set,
 )
 from hfw_toolkit.shaders import DXCDisassembler, ShaderHashDictionary, analyze_material_deep
@@ -58,6 +62,8 @@ class ExportBlendRequest(BaseModel):
     pack_textures: bool = False
     enable_detail_nodes: bool = True
     export_fbx: bool = False
+    build_control_rig: bool = True
+    animations: str | int | list[str] | None = None
     max_texture_size: int | None = None
 
 
@@ -113,6 +119,8 @@ class ExportCharacterRequest(BaseModel):
     unpack_textures: bool = False
     pack_textures: bool = False
     export_fbx: bool = False
+    build_control_rig: bool = True
+    animations: str | int | list[str] | None = None
     max_texture_size: int | None = None
 
 
@@ -540,6 +548,7 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
                     bdir,
                     max_texture_size=req.max_texture_size,
                     unpack_textures=req.unpack_textures,
+                    animations=req.animations,
                 )
                 state.export_jobs[job_id]["message"] = f"Building {out_blend.name}{' + UE5 FBX' if req.export_fbx else ''} in Blender..."
                 build_blend_headless(
@@ -549,6 +558,7 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
                     pack_textures=req.pack_textures,
                     enable_detail_nodes=req.enable_detail_nodes,
                     export_fbx=fbx_out,
+                    build_control_rig=req.build_control_rig,
                 )
                 state.export_jobs[job_id] = {
                     "status": "done",
@@ -1119,6 +1129,7 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
                     max_texture_size=req.max_texture_size,
                     unpack_textures=req.unpack_textures,
                     asset_kind="character",
+                    animations=req.animations,
                 )
                 state.export_jobs[job_id]["message"] = f"Building unified rig {out_blend.name}{' + UE5 FBX' if req.export_fbx else ''} in Blender..."
                 build_blend_headless(
@@ -1128,6 +1139,7 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
                     pack_textures=req.pack_textures,
                     enable_detail_nodes=False,
                     export_fbx=fbx_out,
+                    build_control_rig=req.build_control_rig,
                 )
                 state.export_jobs[job_id] = {
                     "status": "done",
@@ -1240,5 +1252,74 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"job_id": job_id}
+
+    @app.get("/api/animations/{kind}/{target}")
+    def api_animations_list(kind: str, target: str, category: str = "", q: str = "", limit: int = 0):
+        """Discover ALL compatible HFW `EA08` animations with categories & plain-English descriptions."""
+        try:
+            if kind == "machine":
+                oid, _code, disp = resolve_machine_entity_id(state.game, state.catalog, target)
+                all_clips = discover_entity_animations(
+                    state.game,
+                    entity_group_id=oid.group_id,
+                    asset_kind="machine",
+                    limit=None,
+                )
+                label = disp
+            else:
+                gender = "male" if ("male" in target.lower() and "female" not in target.lower()) else "female"
+                all_clips = discover_entity_animations(
+                    state.game,
+                    entity_group_id=None,
+                    asset_kind="character",
+                    gender=gender,
+                    limit=None,
+                )
+                label = target
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        cat_counts = summarize_animation_categories(all_clips)
+        filtered = all_clips
+        cat_clean = (category or "").strip()
+        if cat_clean and cat_clean.lower() != "all":
+            wanted = {normalize_animation_category(tok) for tok in cat_clean.split(",") if tok.strip()}
+            filtered = [c for c in filtered if c.category in wanted]
+        ql = (q or "").strip().lower()
+        if ql:
+            filtered = [
+                c
+                for c in filtered
+                if ql in c.name.lower()
+                or ql in c.description.lower()
+                or ql in c.anim_id.lower()
+                or any(ql in ev.lower() for ev in c.events)
+            ]
+        shown = filtered[:limit] if (limit and limit > 0) else filtered
+        return {
+            "kind": kind,
+            "target": label,
+            "total": len(all_clips),
+            "filtered_total": len(filtered),
+            "count": len(shown),
+            "category_counts": cat_counts,
+            "categories_meta": [{"key": k, "label": lbl} for k, lbl in ANIMATION_CATEGORIES],
+            "items": [
+                {
+                    "anim_id": c.anim_id,
+                    "name": c.name,
+                    "category": c.category,
+                    "description": c.description,
+                    "skeleton_id": c.skeleton_id,
+                    "duration": round(c.duration, 3),
+                    "sample_rate": round(c.sample_rate, 2),
+                    "num_frames": c.num_frames,
+                    "num_joints": c.num_joints,
+                    "yaw_delta_deg": round(c.yaw_delta_deg, 1),
+                    "events": list(c.events[:8]),
+                }
+                for c in shown
+            ],
+        }
 
     return app

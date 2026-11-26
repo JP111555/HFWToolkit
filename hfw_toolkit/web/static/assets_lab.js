@@ -21,6 +21,8 @@
   let selectedChar = null;
   let selectedAsset = null;
   let currentTreeDir = "";
+  let charAnimsData = null;
+  let selectedCharAnimIds = new Set();
 
   async function pollExportJob(jobId, statusEl) {
     statusEl.className = "export-status";
@@ -175,14 +177,118 @@
     }
   }
 
+  function resolveCharAnimSpec() {
+    const mode = ($("#ch-anim-mode")?.value || "").trim();
+    if (!mode) return null;
+    if (mode === "selected") {
+      return selectedCharAnimIds.size ? Array.from(selectedCharAnimIds).join(",") : null;
+    }
+    return mode;
+  }
+
+  function updateCharSelectedModeOption() {
+    const opt = $("#ch-anim-mode")?.querySelector('option[value="selected"]');
+    if (opt) opt.textContent = `Anims: Checked Clips (${selectedCharAnimIds.size})`;
+  }
+
+  async function loadCharacterAnimations() {
+    const target = selectedChar ? `${selectedChar.display_name} ${selectedChar.gender || ""}` : "Aloy female";
+    const sumEl = $("#ch-anim-summary");
+    if (sumEl) sumEl.textContent = "Scanning HFW humanoid animations...";
+    try {
+      charAnimsData = await api(`/api/animations/character/${encodeURIComponent(target)}?limit=0`);
+      const sel = $("#ch-anim-cat-filter");
+      if (sel) {
+        const counts = charAnimsData.category_counts || {};
+        sel.innerHTML = `<option value="">All Categories (${counts.all || 0})</option>`;
+        (charAnimsData.categories_meta || []).forEach((cm) => {
+          const n = counts[cm.key] || 0;
+          if (n > 0) {
+            const opt = document.createElement("option");
+            opt.value = cm.key;
+            opt.textContent = `${cm.label} (${n})`;
+            sel.appendChild(opt);
+          }
+        });
+      }
+      renderCharAnimList();
+    } catch (err) {
+      if (sumEl) sumEl.textContent = "Failed to load animations: " + err.message;
+    }
+  }
+
+  function getVisibleCharAnims() {
+    if (!charAnimsData) return [];
+    const cat = ($("#ch-anim-cat-filter")?.value || "").trim();
+    const q = ($("#ch-anim-search")?.value || "").trim().toLowerCase();
+    return (charAnimsData.items || []).filter((c) => {
+      if (cat && c.category !== cat) return false;
+      if (q) {
+        const hay = `${c.name} ${c.description} ${c.anim_id} ${(c.events || []).join(" ")}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
+  function renderCharAnimList() {
+    const list = $("#ch-anim-list");
+    const sumEl = $("#ch-anim-summary");
+    if (!list || !charAnimsData) return;
+    const vis = getVisibleCharAnims();
+    const counts = charAnimsData.category_counts || {};
+    if (sumEl) {
+      sumEl.textContent = `${counts.all || 0} humanoid clips discovered • Showing ${vis.length} • Checked: ${selectedCharAnimIds.size}`;
+    }
+    list.innerHTML = "";
+    vis.slice(0, 300).forEach((c) => {
+      const row = document.createElement("div");
+      row.className = "list-item" + (selectedCharAnimIds.has(c.anim_id) ? " active" : "");
+      row.style.padding = "6px 8px";
+      const chk = selectedCharAnimIds.has(c.anim_id) ? "checked" : "";
+      row.innerHTML = `
+        <div style="display:flex;align-items:flex-start;gap:7px;">
+          <input type="checkbox" ${chk} style="margin-top:3px;" />
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;justify-content:space-between;gap:8px;font-size:12.5px;font-weight:600;">
+              <span>${esc(c.name)}</span>
+              <span style="color:#94a3b8;font-weight:400;">[${esc(c.category)}] ${c.duration.toFixed(2)}s (${c.num_frames}f)</span>
+            </div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">${esc(c.description || "")}</div>
+          </div>
+        </div>
+      `;
+      row.addEventListener("click", (ev) => {
+        const cb = row.querySelector("input[type=checkbox]");
+        if (ev.target !== cb) cb.checked = !cb.checked;
+        if (cb.checked) {
+          selectedCharAnimIds.add(c.anim_id);
+          if ($("#ch-anim-mode")) $("#ch-anim-mode").value = "selected";
+        } else {
+          selectedCharAnimIds.delete(c.anim_id);
+        }
+        row.classList.toggle("active", cb.checked);
+        updateCharSelectedModeOption();
+        if (sumEl) {
+          sumEl.textContent = `${counts.all || 0} humanoid clips discovered • Showing ${vis.length} • Checked: ${selectedCharAnimIds.size}`;
+        }
+      });
+      list.appendChild(row);
+    });
+  }
+
   async function triggerCharacterExport(usePrompt, exportFbx) {
     const st = $("#ch-export-status");
+    const ctrlRig = $("#ch-chk-ctrl-rig") ? $("#ch-chk-ctrl-rig").checked : true;
+    const animSpec = resolveCharAnimSpec();
     const body = usePrompt
       ? {
           prompt: ($("#ch-prompt-input").value || "").trim(),
           hair_lod: Number($("#ch-hair-lod").value || 2),
           pack_textures: $("#ch-chk-pack").checked,
           export_fbx: exportFbx,
+          build_control_rig: ctrlRig,
+          animations: animSpec,
         }
       : {
           char_id: selectedChar ? selectedChar.char_id : "aloy",
@@ -193,6 +299,8 @@
           hair_lod: Number($("#ch-hair-lod").value || 2),
           pack_textures: $("#ch-chk-pack").checked,
           export_fbx: exportFbx,
+          build_control_rig: ctrlRig,
+          animations: animSpec,
         };
     if (usePrompt && !body.prompt) {
       alert("Enter a character prompt first (e.g. 'Aloy Carja Blazon no headgear').");
@@ -361,6 +469,20 @@
         $("#ch-btn-export-ue5")?.addEventListener("click", () => triggerCharacterExport(true, true));
         $("#ch-btn-export-sel-blend")?.addEventListener("click", () => triggerCharacterExport(false, false));
         $("#ch-btn-export-sel-ue5")?.addEventListener("click", () => triggerCharacterExport(false, true));
+        $("#ch-btn-load-anims")?.addEventListener("click", () => loadCharacterAnimations());
+        $("#ch-anim-cat-filter")?.addEventListener("change", () => renderCharAnimList());
+        $("#ch-anim-search")?.addEventListener("input", () => renderCharAnimList());
+        $("#ch-anim-sel-vis")?.addEventListener("click", () => {
+          getVisibleCharAnims().forEach((c) => selectedCharAnimIds.add(c.anim_id));
+          updateCharSelectedModeOption();
+          if ($("#ch-anim-mode")) $("#ch-anim-mode").value = "selected";
+          renderCharAnimList();
+        });
+        $("#ch-anim-clr")?.addEventListener("click", () => {
+          selectedCharAnimIds.clear();
+          updateCharSelectedModeOption();
+          renderCharAnimList();
+        });
       }
       await Promise.all([loadCharacterList(), populateHeadsDropdown()]);
     },
