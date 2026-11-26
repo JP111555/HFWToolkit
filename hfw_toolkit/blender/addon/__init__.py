@@ -29,12 +29,12 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 bl_info = {
     "name": "HFW Toolkit — Machines, Characters, Animations, Control Rig & Live Shaders",
     "author": "HFWToolkit",
-    "version": (0, 9, 5),
+    "version": (1, 0, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-Panel) > HFW Toolkit",
     "description": (
         "One-click import rigged Horizon Forbidden West machines (all 8 archetypes: theropods, quadrupeds, flyers, hexapods, aquatic, serpentine), "
-        "characters, ALL/per-category EA08 animations, multi-bone Chest & Cobra Hood IK/FK, Wing & Quadruped IK/FK, pose mirroring, dynamic bone groups, and live shaders."
+        "characters, ALL/per-category EA08 animations, B-Bone Spline IK, Head/Neck IK, Finger/Toe Curl rigs, spinning Chainsaws & Drills, mesh-fitted widgets, and live shaders."
     ),
     "category": "Import-Export",
 }
@@ -1313,6 +1313,50 @@ class HFW_OT_MirrorControlRigPose(Operator):
         return {"FINISHED"}
 
 
+class HFW_OT_PoseSerpentWave(Operator):
+    bl_idname = "hfw_toolkit.pose_serpent_wave"
+    bl_label = "Serpent S-Wave / Coil Pose"
+    bl_description = "Shape the Spline IK body / tail / trunk into a smooth sinusoidal slithering S-wave or ground coil"
+    bl_options = {"REGISTER", "UNDO"}
+
+    style: StringProperty(default="wave")
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        toolkit_dir, _ = _get_prefs(context)
+        cr = _load_control_rig_module(toolkit_dir)
+        n = cr.pose_serpent_wave(arm, style=self.style)
+        if n == 0:
+            self.report({"WARNING"}, f"No Spline IK controls found on '{arm.name}'.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Applied smooth Spline IK '{self.style}' pose across {n} gimbal handles!")
+        return {"FINISHED"}
+
+
+class HFW_OT_ToggleSpinSpeed(Operator):
+    bl_idname = "hfw_toolkit.toggle_spin_speed"
+    bl_label = "Toggle Chainsaw / Drill Auto-Spin"
+    bl_description = "Start or stop real-time playback spinning for machine Chainsaws or Drills/Grinders/Rotors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    prop_key: StringProperty(default="hfw_saw_speed")
+    target_speed: FloatProperty(default=1.0)
+
+    def execute(self, context):
+        arm = _find_active_hfw_armature(context)
+        if arm is None or self.prop_key not in arm:
+            return {"CANCELLED"}
+        cur = float(arm[self.prop_key])
+        arm[self.prop_key] = 0.0 if abs(cur) > 0.05 else float(self.target_speed)
+        arm.update_tag()
+        context.view_layer.update()
+        state = "ON" if abs(float(arm[self.prop_key])) > 0.05 else "OFF"
+        self.report({"INFO"}, f"Auto-spin ({self.prop_key}) turned {state} (press Spacebar to watch it spin!).")
+        return {"FINISHED"}
+
+
 class HFW_OT_ScanAnimations(Operator):
     bl_idname = "hfw_toolkit.scan_animations"
     bl_label = "Scan Available Animations"
@@ -1738,9 +1782,11 @@ class HFW_PT_MainPanel(Panel):
                     warn.label(text="In Game Anim mode — click 'Control Rig' to pose!", icon="INFO")
                 rbox.prop(arm, '["hfw_rig_master"]', text="Anim (0) <-> Control Rig (1)", slider=True)
 
-                # 2. Prominent IK / FK Switches (Torso Chest IK/FK + Legs + Quad Front Legs + Arms + Flyer Wings!)
+                # 2. Prominent IK / FK Switches (Torso/Hood + Head IK + Spline IK + Legs + Front Legs + Arms + Wings!)
                 rig_meta, rig_slots = _get_arm_rig_meta_and_slots(arm)
                 has_torso_ik = ("torso_ik" in rig_slots) and ("hfw_ik_fk_torso" in arm)
+                has_head_ik = ("head_ik" in rig_slots) and ("hfw_ik_fk_head" in arm)
+                has_spline_ik = ("spline_ik" in rig_slots) and ("hfw_ik_fk_spline" in arm)
                 flegs_ik_nm = rig_slots.get("front_legs_ik", "")
                 flegs_fk_nm = rig_slots.get("front_legs_fk", "")
                 has_flegs = bool(flegs_ik_nm in arm.data.collections or flegs_fk_nm in arm.data.collections)
@@ -1757,7 +1803,8 @@ class HFW_PT_MainPanel(Panel):
                 flegs_lbl = re.sub(r"\s+(IK|FK)$", "", flegs_ik_nm).strip() or "Front Legs"
                 legs_lbl = re.sub(r"\s+(IK|FK)$", "", legs_ik_nm).strip() or "Legs"
                 arms_lbl = re.sub(r"\s+(IK|FK)$", "", arms_ik_nm).strip() or "Arms"
-                if has_torso_ik or has_flegs or has_legs or has_arms or has_wings_ik:
+                spline_lbl = re.sub(r"\s+Spline\s+IK$", "", rig_slots.get("spline_ik", "Spline")).strip() or "Spline"
+                if has_torso_ik or has_head_ik or has_spline_ik or has_flegs or has_legs or has_arms or has_wings_ik:
                     ikbox = rbox.box()
                     ikbox.label(text="IK / FK Switches (Auto-Snaps Pose)", icon="CON_KINEMATIC")
                     if has_torso_ik:
@@ -1770,6 +1817,30 @@ class HFW_PT_MainPanel(Panel):
                         ot2 = trow.operator("hfw_toolkit.switch_limb_ik_fk", text="Hood FK" if is_hood_mode else "Spine FK", depress=not t_is_ik)
                         ot2.group = "torso"; ot2.to_ik = False; ot2.snap_pose = True
                         ikbox.prop(arm, '["hfw_ik_fk_torso"]', text="Hood FK <-> Hood IK" if is_hood_mode else "Spine FK <-> Chest IK", slider=True)
+                    if has_head_ik:
+                        h_is_ik = float(arm["hfw_ik_fk_head"]) >= 0.5
+                        hrow = ikbox.row(align=True)
+                        hrow.label(text="Head:")
+                        oh1 = hrow.operator("hfw_toolkit.switch_limb_ik_fk", text="Head IK", depress=h_is_ik)
+                        oh1.group = "head"; oh1.to_ik = True; oh1.snap_pose = True
+                        oh2 = hrow.operator("hfw_toolkit.switch_limb_ik_fk", text="Neck FK", depress=not h_is_ik)
+                        oh2.group = "head"; oh2.to_ik = False; oh2.snap_pose = True
+                        if h_is_ik and "hfw_head_ik_space" in arm:
+                            ikbox.prop(arm, '["hfw_head_ik_space"]', text="Head Space: Chest <-> World", slider=True)
+                    if has_spline_ik:
+                        sp_is_ik = float(arm["hfw_ik_fk_spline"]) >= 0.5
+                        sprow = ikbox.row(align=True)
+                        sprow.label(text=f"{spline_lbl}:")
+                        os1 = sprow.operator("hfw_toolkit.switch_limb_ik_fk", text="Spline IK", depress=sp_is_ik)
+                        os1.group = "spline"; os1.to_ik = True; os1.snap_pose = True
+                        os2 = sprow.operator("hfw_toolkit.switch_limb_ik_fk", text="FK", depress=not sp_is_ik)
+                        os2.group = "spline"; os2.to_ik = False; os2.snap_pose = True
+                        ikbox.prop(arm, '["hfw_ik_fk_spline"]', text=f"{spline_lbl} FK <-> Spline IK", slider=True)
+                        wprow = ikbox.row(align=True)
+                        op_wv = wprow.operator("hfw_toolkit.pose_serpent_wave", text="S-Wave Pose", icon="MOD_WAVE")
+                        op_wv.style = "wave"
+                        op_cl = wprow.operator("hfw_toolkit.pose_serpent_wave", text="Coil Pose", icon="FORCE_VORTEX")
+                        op_cl.style = "coil"
                     if has_flegs and "hfw_ik_fk_front_legs" in arm:
                         fl_is_ik = float(arm["hfw_ik_fk_front_legs"]) >= 0.5
                         flrow = ikbox.row(align=True)
@@ -1807,6 +1878,25 @@ class HFW_PT_MainPanel(Panel):
                         ow2.group = "wings"; ow2.to_ik = False; ow2.snap_pose = True
                         ikbox.prop(arm, '["hfw_ik_fk_wings"]', text="Wings FK<->IK", slider=True)
 
+                # 2b. Chainsaws & Drills / Grinders Auto-Spin Controls (shown when rig has chainsaws or rotary drills!)
+                has_saws = bool(rig_meta.get("has_chainsaws")) and ("hfw_saw_speed" in arm)
+                has_drills = bool(rig_meta.get("has_spinners")) and ("hfw_drill_speed" in arm)
+                if has_saws or has_drills:
+                    spbox = rbox.box()
+                    spbox.label(text="Chainsaws & Rotary Drills (Play to Spin)", icon="MOD_SCREW")
+                    if has_saws:
+                        s_on = abs(float(arm["hfw_saw_speed"])) > 0.05
+                        sr = spbox.row(align=True)
+                        sr.prop(arm, '["hfw_saw_speed"]', text="Saw Speed", slider=True)
+                        op_sv = sr.operator("hfw_toolkit.toggle_spin_speed", text="Stop" if s_on else "Rev", depress=s_on)
+                        op_sv.prop_key = "hfw_saw_speed"; op_sv.target_speed = 1.0
+                    if has_drills:
+                        d_on = abs(float(arm["hfw_drill_speed"])) > 0.05
+                        dr = spbox.row(align=True)
+                        dr.prop(arm, '["hfw_drill_speed"]', text="Drill Speed", slider=True)
+                        op_dv = dr.operator("hfw_toolkit.toggle_spin_speed", text="Stop" if d_on else "Spin", depress=d_on)
+                        op_dv.prop_key = "hfw_drill_speed"; op_dv.target_speed = 1.0
+
                 # 3. Dynamically Named Control Categories (Show / Hide by Actual Controlled Parts!)
                 cbox_cat = rbox.box()
                 chdr = cbox_cat.row(align=True)
@@ -1816,8 +1906,8 @@ class HFW_PT_MainPanel(Panel):
                 cat_grid = cbox_cat.grid_flow(columns=2, align=True)
                 shown_colls: set[str] = set()
                 for skey in (
-                    "body", "torso_ik", "hood_fk", "spine_fk", "tail", "appendages",
-                    "wings_ik", "wings_fk", "hands_feet", "frills", "weapons", "plates",
+                    "body", "head_ik", "torso_ik", "hood_fk", "spline_ik", "spine_fk", "tail", "appendages",
+                    "wings_ik", "wings_fk", "hands_feet", "hf_tweaks", "spinners", "frills", "weapons", "plates",
                     "front_legs_ik", "front_legs_fk", "legs_ik", "legs_fk", "arms_ik", "arms_fk",
                 ):
                     cname = rig_slots.get(skey)
@@ -1859,6 +1949,12 @@ class HFW_PT_MainPanel(Panel):
                 if has_chest:
                     op_ch = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Hood" if is_hood_mode else "Chest", icon="MESH_TORUS")
                     op_ch.group = "chest"
+                if has_head_ik:
+                    op_hd = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Head", icon="USER")
+                    op_hd.group = "head"
+                if rig_meta.get("spline_ctrls"):
+                    op_sp = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Spline", icon="CURVE_BEZCURVE")
+                    op_sp.group = "spline"
                 if len(rig_meta.get("neck_ctrls") or ()) >= 2:
                     op_nk = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Neck", icon="CURVE_BEZCURVE")
                     op_nk.group = "neck"
@@ -1872,6 +1968,9 @@ class HFW_PT_MainPanel(Panel):
                     app_btn = rig_slots.get("appendages", "Trunk").replace(" FK", "")
                     op_a = qrow.operator("hfw_toolkit.select_ctrl_chain", text=app_btn, icon="CURVE_BEZCURVE")
                     op_a.group = "appendages"
+                if rig_meta.get("curl_ctrls"):
+                    op_cu = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Curls", icon="HAND")
+                    op_cu.group = "curls"
                 op_s = qrow.operator("hfw_toolkit.select_ctrl_chain", text="Spine", icon="MOD_CURVE")
                 op_s.group = "spine"
 
@@ -2009,6 +2108,8 @@ _CLASSES = (
     HFW_OT_BakeControlRigToDeform,
     HFW_OT_ResetControlRigPose,
     HFW_OT_MirrorControlRigPose,
+    HFW_OT_PoseSerpentWave,
+    HFW_OT_ToggleSpinSpeed,
     HFW_OT_ScanAnimations,
     HFW_OT_SelectVisibleAnimations,
     HFW_OT_ImportAnimationsToActiveRig,

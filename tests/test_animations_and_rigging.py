@@ -109,10 +109,13 @@ def test_ea08_humanoid_remap_onto_aloy_1881j(game_and_catalog):
     aspec = analyze_rig_chains(_skel_specs(aloy.skeleton))
     assert aspec["archetype"] == "humanoid"
     assert aspec["chest"] == "C_Spine_sjnt_4"
+    assert aspec["head_ik_supported"] is True
     assert "C_ChestOri_fjnt_0" not in aspec["spine"]
     aloy_labels = compute_dynamic_collection_labels(aspec)
     assert aloy_labels["body"] == "Torso, Chest & Head"
+    assert aloy_labels["head_ik"] == "Head & Neck IK"
     assert aloy_labels["hands_feet"] == "Fingers & Toes"
+    assert aloy_labels["hf_tweaks"] == "Fingers & Toes Tweaks"
     assert aloy_labels["frills"] == "Belt Flaps"
     assert aloy_labels["weapons"] == "Weapon Sockets"
     assert aloy_labels["arms_ik"] == "Arms IK"
@@ -170,6 +173,10 @@ def test_universal_control_rig_chain_detection(game_and_catalog, query, expected
         assert dyn["torso_ik"] == "Cobra Hood IK"
         assert dyn["hood_fk"] == "Cobra Hood FK"
         assert dyn["frills"] == "Hood Feathers"
+        assert any(s.get("kind") == "spine" for s in spec.get("spline_chains") or [])
+        assert dyn["spline_ik"] == "Serpent Spline IK"
+        assert len(spec.get("spinners") or []) >= 40
+        assert dyn["spinners"] in ("Earthgrinders", "Drills & Grinders")
     if query == "behemoth":
         assert spec["chest"] == "C_Chest_sjnt_0"
         assert dyn["front_legs_ik"] == "Front Legs IK"
@@ -182,6 +189,7 @@ def test_universal_control_rig_chain_detection(game_and_catalog, query, expected
     if query == "tremortusk":
         assert spec["appendages"] and spec["appendages"][0]["name"] == "Trunk"
         assert dyn["appendages"] == "Trunk FK"
+        assert any(s.get("kind") == "appendage" and s.get("name") == "Trunk" for s in spec.get("spline_chains") or [])
     if query == "bilegut":
         assert spec["appendages"] and spec["appendages"][0]["name"] == "Tongue"
         assert dyn["frills"] == "Vocal Sacs"
@@ -192,10 +200,17 @@ def test_universal_control_rig_chain_detection(game_and_catalog, query, expected
     if query == "tideripper":
         assert all(lg.get("is_flipper") for lg in spec["legs"])
         assert all(ar.get("is_flipper") for ar in spec["arms"])
+        assert spec["head_ik_supported"] is True
+        assert len(spec.get("spinners") or []) >= 6
         assert dyn["arms_ik"] == "Front Flippers IK"
         assert dyn["legs_ik"] == "Rear Flippers IK"
+        assert dyn["spinners"] == "Drills & Rotors"
     if query == "clawstrider":
         assert spec["chest"] == "C_spine_sjnt_6"
+        assert spec["head_ik_supported"] is True
+        assert len(spec.get("chainsaws") or []) == 2
+        assert sum(len(c["blades"]) for c in spec["chainsaws"]) == 52
+        assert dyn["spinners"] == "Chainsaws"
         assert dyn["frills"] == "Feathers & Blades"
         assert dyn["weapons"] == "Jaw Saws & Launchers"
         assert dyn["hands_feet"] == "Claws & Talons"
@@ -233,6 +248,10 @@ def test_blender_control_rig_and_bidirectional_bake_and_ue5_ast(game_and_catalog
     ast.parse(ue5_script)
     assert "build_ue5_control_rig" in ue5_script
     assert "CR_Chest" in ue5_script
+    assert "CR_IK_Head" in ue5_script
+    assert "CR_Spline_" in ue5_script
+    assert "CR_Saw_Spin_" in ue5_script
+    assert "CR_Spin_" in ue5_script
     assert "CR_Shoulder_" in ue5_script
     assert "CR_Clavicle_" in ue5_script
     assert "_Blade_" in ue5_script
@@ -405,6 +424,71 @@ assert arm.data.collections[slots["legs_fk"]].is_visible is False
 assert (arm.pose.bones["L_leg_sjnt_3"].matrix.to_translation() - foot_fk_moved).length < 0.005
 cr.reset_control_rig_pose(arm)
 
+# 1d. Verify v1.0.0 Studio Rig features: Head IK + Chest<->World Space, Master Talon Curls, Looping Chainsaws & Tail Spline IK!
+assert "CTRL_IK_Head" in arm.pose.bones and "hfw_ik_fk_head" in arm and "hfw_head_ik_space" in arm
+assert "CTRL_Saw_Spin" in arm.pose.bones and "hfw_saw_speed" in arm
+assert len(rig_meta.get("curl_ctrls") or []) >= 6
+assert len(rig_meta.get("spline_ctrls") or []) >= 4
+
+# Head IK + Chest<->World lock + zero-pop IK->FK snap
+arm["hfw_ik_fk_head"] = 1.0
+arm["hfw_head_ik_space"] = 0.0
+arm.update_tag(); bpy.context.view_layer.update()
+hd_r0 = arm.pose.bones["C_head_sjnt_0"].matrix.to_translation().copy()
+arm.pose.bones["CTRL_IK_Head"].location = (0.30, 0.35, 0.20)
+arm.update_tag(); bpy.context.view_layer.update()
+hd_ik_p = arm.pose.bones["C_head_sjnt_0"].matrix.to_translation().copy()
+assert (hd_ik_p - hd_r0).length > 0.20
+cr.switch_limb_ik_fk(arm, group="head", to_ik=False, snap_pose=True)
+assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - hd_ik_p).length < 0.015
+arm["hfw_ik_fk_head"] = 1.0; arm["hfw_head_ik_space"] = 1.0
+arm.pose.bones["CTRL_IK_Head"].location = (0.0, 0.0, 0.0)
+arm.update_tag(); bpy.context.view_layer.update()
+hd_w0 = arm.pose.bones["C_head_sjnt_0"].matrix.to_translation().copy()
+arm.pose.bones["CTRL_COG"].location = (0.0, 0.0, -0.30)
+arm.update_tag(); bpy.context.view_layer.update()
+assert (arm.pose.bones["C_head_sjnt_0"].matrix.to_translation() - hd_w0).length < 0.06
+arm["hfw_ik_fk_head"] = 0.0; arm["hfw_head_ik_space"] = 0.0
+cr.reset_control_rig_pose(arm)
+
+# Looping Mouth Chainsaws (auto-spin speed AND manual dial, zero drift at rest!)
+saw_teeth = [pb.name for pb in arm.pose.bones if not pb.name.startswith(("CTRL_", "MCH_", "WGT_")) and "sawblade" in pb.name.lower()]
+assert len(saw_teeth) == 52
+bpy.context.scene.frame_set(1); arm["hfw_saw_speed"] = 0.0
+arm.update_tag(); bpy.context.view_layer.update()
+saw_p0 = {{b: arm.pose.bones[b].matrix.to_translation().copy() for b in saw_teeth}}
+arm["hfw_saw_speed"] = 1.0; arm.update_tag()
+bpy.context.scene.frame_set(15); bpy.context.view_layer.update()
+assert min((arm.pose.bones[b].matrix.to_translation() - saw_p0[b]).length for b in saw_teeth) > 0.10
+arm["hfw_saw_speed"] = 0.0; bpy.context.scene.frame_set(1)
+arm.pose.bones["CTRL_Saw_Spin"].rotation_euler = Euler((0.0, 2.0, 0.0), "XYZ")
+arm.update_tag(); bpy.context.view_layer.update()
+assert min((arm.pose.bones[b].matrix.to_translation() - saw_p0[b]).length for b in saw_teeth) > 0.08
+cr.reset_control_rig_pose(arm)
+
+# Master Finger/Talon Curl lever curls all phalanges cleanly
+curl0 = rig_meta["curl_ctrls"][0]
+arm.pose.bones[curl0].rotation_euler = Euler((1.0, 0.0, 0.0), "XYZ")
+arm.update_tag(); bpy.context.view_layer.update()
+curled_cnt = sum(
+    1 for pb in arm.pose.bones
+    if not pb.name.startswith(("CTRL_", "MCH_", "WGT_"))
+    and any(k in pb.name.lower() for k in ("finger", "toe", "claw", "talon"))
+    and math.degrees(pb.bone.matrix_local.to_quaternion().rotation_difference(pb.matrix.to_quaternion()).angle) > 15.0
+)
+assert curled_cnt >= 2
+cr.reset_control_rig_pose(arm)
+
+# Toggleable B-Bone Spline IK on Tail (rigid uniform armor scale!)
+arm["hfw_ik_fk_spline"] = 1.0; arm.update_tag(); bpy.context.view_layer.update()
+t_tip0 = arm.pose.bones["C_tail_sjnt_7"].matrix.to_translation().copy()
+arm.pose.bones[rig_meta["spline_ctrls"][-1]].location = (0.6, 0.0, 0.5)
+arm.update_tag(); bpy.context.view_layer.update()
+assert (arm.pose.bones["C_tail_sjnt_7"].matrix.to_translation() - t_tip0).length > 0.35
+assert max(abs(s - 1.0) for s in arm.pose.bones["C_tail_sjnt_7"].matrix.to_scale()) < 0.005
+arm["hfw_ik_fk_spline"] = 0.0
+cr.reset_control_rig_pose(arm)
+
 # Switch back to pure game anim before baking
 arm["hfw_rig_master"] = 0.0
 arm["hfw_ik_fk_legs"] = 1.0
@@ -416,6 +500,8 @@ bpy.context.view_layer.update()
 baked_ctrl = cr.bake_action_to_control_rig(arm, frame_start=18, frame_end=22, activate_baked=True)
 assert baked_ctrl is not None
 assert float(arm["hfw_rig_master"]) == 1.0
+assert float(arm["hfw_saw_speed"]) == 0.0
+assert float(arm["hfw_head_ik_space"]) == 0.0
 bpy.context.scene.frame_set(20)
 for ik_val in (1.0, 0.0):
     arm["hfw_ik_fk_legs"] = ik_val
@@ -458,3 +544,6 @@ print("BLENDER_RIG_TEST_OK")
     )
     assert proc.returncode == 0, f"Blender test failed:\nSTDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
     assert "BLENDER_RIG_TEST_OK" in proc.stdout
+    combined_log = proc.stdout + "\n" + proc.stderr
+    assert "Dependency cycle" not in combined_log
+    assert "Error in PyDriver" not in combined_log

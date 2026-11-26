@@ -2342,6 +2342,36 @@ def build_ue5_control_rig(mesh_asset):
         k_head = _add_ctrl("CR_Head", head_b, nk_parent, "Box_Thick", "C", 1.8) if head_b else None
         if k_head:
             ctrl_to_bone.append(("CR_Head", head_b))
+        if RIG_SPEC.get("head_ik_supported") and head_b and _has_bone(head_b):
+            k_hik = _add_ctrl("CR_IK_Head", head_b, k_root, "Box_Thick", "C", 2.0)
+            if k_hik:
+                ik_chains.append({{"ctrl_name": "CR_IK_Head", "ik_bones": list(RIG_SPEC.get("neck") or []), "end_bone": head_b, "is_leg": False}})
+
+        for spc in RIG_SPEC.get("spline_chains") or []:
+            sp_bs = [b for b in (spc.get("bones") or []) if _has_bone(b)]
+            if len(sp_bs) >= 5:
+                k_cnt = int(spc.get("knots", 6))
+                for ki, kb in enumerate(_sample(sp_bs, k_cnt)):
+                    kn_nm = f"CR_Spline_{{spc['name']}}_{{ki:02d}}"
+                    k_kn = _add_ctrl(kn_nm, kb, k_root if ki > 0 else (k_cog or k_root), "Circle_Thick", "C", 2.2)
+                    if k_kn:
+                        ctrl_to_bone.append((kn_nm, kb))
+
+        for spn in (RIG_SPEC.get("spinners") or [])[:12]:
+            sb = spn.get("bone")
+            if sb and _has_bone(sb):
+                sp_nm = f"CR_Spin_{{spn['name']}}"
+                k_sp = _add_ctrl(sp_nm, sb, k_head or k_cog or k_root, "Circle_Thick", spn.get("side", "C"), 1.2)
+                if k_sp:
+                    ctrl_to_bone.append((sp_nm, sb))
+
+        for cs in RIG_SPEC.get("chainsaws") or []:
+            pb_s = cs.get("parent_def")
+            if pb_s and _has_bone(pb_s):
+                sw_nm = f"CR_Saw_Spin_{{cs['name']}}"
+                k_sw = _add_ctrl(sw_nm, pb_s, k_head or k_cog or k_root, "Circle_Thick", cs.get("side", "C"), 1.4)
+                if k_sw:
+                    ctrl_to_bone.append((sw_nm, pb_s))
 
         for idx, jb in enumerate(RIG_SPEC.get("jaws") or []):
             cn = f"CR_Jaw_{{idx:02d}}"
