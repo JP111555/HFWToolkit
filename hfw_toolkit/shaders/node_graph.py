@@ -163,6 +163,7 @@ def build_decima_node_graph(
                         "target_channels": tb.target_channels,
                         "source_paths": tb.source_paths,
                         "binding_hash": f"{tb.binding_name_hash:#010x}",
+                        "preview_url": f"/api/texture/{tb.resource_id}/image?max_dim=96" if tb.resource_id else "",
                     },
                 )
             )
@@ -341,6 +342,12 @@ def build_decima_node_graph(
         "title": f"Decima Engine Shader Flow — {mat.name}",
         "nodes": nodes,
         "edges": edges,
+        "stage_frames": [
+            {"cols": [0], "title": "Inputs & Parameters", "color": "#f59e0b"},
+            {"cols": [1], "title": "Texture Samplers & UV", "color": "#22d3ee"},
+            {"cols": [2, 3], "title": "PBR & Normal Operations", "color": "#c084fc"},
+            {"cols": [4], "title": "Decima G-Buffer Targets", "color": "#f87171"},
+        ],
     }
 
 

@@ -30,6 +30,7 @@ _HASH_EYE_VB = 0x2A15D368
 _HASH_EYE_IRIS_MASK = 0x5E969132
 _HASH_GLASS_TINT_VB = 0x01943DD3
 _HASH_SAC_FLOW_MAP = 0x7C771B98
+_HASH_SAC_FLOW_MAP_ALT = 0x21F95B28
 _HASH_SAC_FLUID_TEX = 0x23FE87DB
 _HASH_SAC_COLOR_VB = 0x249F1E74
 _HASH_EMISSIVE_TINT_VB = 0x0E470C22
@@ -91,7 +92,7 @@ def detect_ue5_animation_profile(mat: MaterialInfo) -> dict[str, Any]:
             "glow_strength": 5.5,
             "summary": "Animated glowing machine heart/core (1 Hz Abs(Sine) heartbeat + Panner energy scroll + Fresnel rim)",
         }
-    if _HASH_SAC_FLOW_MAP in tb_by_hash and _HASH_SAC_FLUID_TEX in tb_by_hash:
+    if (_HASH_SAC_FLOW_MAP in tb_by_hash or _HASH_SAC_FLOW_MAP_ALT in tb_by_hash) and _HASH_SAC_FLUID_TEX in tb_by_hash:
         col = [0.14, 0.68, 1.0]
         if _HASH_SAC_COLOR_VB in vb_by_hash:
             f4 = vb_by_hash[_HASH_SAC_COLOR_VB].float4
@@ -181,6 +182,7 @@ def generate_ue5_clipboard_t3d(mat: MaterialInfo, has_weather: bool = True) -> s
         for vb in pt.variable_bindings:
             if vb.binding_name_hash == 0x3806EAE3 and 1.5 <= vb.float4[0] <= 128.0:
                 detail_tile = vb.float4[0]
+    detail_tile = min(72.0, max(24.0, detail_tile * 2.25)) if detail_tile < 24.0 else min(96.0, detail_tile * 1.45)
 
     anim = detect_ue5_animation_profile(mat)
     safe = _ue_safe(mat.name)
@@ -393,6 +395,7 @@ def generate_ue5_python_script(
         for vb in pt.variable_bindings:
             if vb.binding_name_hash == 0x3806EAE3 and 1.5 <= vb.float4[0] <= 128.0:
                 detail_tile = vb.float4[0]
+    detail_tile = min(72.0, max(24.0, detail_tile * 2.25)) if detail_tile < 24.0 else min(96.0, detail_tile * 1.45)
 
     anim = detect_ue5_animation_profile(mat)
     safe = _ue_safe(mat.name)
@@ -1088,7 +1091,19 @@ def build_single_material(slot_name: str, meta: dict):
                 l_rghs.append((_const(mat, 0.42 if is_m else 0.78, -1340, 2200 + idx * 90), ""))
                 l_nrms.append((n_flat_xy, ""))
             else:
-                dye_lin = lay.get("dye_color_linear") or _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
+                raw_dye = lay.get("dye_color_linear")
+                raw_f0 = lay.get("f0_rgb")
+                if is_m:
+                    d_mx = max(raw_dye[:3]) if (raw_dye and len(raw_dye) >= 3) else 0.0
+                    f_mx = max(raw_f0[:3]) if (raw_f0 and len(raw_f0) >= 3) else 0.0
+                    if f_mx > max(0.18, d_mx * 1.30):
+                        dye_lin = [max(0.14, min(0.96, float(c))) for c in raw_f0[:3]]
+                    elif d_mx >= 0.16:
+                        dye_lin = list(raw_dye[:3])
+                    else:
+                        dye_lin = _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
+                else:
+                    dye_lin = raw_dye or _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
                 tint_v = _vec(mat, f"L{{idx}}_{{lname}}_Dye", dye_lin, -1560, -560 + idx * 260)
                 # CRITICAL: HFW `Shaders_HRZ2/Materials/*_CLR` is Linear `0.5`-centered (`is_srgb=False`) -> pow(2.0 * tex, 2.2) * Dye!
                 c_tex = import_texture(lay.get("color_file", ""), is_srgb=False, is_normal=False)
@@ -1746,15 +1761,21 @@ def build_single_material(slot_name: str, meta: dict):
         okind = overlay.get("kind", "")
         n_t = _time_scaled(mat, -1100, 960)
 
-        if okind == "elemental_sack_overlay" and "Mask" in sockets:
-            # Exact DXIL mat_id==0 * Mask_Alpha + True Dual-Phase Flow Map (172:0) + Caustics (1703:0) + Fresnel + Wet Specular!
-            n_is0 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 0.0, -560, 820)
-            sac_mask = n_is0
-            if "Mask_Alpha" in sockets:
-                n_sm = _mk(mat, unreal.MaterialExpressionMultiply, -380, 840)
-                mel.connect_material_expressions(n_is0, "", n_sm, "A")
-                mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_sm, "B")
-                sac_mask = n_sm
+        if okind == "elemental_sack_overlay" and ("Mask" in sockets or float(overlay.get("mask_id", 0.0)) < 0.0):
+            # Exact DXIL mat_id==0 / mat_id==20 / full Mask_Alpha + True Dual-Phase Flow Map (172:0) + Caustics (1703:0) + Fresnel!
+            sac_mid = float(overlay.get("mask_id", 0.0))
+            if sac_mid >= 0.0 and "Mask" in sockets:
+                n_is0 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], sac_mid, -560, 820)
+                sac_mask = n_is0
+                if "Mask_Alpha" in sockets:
+                    n_sm = _mk(mat, unreal.MaterialExpressionMultiply, -380, 840)
+                    mel.connect_material_expressions(n_is0, "", n_sm, "A")
+                    mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_sm, "B")
+                    sac_mask = n_sm
+            elif "Mask_Alpha" in sockets:
+                sac_mask = sockets["Mask_Alpha"][0]
+            else:
+                sac_mask = _const(mat, 1.0, -380, 840)
 
             # Dual-phase flow-map time: phase0 = frac(t*spd + 0.5)*2-1, phase1 = frac(t*spd + 1.0)*2-1, blend = abs(phase0)
             n_fspd = _scalar(mat, "FlowSpeed", float(overlay.get("flow_speed", 0.35)), -1580, 1040)
@@ -1874,7 +1895,7 @@ def build_single_material(slot_name: str, meta: dict):
             mel.connect_material_expressions(n_m2, "", n_em, "B")
             mel.connect_material_property(n_em, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
-            # Blend smooth wet glossy membrane roughness (0.12) onto sac regions!
+            # Blend smooth wet glossy membrane roughness (0.12), luminous liquid diffuse albedo, and dielectric Metallic=0 onto sac regions!
             if "Roughness" in sockets:
                 n_inv_s = _mk(mat, unreal.MaterialExpressionOneMinus, -220, -40)
                 mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_inv_s, "")
@@ -1883,6 +1904,22 @@ def build_single_material(slot_name: str, meta: dict):
                 mel.connect_material_expressions(n_inv_s, "", n_wrg, "A")
                 mel.connect_material_expressions(sac_mask, "", n_wrg, "Alpha")
                 mel.connect_material_property(n_wrg, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            n_sbc_tint = _mk(mat, unreal.MaterialExpressionMultiply, 260, -240)
+            n_sbc_tint.set_editor_property("const_b", 0.68)
+            mel.connect_material_expressions(n_gc, "", n_sbc_tint, "A")
+            if base_color_expr is not None:
+                n_sbc_mix = _mk(mat, unreal.MaterialExpressionLinearInterpolate, 440, -200)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_sbc_mix, "A")
+                mel.connect_material_expressions(n_sbc_tint, "", n_sbc_mix, "B")
+                mel.connect_material_expressions(sac_mask, "", n_sbc_mix, "Alpha")
+                mel.connect_material_property(n_sbc_mix, "", unreal.MaterialProperty.MP_BASE_COLOR)
+            if "Reflectance" in sockets and sprof not in _DIELECTRIC_PROFILES:
+                n_inv_sm = _mk(mat, unreal.MaterialExpressionOneMinus, 260, 260)
+                mel.connect_material_expressions(sac_mask, "", n_inv_sm, "")
+                n_smet = _mk(mat, unreal.MaterialExpressionMultiply, 440, 260)
+                mel.connect_material_expressions(n_met, "", n_smet, "A")
+                mel.connect_material_expressions(n_inv_sm, "", n_smet, "B")
+                mel.connect_material_property(n_smet, "", unreal.MaterialProperty.MP_METALLIC)
 
         elif okind == "canister_emissive_overlay" and "Mask" in sockets:
             n_is1 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 1.0, -560, 820)
@@ -2034,9 +2071,28 @@ def build_single_material(slot_name: str, meta: dict):
     # Surface Profile refinements for Characters (Skin SSS, Hair, Brows/Lashes, Peach Fuzz, Eyes, Cloth) and General Assets (Foliage, Glass)!
     sprof = meta.get("surface_profile", "pbr")
     if sprof == "peach_fuzz":
+        # Backlit grazing-angle vellus facial hair (Fresnel^3.4 * PeachFuzzIntensity) matching Blender Cycles!
         mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
-        n_op = _scalar(mat, "PeachFuzzOpacity", 0.0, -360, 620)
-        mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+        mat.set_editor_property("two_sided", True)
+        try:
+            mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_SUBSURFACE)
+        except Exception:
+            pass
+        n_pf_col = _vec(mat, "PeachFuzzColor", [0.82, 0.64, 0.50], -620, 480)
+        n_pf_fr = _mk(mat, unreal.MaterialExpressionFresnel, -620, 620)
+        n_pf_fr.set_editor_property("exponent", 3.4)
+        n_pf_int = _scalar(mat, "PeachFuzzIntensity", float(meta.get("peach_fuzz_intensity", 0.45)), -620, 740)
+        n_pf_op = _mk(mat, unreal.MaterialExpressionMultiply, -380, 660)
+        mel.connect_material_expressions(n_pf_fr, "", n_pf_op, "A")
+        mel.connect_material_expressions(n_pf_int, "", n_pf_op, "B")
+        n_pf_rgh = _scalar(mat, "PeachFuzzRoughness", 0.52, -380, 560)
+        mel.connect_material_property(n_pf_col, "", unreal.MaterialProperty.MP_BASE_COLOR)
+        mel.connect_material_property(n_pf_rgh, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        mel.connect_material_property(n_pf_op, "", unreal.MaterialProperty.MP_OPACITY)
+        try:
+            mel.connect_material_property(n_pf_col, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+        except Exception:
+            pass
     elif sprof == "hair_face":
         mat.set_editor_property("two_sided", True)
         if "Color" not in sockets:
@@ -2051,8 +2107,18 @@ def build_single_material(slot_name: str, meta: dict):
     elif sprof == "skin":
         try:
             mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_SUBSURFACE)
-            n_sss = _vec(mat, "SkinSubsurfaceColor", [0.85, 0.30, 0.20], -360, 620)
+            n_sss = _vec(mat, "SkinSubsurfaceColor", [0.85, 0.28, 0.16], -360, 620)
             mel.connect_material_property(n_sss, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+            tra_f = meta.get("translucency_file", "")
+            if tra_f:
+                tra_tex = import_texture(tra_f, is_srgb=False, is_normal=False)
+                if tra_tex:
+                    n_tra = _tex_node(mat, "SkinTranslucencyAmount", tra_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -620, 740)
+                    n_tra_op = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -360, 740)
+                    n_tra_op.set_editor_property("const_a", 0.18)
+                    n_tra_op.set_editor_property("const_b", 0.85)
+                    mel.connect_material_expressions(n_tra, "R", n_tra_op, "Alpha")
+                    mel.connect_material_property(n_tra_op, "", unreal.MaterialProperty.MP_OPACITY)
         except Exception:
             pass
     elif sprof == "hair":
@@ -2085,6 +2151,20 @@ def build_single_material(slot_name: str, meta: dict):
             mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_CLEAR_COAT)
             n_er = _scalar(mat, "EyeRoughness", 0.04, -360, 620)
             mel.connect_material_property(n_er, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            iris_lin = meta.get("iris_color_linear")
+            if iris_lin and base_color_expr is not None:
+                n_ic = _vec(mat, "IrisColor", [min(1.0, float(c) * 2.25) for c in iris_lin[:3]], -620, 480)
+                n_im = _mk(mat, unreal.MaterialExpressionMultiply, -380, 460)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_im, "A")
+                mel.connect_material_expressions(n_ic, "", n_im, "B")
+                n_il = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -200, 460)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_il, "A")
+                mel.connect_material_expressions(n_im, "", n_il, "B")
+                if "Mask" in sockets:
+                    mel.connect_material_expressions(sockets["Mask"][0], "G", n_il, "Alpha")
+                else:
+                    n_il.set_editor_property("const_alpha", 0.55)
+                mel.connect_material_property(n_il, "", unreal.MaterialProperty.MP_BASE_COLOR)
         except Exception:
             pass
     elif sprof == "eye_wet":

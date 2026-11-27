@@ -56,22 +56,22 @@ def _resolve_default_toolkit_dir() -> str:
 DEFAULT_TOOLKIT_DIR = _resolve_default_toolkit_dir()
 
 # Authentic Horizon Forbidden West Muscle & Eye Color Presets (Linear RGB)
+# Lore-accurate decoupling: Overridden machines change ONLY eyes to Cyan — muscles only change on Apex/Corrupted!
 MUSCLE_PRESETS: dict[str, tuple[float, float, float]] = {
-    "STANDARD": (0.85, 0.24, 0.04),   # Warm HFW Standard Amber-Orange
-    "APEX": (0.58, 0.07, 0.96),       # Authentic HFW Apex Purple-Violet
-    "OVERRIDDEN": (0.04, 0.56, 1.00), # Aloy Overridden Electric Cyan
-    "CORRUPTED": (0.95, 0.05, 0.04),  # Hades / Corrupted Crimson Red
-    "PLASMA": (0.52, 0.06, 1.00),     # Slaughterspine Plasma Violet
+    "STANDARD": (0.95, 0.28, 0.02),   # Warm HFW Standard Amber-Orange
+    "APEX": (0.54, 0.05, 1.00),       # Authentic HFW Apex Purple-Violet
+    "CORRUPTED": (1.00, 0.05, 0.01),  # Hades / Corrupted Crimson Red
+    "PLASMA": (0.46, 0.05, 1.00),     # Slaughterspine Plasma Violet
     "ACID": (0.36, 0.85, 0.06),       # Acid / Bilegut Toxic Lime
 }
 
 EYE_PRESETS: dict[str, tuple[float, float, float]] = {
-    "PATROL_BLUE": (0.06, 0.42, 1.00),   # Unaware Patrol Blue
+    "PATROL_BLUE": (0.04, 0.56, 1.00),   # Unaware Patrol Blue
     "SUSPICIOUS": (1.00, 0.72, 0.04),    # Suspicious Alert Yellow
-    "HOSTILE_RED": (1.00, 0.05, 0.03),   # Hostile Combat Red
-    "OVERRIDDEN": (0.03, 0.72, 1.00),    # Overridden Blue-Cyan
-    "APEX_PURPLE": (0.70, 0.10, 1.00),   # Apex Machine Violet
-    "CORRUPTED": (0.95, 0.02, 0.06),     # Corrupted Crimson
+    "HOSTILE_RED": (1.00, 0.06, 0.02),   # Hostile Combat Red
+    "OVERRIDDEN": (0.03, 0.82, 1.00),    # Overridden Electric Cyan (Eyes ONLY!)
+    "APEX_PURPLE": (0.64, 0.05, 1.00),   # Apex Machine Violet
+    "CORRUPTED": (1.00, 0.04, 0.02),     # Corrupted Crimson
 }
 
 

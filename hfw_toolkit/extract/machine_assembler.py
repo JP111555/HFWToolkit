@@ -17,10 +17,10 @@ from typing import Any
 
 import numpy as np
 
-from hfw_toolkit.decima.catalog import AssetCatalog
+from hfw_toolkit.decima.catalog import AssetCatalog, MACHINE_CODENAMES
 from hfw_toolkit.decima.reader import ObjectId, UUIDRef
 from hfw_toolkit.decima.streaming_graph import HFWGame
-from hfw_toolkit.extract.materials import MaterialInfo, parse_material
+from hfw_toolkit.extract.materials import MaterialInfo, apply_shader_overrides, parse_material
 from hfw_toolkit.extract.meshes import DecodedMesh, decode_mesh_hierarchy
 from hfw_toolkit.extract.skeleton import (
     SkeletonData,
@@ -73,6 +73,8 @@ class MachineAssembly:
     materials: dict[str, MaterialInfo] = field(default_factory=dict)  # material_id -> MaterialInfo
     official_variant_name: str = ""
     official_variant_description: str = ""
+    shader_override_count: int = 0
+    shader_override_resource_ids: list[str] = field(default_factory=list)
 
 
 def _classify_part_collection(name: str, is_skinned: bool, is_alt_state: bool) -> str:
@@ -262,6 +264,222 @@ def _extract_collectable_robot_info(
     return result
 
 
+def collect_variant_shader_overrides(
+    game: HFWGame,
+    variant_group_id: int,
+) -> tuple[dict[int, ObjectId], dict[int, dict[str, Any]], list[str]]:
+    """Collect Decima `RenderEffectShaderOverridesResource` texture & variable overrides for a variant group.
+
+    Fast (<5ms): uses `game.graph.group_types(gid)` to only read groups that actually contain
+    `RenderEffectShaderOverridesResource` across depth 0..2 subgroups (skipping shared root groups <= 20).
+    """
+    tex_overrides: dict[int, ObjectId] = {}
+    var_overrides: dict[int, dict[str, Any]] = {}
+    override_ids: list[str] = []
+
+    visited: set[int] = {variant_group_id}
+    frontier: list[int] = [variant_group_id]
+    candidate_gids: list[int] = []
+
+    for depth in range(3):
+        nxt: list[int] = []
+        for g in frontier:
+            try:
+                gmeta = game.graph.group(g)
+            except Exception:
+                continue
+            if gmeta.num_objects > 12_000:
+                continue
+            if "RenderEffectShaderOverridesResource" in game.graph.group_types(g):
+                candidate_gids.append(g)
+            if depth < 2:
+                for sg in game.graph.group_subgroups(g):
+                    if sg not in visited and sg > 20:
+                        visited.add(sg)
+                        nxt.append(sg)
+        frontier = nxt[:240]
+
+    for cg in candidate_gids:
+        try:
+            # Must read with read_subgroups=True so external/subgroup TextureResource refs populate!
+            objs = game.read_group(cg, read_subgroups=True)
+        except Exception:
+            continue
+        for o in objs:
+            if o.get("_type") != "RenderEffectShaderOverridesResource":
+                continue
+            oid_str = str(o.get("_id", ""))
+            if oid_str and oid_str not in override_ids:
+                override_ids.append(oid_str)
+            so = o.get("ShaderOverrides") or {}
+            for tb in so.get("ShaderTextureOverrides", ()):
+                bh = int(tb.get("BindingNameHash", 0))
+                tr = tb.get("TextureResource")
+                if not bh or tr is None or bh in tex_overrides:
+                    continue
+                if isinstance(tr, dict) and tr.get("_id") is not None:
+                    tex_overrides[bh] = tr
+                else:
+                    tid = getattr(tr, "target_id", None)
+                    if tid is not None:
+                        tex_overrides[bh] = tid
+                    else:
+                        resolved = game.resolve_ref(tr)
+                        if isinstance(resolved, dict) and resolved.get("_id") is not None:
+                            tex_overrides[bh] = resolved
+            for vb in so.get("ShaderVariableOverrides", ()):
+                bh = int(vb.get("BindingNameHash", 0))
+                if bh and bh not in var_overrides:
+                    var_overrides[bh] = dict(vb)
+
+    return tex_overrides, var_overrides, override_ids
+
+
+def _has_variant_shader_overrides_fast(game: HFWGame, variant_group_id: int) -> bool:
+    """Zero-I/O graph-metadata check (<0.1ms) for `RenderEffectShaderOverridesResource` in depth 0..2 subgroups."""
+    visited: set[int] = {variant_group_id}
+    frontier: list[int] = [variant_group_id]
+    for depth in range(3):
+        nxt: list[int] = []
+        for g in frontier:
+            try:
+                gmeta = game.graph.group(g)
+            except Exception:
+                continue
+            if gmeta.num_objects > 12_000:
+                continue
+            if "RenderEffectShaderOverridesResource" in game.graph.group_types(g):
+                return True
+            if depth < 2:
+                for sg in game.graph.group_subgroups(g):
+                    if sg not in visited and sg > 20:
+                        visited.add(sg)
+                        nxt.append(sg)
+        frontier = nxt[:240]
+    return False
+
+
+_ALL_KNOWN_SPECIES_NAMES: frozenset[str] = frozenset(v.lower() for v in MACHINE_CODENAMES.values())
+
+# Shared-chassis ControlledEntityResource groups that legitimately host multiple subspecies
+_ALLOWED_SHARED_SPECIES: dict[int, frozenset[str]] = {
+    4262: frozenset({"grazer", "fanghorn", "lancehorn"}),
+    2911: frozenset({"charger", "strider", "lancehorn"}),
+    3385: frozenset({"plowhorn", "grimhorn"}),
+    1587: frozenset({"clawstrider"}),
+}
+
+
+def _infer_base_species_names(game: HFWGame, entity_oid: ObjectId, smr: dict[str, Any] | None) -> set[str]:
+    """Infer the canonical HFW species display name(s) belonging to this entity's own CE/SMR group."""
+    if entity_oid.group_id in _ALLOWED_SHARED_SPECIES:
+        return set(_ALLOWED_SHARED_SPECIES[entity_oid.group_id])
+    species: set[str] = set()
+    # 1. Check CE's own CollectableRobotComponentResource if present
+    cr_name, _, _ = _extract_collectable_robot_info(game, entity_oid.group_id)
+    if cr_name:
+        low = cr_name.lower()
+        for sp in _ALL_KNOWN_SPECIES_NAMES:
+            if sp in low:
+                species.add(sp)
+    # 2. Check TextureSet paths in CE and SMR groups (and 1-hop small subgroups)
+    scan_gids: list[int] = [entity_oid.group_id]
+    if smr is not None:
+        sg = smr["_id"].group_id
+        if sg not in scan_gids:
+            scan_gids.append(sg)
+    for base_g in list(scan_gids):
+        for sub in game.graph.group_subgroups(base_g):
+            if sub > 20 and sub not in scan_gids and "TextureSet" in game.graph.group_types(sub):
+                if game.graph.group(sub).num_objects < 400:
+                    scan_gids.append(sub)
+    for g in scan_gids[:12]:
+        try:
+            objs = game.read_group(g, read_subgroups=False)
+        except Exception:
+            continue
+        for o in objs:
+            if o.get("_type") != "TextureSet":
+                continue
+            for desc in o.get("TextureDesc", ()):
+                p = str(desc.get("Path", "")).lower().replace("\\", "/")
+                if "models/characters/robots/" not in p:
+                    continue
+                after = p.split("models/characters/robots/", 1)[1]
+                code = after.split("/", 1)[0]
+                if code in ("dlc1", "shared", "common", "generic", "canisters", "weapons"):
+                    if "inferno" in p or "firebear" in p:
+                        code = "infernobear"
+                    elif "cryo" in p or "frost" in p:
+                        code = "cryobear"
+                    else:
+                        continue
+                if code in MACHINE_CODENAMES:
+                    species.add(MACHINE_CODENAMES[code].lower())
+    return species
+
+
+def _dr_matches_skeleton(
+    game: HFWGame,
+    dr: dict[str, Any],
+    base_joint_uuids: set[str],
+    base_joint_names: set[str],
+    base_helper_names: set[str],
+    local_objs: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Fast local-only validation that a `DestructibilityResource`'s parts attach to `base_skel` (zero subgroup I/O!)."""
+    if not base_joint_uuids and not base_joint_names:
+        return True
+    cp = dr.get("ConvertedParts", ())
+    if not cp:
+        return False
+    dr_gid = dr["_id"].group_id if dr.get("_id") is not None else -1
+
+    def _local_resolve(ref: Any) -> dict[str, Any] | None:
+        if isinstance(ref, dict):
+            return ref
+        if ref is None:
+            return None
+        # Only dereference already-resolved `.target` or same-group objects (NEVER trigger recursive subgroup reads!)
+        tgt = getattr(ref, "target", None)
+        if isinstance(tgt, dict):
+            return tgt
+        tid = getattr(ref, "target_id", None)
+        if tid is not None and local_objs is not None and tid.group_id == dr_gid and 0 <= tid.object_index < len(local_objs):
+            return local_objs[tid.object_index]
+        return None
+
+    checked = 0
+    matched = 0
+    for pref in cp[:32]:
+        dp = _local_resolve(pref)
+        if not isinstance(dp, dict):
+            continue
+        jref = dp.get("AttachToJointID")
+        juuid = jref.uuid if isinstance(jref, UUIDRef) else None
+        bname = str(dp.get("BoneName", "") or "")
+        if not juuid and not bname:
+            st = _local_resolve(dp.get("InitialState"))
+            mpr = _local_resolve(st.get("ModelPartResource")) if isinstance(st, dict) else None
+            if isinstance(mpr, dict):
+                mj = mpr.get("AttachToJointID")
+                juuid = mj.uuid if isinstance(mj, UUIDRef) else None
+                bname = str(mpr.get("HelperNode", "") or "")
+        if not juuid and not bname:
+            continue
+        checked += 1
+        bclean = bname.removesuffix("_Lx_helper").removesuffix("_Cx_helper").removesuffix("_helper")
+        if (
+            (juuid and juuid in base_joint_uuids)
+            or (bname and (bname in base_joint_names or bname in base_helper_names))
+            or (bclean and (bclean in base_joint_names or bclean in base_helper_names))
+        ):
+            matched += 1
+    if checked >= 3:
+        return (matched / checked) >= 0.25
+    return True
+
+
 def discover_machine_variants(
     game: HFWGame,
     entity_oid: ObjectId,
@@ -407,6 +625,32 @@ def discover_machine_variants(
             return best_sub_smr
         return smr
 
+    # Build base skeleton joint/helper signature sets to reject cross-species DestructibilityResources
+    # (e.g. Bilegut 85-part DR inside Stingspawn egg-spawner supergroups, Dreadwing 95-part DR inside Stormbird duo supergroups!)
+    base_joint_uuids: set[str] = set()
+    base_joint_names: set[str] = set()
+    base_helper_names: set[str] = set()
+    if base_skel is not None:
+        for j in base_skel.get("Joints", ()):
+            jid = j.get("JointID")
+            if isinstance(jid, UUIDRef) and jid.uuid:
+                base_joint_uuids.add(jid.uuid)
+            jnm = str(j.get("Name", "") or "")
+            if jnm:
+                base_joint_names.add(jnm)
+    for cand_smr_h in (smr, direct_smr):
+        if cand_smr_h is None:
+            continue
+        for href in cand_smr_h.get("Helpers", ()):
+            ho = game.resolve_ref(href)
+            if isinstance(ho, dict):
+                for h in ho.get("OrientationHelpers", ()):
+                    hnm = str(h.get("Name", "") or "")
+                    if hnm:
+                        base_helper_names.add(hnm)
+
+    base_species_names = _infer_base_species_names(game, entity_oid, smr or direct_smr)
+
     # Candidate groups that may hold this machine's DestructibilityResource(s):
     # 1. Direct components on CE
     # 2. Objects in CE's own group
@@ -414,13 +658,21 @@ def discover_machine_variants(
     seen_dr_ids: set[str] = set()
     variants: list[MachineVariantOption] = []
 
-    def consider_dr(dr: dict[str, Any], hint_gid: int, matched_smr: dict[str, Any] | None = None) -> None:
+    def consider_dr(
+        dr: dict[str, Any],
+        hint_gid: int,
+        matched_smr: dict[str, Any] | None = None,
+        local_objs: list[dict[str, Any]] | None = None,
+    ) -> bool:
         dr_id = str(dr["_id"])
         if dr_id in seen_dr_ids:
-            return
+            return False
         cp = dr.get("ConvertedParts", ())
         if len(cp) < 2:
-            return
+            return False
+        # Reject foreign-species DRs whose parts don't attach to this machine's skeleton!
+        if not _dr_matches_skeleton(game, dr, base_joint_uuids, base_joint_names, base_helper_names, local_objs=local_objs):
+            return False
         seen_dr_ids.add(dr_id)
         use_smr = matched_smr or smr or direct_smr
         variants.append(
@@ -433,6 +685,7 @@ def discover_machine_variants(
                 smr_id=str(use_smr["_id"]) if use_smr is not None else None,
             )
         )
+        return True
 
     # 1. Direct CE component
     for c in comps:
@@ -468,11 +721,17 @@ def discover_machine_variants(
                     seen_super.add(sup2)
                     super_gids.append(sup2)
 
+    # Keep track of ALL candidate supergroups (including shared-DR Apex/variant groups that carry
+    # `CollectableRobotComponentResource` + `RenderEffectShaderOverridesResource` without duplicating the DR!)
+    all_candidate_super_gids = [
+        sg for sg in super_gids
+        if game.graph.group(sg).num_objects <= 18_000
+    ]
+
     # Prioritize official CollectableRobot variant groups first, then smaller clean groups
     super_gids = [
-        sg for sg in super_gids
+        sg for sg in all_candidate_super_gids
         if "DestructibilityResource" in game.graph.group_types(sg)
-        and game.graph.group(sg).num_objects <= 18_000
     ]
     super_gids.sort(
         key=lambda sg: (
@@ -483,7 +742,7 @@ def discover_machine_variants(
 
     for sgid in super_gids[:45]:
         matched_smr = _find_matching_smr_for_group(sgid)
-        if len(extra_smrs) > 1 and matched_smr is None:
+        if len(extra_smrs) > 1 and matched_smr is None and "CollectableRobotComponentResource" not in game.graph.group_types(sgid):
             continue
         try:
             # Flat read is 100x faster than read_subgroups=True and still reads exact DestructibilityResource ConvertedParts count!
@@ -492,8 +751,38 @@ def discover_machine_variants(
             continue
         drs = [o for o in objs if o["_type"] == "DestructibilityResource" and len(o.get("ConvertedParts", ())) >= 5]
         if drs:
-            best_dr = max(drs, key=lambda d: len(d.get("ConvertedParts", ())))
-            consider_dr(best_dr, sgid, matched_smr=matched_smr)
+            # Sort largest first, and pick the first DR whose parts actually attach to this machine's skeleton!
+            # (Prevents a larger foreign machine in a duo-encounter supergroup from masking this machine's DR!)
+            for cand_dr in sorted(drs, key=lambda d: len(d.get("ConvertedParts", ())), reverse=True):
+                if consider_dr(cand_dr, sgid, matched_smr=matched_smr, local_objs=objs):
+                    break
+
+    # 3b. Shared-DR Apex / named variant groups (e.g. Apex Slitherfang `61843`, Apex Tideripper `68979`) that inherit
+    # their base machine's DestructibilityResource from a subgroup while supplying their own CollectableRobot +
+    # `RenderEffectShaderOverridesResource` (`*_BVar_*` textures)!
+    if variants:
+        base_dr_var = max(variants, key=lambda vv: vv.part_count)
+        seen_var_gids = {vv.group_id for vv in variants}
+        cr_ov_gids = [
+            sg for sg in all_candidate_super_gids
+            if sg not in seen_var_gids
+            and "CollectableRobotComponentResource" in game.graph.group_types(sg)
+            and _has_variant_shader_overrides_fast(game, sg)
+        ]
+        cr_ov_gids.sort(key=lambda sg: game.graph.group(sg).num_objects)
+        for sgid in cr_ov_gids[:16]:
+            matched_smr = _find_matching_smr_for_group(sgid)
+            use_smr = matched_smr or smr or direct_smr
+            variants.append(
+                MachineVariantOption(
+                    variant_index=len(variants),
+                    label=f"Variant_{len(variants) + 1}_Group{sgid}",
+                    destructibility_id=base_dr_var.destructibility_id,
+                    group_id=sgid,
+                    part_count=base_dr_var.part_count,
+                    smr_id=str(use_smr["_id"]) if use_smr is not None else base_dr_var.smr_id,
+                )
+            )
 
     # If smr was still None (e.g. Grazer/Fanghorn where SMR lived inside variant subgroup), pick the best variant SMR!
     if smr is None and extra_smrs:
@@ -587,19 +876,46 @@ def discover_machine_variants(
                 if o["_type"] == "TextureSet":
                     for desc in o.get("TextureDesc", ()):
                         _scan_path_tokens(desc.get("Path", "").lower().replace("\\", "/"), allow_apex=not bool(cr_name))
+        # 3. Authoritative Apex signal: zero-I/O graph check for RenderEffectShaderOverridesResource in variant group
+        if not is_apex and not cr_name:
+            if _has_variant_shader_overrides_fast(game, v.group_id):
+                is_apex = True
         return cr_name, cr_desc, sub_type, is_apex
 
-    tagged: list[tuple[MachineVariantOption, str, str, str, bool]] = [(v, *_inspect_variant_tags(v)) for v in variants]
+    tagged_raw: list[tuple[MachineVariantOption, str, str, str, bool]] = [(v, *_inspect_variant_tags(v)) for v in variants]
+
+    # Species consistency filter: reject cross-species duo-encounter variants (e.g. Bilegut on Stingspawn,
+    # Dreadwing on Stormbird) whose CollectableRobot official name explicitly names a DIFFERENT species!
+    def _species_is_compatible(cr_name: str) -> bool:
+        if not cr_name or not base_species_names:
+            return True
+        low = cr_name.lower()
+        if any(sp in low for sp in base_species_names):
+            return True
+        # Check if cr_name explicitly names a known OTHER machine species
+        for other_sp in _ALL_KNOWN_SPECIES_NAMES:
+            if other_sp in low and other_sp not in base_species_names:
+                return False
+        return True
+
+    tagged = [t for t in tagged_raw if _species_is_compatible(t[1])]
+    if not tagged:
+        tagged = tagged_raw
     # Prefer Standard (non-Apex) full-part variants first so default export is the iconic complete machine!
-    max_parts = max((v.part_count for v in variants), default=0)
+    max_parts = max((t[0].part_count for t in tagged), default=0)
     # Filter out tiny incomplete stub variants (keep any official CollectableRobot variant!)
     if max_parts >= 20:
         filtered = [t for t in tagged if t[1] or t[0].part_count >= max_parts * 0.45]
         if filtered:
             tagged = filtered
 
-    # If official CollectableRobot variants exist for this machine, drop anonymous quest duplicates with same part_count
+    # If official CollectableRobot variants exist for this machine, drop anonymous quest duplicates —
+    # EXCEPT preserve a full-part Standard (non-Apex) variant if ONLY Apex has a CollectableRobot (e.g. Ravager, Spikesnout, Rollerback)!
     has_official = any(bool(t[1]) for t in tagged)
+    has_official_standard = any(
+        bool(t[1]) and not t[4] and t[0].part_count >= max_parts * 0.5
+        for t in tagged
+    )
 
     def _is_elemental_variant_name(nm: str) -> bool:
         low = nm.lower()
@@ -632,8 +948,8 @@ def discover_machine_variants(
             seen_official_names.add(k_name)
             deduped.append(item)
             continue
-        # Anonymous variant (no CollectableRobot): skip if we already have official variants with >= part_count
-        if has_official:
+        # Anonymous variant (no CollectableRobot): skip if official variants already cover Standard (or if this is Apex/partial)
+        if has_official and (is_apex or has_official_standard or v.part_count < max_parts * 0.5):
             continue
         bkey = (sub_type, is_apex, v.smr_id, v.part_count)
         cnt = bucket_counts.get(bkey, 0)
@@ -1253,19 +1569,52 @@ def assemble_machine(
                     _emit_child_mpr(mpr, "ChildEntityPart", None, "", True, 0, f"Static{mi_idx}")
 
     child_idx_counter = 0
+    seen_child_ids: set[str] = set()
     for comp_ref in ce.get("EntityComponentResources", ()):
         comp = game.resolve_ref(comp_ref)
         if comp and comp["_type"] == "ChildEntityComponentResource":
+            cid = str(comp.get("_id", ""))
+            if cid:
+                seen_child_ids.add(cid)
             try:
                 _assemble_child_entity(comp, child_idx_counter)
             except Exception:
                 pass
             child_idx_counter += 1
 
-    # Step 3: Parse all referenced materials
+    # Also check selected variant group for any variant-exclusive ChildEntityComponentResource (e.g. elemental weapons/turrets)
+    if selected_variant is not None and selected_variant.group_id != entity_oid.group_id:
+        if "ChildEntityComponentResource" in game.graph.group_types(selected_variant.group_id):
+            try:
+                for v_obj in game.read_group(selected_variant.group_id, read_subgroups=True):
+                    if v_obj.get("_type") != "ChildEntityComponentResource":
+                        continue
+                    cid = str(v_obj.get("_id", ""))
+                    if cid in seen_child_ids:
+                        continue
+                    seen_child_ids.add(cid)
+                    try:
+                        _assemble_child_entity(v_obj, child_idx_counter)
+                    except Exception:
+                        pass
+                    child_idx_counter += 1
+            except Exception:
+                pass
+
+    # Step 3: Parse all referenced materials AND apply Decima Variant/Apex RenderEffectShaderOverridesResource!
+    tex_overrides: dict[int, ObjectId] = {}
+    var_overrides: dict[int, dict[str, Any]] = {}
+    override_res_ids: list[str] = []
+    if selected_variant is not None:
+        tex_overrides, var_overrides, override_res_ids = collect_variant_shader_overrides(game, selected_variant.group_id)
+
     materials: dict[str, MaterialInfo] = {}
+    total_override_hits = 0
     for mid, mobj in material_objs.items():
-        materials[mid] = parse_material(game, mobj)
+        mat_info = parse_material(game, mobj)
+        if tex_overrides or var_overrides:
+            total_override_hits += apply_shader_overrides(game, mat_info, tex_overrides, var_overrides)
+        materials[mid] = mat_info
 
     # Step 4: Route Focus-Scan wireframe overlays (ForwardForeground-only with no PBR maps),
     # unattached origin proxy parts, and intact DestructibilityParts with combat Enabled=False
@@ -1322,4 +1671,6 @@ def assemble_machine(
         materials=materials,
         official_variant_name=cr_name or (selected_variant.official_name if selected_variant else ""),
         official_variant_description=cr_desc or (selected_variant.official_description if selected_variant else ""),
+        shader_override_count=total_override_hits,
+        shader_override_resource_ids=override_res_ids,
     )

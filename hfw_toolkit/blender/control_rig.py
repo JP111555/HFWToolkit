@@ -507,6 +507,29 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
             if valid_kids:
                 valid_kids.sort(key=lambda k: head_map[k][2])
                 cleaned.append(valid_kids[0])
+        # Avian/Flyer ground-talon hub extension (e.g. Stormbird & Glinthawk: `L_Thigh -> L_Calf -> L_Ankle_sjnt_0`
+        # sits halfway up the leg at 45-55% height, while `L_Toe_sjnt_0` drops all the way down to the actual talon/foot
+        # hub and parents all talons! Follow down to the real foot/talon hub so Foot IK plants cleanly at the feet!)
+        if cleaned and not (allow_flipper and len(cleaned) >= 7):
+            last_b = cleaned[-1]
+            p_last = head_map[last_b]
+            if p_last[2] > min_z + rig_height * 0.14:
+                drop_kids = [
+                    k
+                    for k in children_map.get(last_b, [])
+                    if k in head_map
+                    and k not in cleaned
+                    and not _is_detail_forbidden(k)
+                    and head_map[k][2] < p_last[2] - rig_height * 0.08
+                    and (
+                        bool(children_map.get(k))
+                        or any(tk in k.lower() for tk in ("toe", "foot", "hoof", "talon", "leg", "ankle"))
+                    )
+                ]
+                if drop_kids:
+                    # Prefer a ground-level hub that parents talons/toes, then lowest Z
+                    drop_kids.sort(key=lambda k: (0 if children_map.get(k) else 1, head_map[k][2]))
+                    cleaned.append(drop_kids[0])
         if len(cleaned) < 3:
             return None
 
@@ -991,7 +1014,55 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         primary_used.add(ar["hand_bone"])
         primary_used.update(ar.get("extra_fk_bones") or ())
 
-    # 8a. Hand Fingers, Forearm Claws & Flyer Wing Fingers / Bat Wing Ribs
+    # 8a-0. Dedicated Wing Feathers, Wing Plates & Bat Wing Ribs (owned cleanly by the Avian/Flyer Wing Controller!)
+    _WING_FEATHER_TOKENS = ("wingfeather", "wingplate", "wingshoulderplate", "wingrib", "gliderrib", "wingknife", "underwing")
+    for wg in wings:
+        side = wg["side"]
+        w_bones = wg["bones"]
+        w_root_p = head_map[w_bones[0]]
+        w_tip_p = head_map[w_bones[-1]]
+        w_span_v = (w_tip_p[0] - w_root_p[0], w_tip_p[1] - w_root_p[1], w_tip_p[2] - w_root_p[2])
+        w_span_sq = max(1e-4, w_span_v[0] ** 2 + w_span_v[1] ** 2 + w_span_v[2] ** 2)
+        f_chains: list[dict[str, Any]] = []
+        for wi, wb in enumerate(w_bones):
+            w_fkids = [
+                k
+                for k in children_map.get(wb, [])
+                if k not in primary_used
+                and not _is_detail_forbidden(k)
+                and any(tk in k.lower() for tk in _WING_FEATHER_TOKENS)
+            ]
+            for ci, ch in enumerate(_collect_sub_chains(w_fkids, children_map, head_map, primary_used, max_depth=5)):
+                hp = head_map[ch[0]]
+                dp = (hp[0] - w_root_p[0], hp[1] - w_root_p[1], hp[2] - w_root_p[2])
+                proj_t = (dp[0] * w_span_v[0] + dp[1] * w_span_v[1] + dp[2] * w_span_v[2]) / w_span_sq
+                span_t = max(0.0, min(1.0, proj_t))
+                low0 = ch[0].lower()
+                if "rib" in low0:
+                    fkind = "rib"
+                elif "feather" in low0 or "knife" in low0 or wi >= max(1, len(w_bones) - 2):
+                    fkind = "primary"
+                else:
+                    fkind = "secondary"
+                stem = re.sub(r"^[LlRrCc]_", "", ch[0])
+                stem = re.sub(r"_?sjnt_?\d+$", "", stem, flags=re.IGNORECASE)
+                stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:16] or f"Feather{ci}"
+                f_chains.append(
+                    {
+                        "name": f"{stem}_{side}",
+                        "side": side,
+                        "parent_def": parent_map.get(ch[0]) or wb,
+                        "bones": ch,
+                        "kind": fkind,
+                        "span_t": round(span_t, 4),
+                        "wing_seg_idx": wi,
+                    }
+                )
+                primary_used.update(ch)
+        f_chains.sort(key=lambda fc: (fc["span_t"], fc["wing_seg_idx"], fc["name"]))
+        wg["feather_chains"] = f_chains
+
+    # 8a. Hand Fingers, Forearm Claws & Flyer Grasping Wing Fingers (`wingHandHinge -> handFinger0..2`)
     fingers: list[dict[str, Any]] = []
     for ar in arms:
         hb = ar["hand_bone"]
@@ -1005,7 +1076,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
             fingers.append({"name": f"{stem}_{side}", "side": side, "parent_def": hb, "bones": ch})
             primary_used.update(ch)
 
-    # Flyer wing fingers & bat wing ribs hanging off wing joints (`wingHandHinge -> handFinger0..2`, `wingRib0..6`)
+    # Flyer grasping wing fingers hanging off wing joints (`wingHandHinge -> handFinger0..2`)
     for wg in wings:
         side = wg["side"]
         for wb in wg["bones"]:
@@ -1014,22 +1085,48 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 for k in children_map.get(wb, [])
                 if k not in primary_used
                 and not _is_detail_forbidden(k)
-                and any(tk in k.lower() for tk in ("wingrib", "gliderrib", "winghandhinge", "armhandhinge", "handfinger", "wingfinger", "claw", "thumb"))
+                and any(tk in k.lower() for tk in ("winghandhinge", "armhandhinge", "handfinger", "wingfinger", "claw", "thumb"))
             ]
             for ci, ch in enumerate(_collect_sub_chains(w_kids, children_map, head_map, primary_used, max_depth=5)):
                 stem = re.sub(r"^[LlRrCc]_", "", ch[0])
                 stem = re.sub(r"_?sjnt_?\d+$", "", stem, flags=re.IGNORECASE)
-                stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:14] or f"WingRib{ci}"
+                stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:14] or f"WingFinger{ci}"
                 fingers.append({"name": f"{stem}_{side}", "side": side, "parent_def": parent_map.get(ch[0]) or wb, "bones": ch})
                 primary_used.update(ch)
 
-    # 8b. Foot Toes, Talons, Dewclaws, Balls & Hooves (descendants of foot_bone + raptor dewclaw thumbs on lower leg!)
+    # 8b. Foot Toes, Talons, Dewclaws, Balls & Hooves (descendants of foot_bone + avian talon hubs + raptor dewclaws!)
     toes: list[dict[str, Any]] = []
     for lg in legs:
         fb = lg["foot_bone"]
         side = lg["side"]
         direct_kids = [k for k in children_map.get(fb, []) if k not in primary_used and not _is_detail_forbidden(k)]
-        sub_chains = _collect_sub_chains(direct_kids, children_map, head_map, primary_used, max_depth=4)
+        # Unwrap avian foot/metatarsal talon hubs (e.g. Stormbird/Glinthawk `L_Toe_sjnt_1` parenting Mid/Left/RightTalon,
+        # or Sunwing/Waterwing/Skydrifter/Dreadwing `L_leg_sjnt_4/5` parenting `footFinger0..3`) so EVERY talon gets its own curl lever!
+        hub_kids: list[str] = []
+        regular_kids: list[str] = []
+        for dk in direct_kids:
+            gkids = [g for g in children_map.get(dk, []) if g not in primary_used and not _is_detail_forbidden(g)]
+            if len(gkids) >= 2 and any(
+                any(tk in g.lower() for tk in ("talon", "footfinger", "toe", "claw")) for g in gkids
+            ):
+                hub_kids.append(dk)
+            else:
+                regular_kids.append(dk)
+        for hk in hub_kids:
+            # Keep the metatarsal hub itself as a single-bone foot-pad pivot, then collect each branching talon chain!
+            stem_h = re.sub(r"^[LlRrCc]_", "", hk)
+            stem_h = re.sub(r"[^A-Za-z0-9]+", "", stem_h)[:14] or "FootPad"
+            toes.append({"name": f"{stem_h}_{side}", "side": side, "parent_def": fb, "bones": [hk]})
+            primary_used.add(hk)
+            gkids = [g for g in children_map.get(hk, []) if g not in primary_used and not _is_detail_forbidden(g)]
+            for ci, ch in enumerate(_collect_sub_chains(gkids, children_map, head_map, primary_used, max_depth=4)[:10]):
+                stem = re.sub(r"^[LlRrCc]_", "", ch[0])
+                stem = re.sub(r"_?sjnt_?\d+$", "", stem, flags=re.IGNORECASE)
+                stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:14] or f"Talon{ci}"
+                toes.append({"name": f"{stem}_{side}", "side": side, "parent_def": hk, "bones": ch})
+                primary_used.update(ch)
+
+        sub_chains = _collect_sub_chains(regular_kids, children_map, head_map, primary_used, max_depth=4)
         for ci, ch in enumerate(sub_chains[:10]):
             stem = re.sub(r"^[LlRrCc]_", "", ch[0])
             stem = re.sub(r"_?sjnt_?\d+$", "", stem, flags=re.IGNORECASE)
@@ -1537,44 +1634,247 @@ def _make_wire_widget(name: str, verts: list[tuple[float, float, float]], edges:
 
 
 def _ensure_control_widgets() -> dict[str, Any]:
-    segs = 28
-    # Bold double-ring FK controller with 4 radial tick marks (super visible around thick machine limbs & tails!)
+    """Create crisp Blender 5.3 Rigify-inspired semantic wireframe widgets (zero clutter, instantly readable)."""
+    segs = 32
+
+    # 1. Rigify-Style Limb FK Circle: single crisp circle perpendicular to bone Y axis + subtle forward orientation notch
     fk_verts: list[tuple[float, float, float]] = []
     fk_edges: list[tuple[int, int]] = []
-    for rad in (0.90, 1.06):
-        off = len(fk_verts)
-        for i in range(segs):
-            a = 2.0 * math.pi * i / segs
-            fk_verts.append((rad * math.cos(a), 0.0, rad * math.sin(a)))
-            fk_edges.append((off + i, off + (i + 1) % segs))
-    for i in range(0, segs, segs // 4):
-        fk_edges.append((i, segs + i))
-    # Subtle forward indicator notch on +Z so rotation orientation reads clearly
+    for i in range(segs):
+        a = 2.0 * math.pi * i / segs
+        fk_verts.append((math.cos(a), 0.0, math.sin(a)))
+        fk_edges.append((i, (i + 1) % segs))
     tbase = len(fk_verts)
-    fk_verts.extend([(0.0, 0.0, 1.32), (-0.16, 0.0, 1.06), (0.16, 0.0, 1.06)])
+    fk_verts.extend([(0.0, 0.0, 1.24), (-0.11, 0.0, 0.99), (0.11, 0.0, 0.99)])
     fk_edges.extend([(tbase, tbase + 1), (tbase, tbase + 2)])
     w_fk_ring = _make_wire_widget("WGT_HFW_FK_Ring", fk_verts, fk_edges)
 
-    # Root ring on XY ground plane with bold forward arrow
-    r_verts = [(math.cos(2.0 * math.pi * i / segs), math.sin(2.0 * math.pi * i / segs), 0.0) for i in range(segs)]
-    r_edges = [(i, (i + 1) % segs) for i in range(segs)]
-    base = len(r_verts)
-    r_verts.extend([(0.0, 1.50, 0.0), (-0.32, 1.05, 0.0), (0.32, 1.05, 0.0)])
-    r_edges.extend([(base, base + 1), (base, base + 2), (base + 1, base + 2)])
+    # 2. Rigify Classic 4-Way Floor Compass Root (`WGT-rig_root`): double ground ring + 4 directional arrows (long +Y forward)
+    r_verts: list[tuple[float, float, float]] = []
+    r_edges: list[tuple[int, int]] = []
+    for rad in (0.94, 1.04):
+        off = len(r_verts)
+        for i in range(segs):
+            a = 2.0 * math.pi * i / segs
+            r_verts.append((rad * math.cos(a), rad * math.sin(a), 0.0))
+            r_edges.append((off + i, off + (i + 1) % segs))
+    # 4 Rigify compass arrowheads (+Y prominent forward arrow, -Y, +X, -X)
+    for dx, dy, tip_l, wing_w, neck_l in (
+        (0.0, 1.0, 1.62, 0.30, 1.06),
+        (0.0, -1.0, 1.38, 0.22, 1.06),
+        (1.0, 0.0, 1.38, 0.22, 1.06),
+        (-1.0, 0.0, 1.38, 0.22, 1.06),
+    ):
+        px, py = -dy, dx
+        b = len(r_verts)
+        r_verts.extend([
+            (dx * tip_l, dy * tip_l, 0.0),
+            (dx * (tip_l - 0.32) + px * wing_w, dy * (tip_l - 0.32) + py * wing_w, 0.0),
+            (dx * (tip_l - 0.32) + px * (wing_w * 0.42), dy * (tip_l - 0.32) + py * (wing_w * 0.42), 0.0),
+            (dx * neck_l + px * (wing_w * 0.42), dy * neck_l + py * (wing_w * 0.42), 0.0),
+            (dx * neck_l - px * (wing_w * 0.42), dy * neck_l - py * (wing_w * 0.42), 0.0),
+            (dx * (tip_l - 0.32) - px * (wing_w * 0.42), dy * (tip_l - 0.32) - py * (wing_w * 0.42), 0.0),
+            (dx * (tip_l - 0.32) - px * wing_w, dy * (tip_l - 0.32) - py * wing_w, 0.0),
+        ])
+        r_edges.extend([
+            (b, b + 1), (b + 1, b + 2), (b + 2, b + 3),
+            (b + 4, b + 5), (b + 5, b + 6), (b + 6, b),
+        ])
     w_root = _make_wire_widget("WGT_HFW_Root", r_verts, r_edges)
 
-    # COG double hoop + inner diamond (unmistakable center-of-gravity grab handle!)
-    cog_verts = [(math.cos(2.0 * math.pi * i / segs), math.sin(2.0 * math.pi * i / segs), 0.0) for i in range(segs)]
-    cog_edges = [(i, (i + 1) % segs) for i in range(segs)]
-    cbase = len(cog_verts)
-    cog_verts.extend([(0.0, 1.28, 0.0), (1.28, 0.0, 0.0), (0.0, -1.28, 0.0), (-1.28, 0.0, 0.0)])
-    cog_edges.extend([(cbase, cbase + 1), (cbase + 1, cbase + 2), (cbase + 2, cbase + 3), (cbase + 3, cbase)])
+    # 3. Rigify Torso / COG Sculpted Saddle (`WGT-rig_torso`): contoured square-circle waist + 4 outward pointer chevrons
+    cog_verts: list[tuple[float, float, float]] = []
+    cog_edges: list[tuple[int, int]] = []
+    for i in range(segs):
+        a = 2.0 * math.pi * i / segs
+        # Superellipse waist contour with gentle Rigify saddle undulation in Z
+        ca, sa = math.cos(a), math.sin(a)
+        rx = math.copysign(abs(ca) ** 0.78, ca) * 1.08
+        ry = math.copysign(abs(sa) ** 0.78, sa) * 1.08
+        rz = 0.14 * math.cos(2.0 * a)
+        cog_verts.append((rx, ry, rz))
+        cog_edges.append((i, (i + 1) % segs))
+    for dx, dy in ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)):
+        px, py = -dy, dx
+        b = len(cog_verts)
+        tip = 1.46 if dy > 0.5 else 1.32
+        cog_verts.extend([
+            (dx * tip, dy * tip, 0.0),
+            (dx * 1.12 + px * 0.20, dy * 1.12 + py * 0.20, 0.0),
+            (dx * 1.12 - px * 0.20, dy * 1.12 - py * 0.20, 0.0),
+        ])
+        cog_edges.extend([(b, b + 1), (b, b + 2), (b + 1, b + 2)])
     w_cog = _make_wire_widget("WGT_HFW_COG", cog_verts, cog_edges)
 
-    # Bold Foot / Hand / Head IK Cube
+    # 4. Rigify Ribcage / Chest Sculpted Loop (`WGT-rig_chest`): clean arched chest collar with front sternum peak
+    ch_verts: list[tuple[float, float, float]] = []
+    ch_edges: list[tuple[int, int]] = []
+    ch_n = 24
+    for tier_y, rx, rz, arch in ((-0.12, 1.02, 0.88, -0.06), (0.28, 1.12, 0.96, 0.10)):
+        off = len(ch_verts)
+        for i in range(ch_n):
+            a = 2.0 * math.pi * i / ch_n
+            ca, sa = math.cos(a), math.sin(a)
+            # Sculpted sternum peak on +Z front, gentle arch over ribs
+            y_sc = tier_y + arch * sa + (0.08 if (sa > 0.6 and tier_y > 0) else 0.0)
+            ch_verts.append((rx * ca, y_sc, rz * sa))
+            ch_edges.append((off + i, off + (i + 1) % ch_n))
+    for i in (0, ch_n // 4, ch_n // 2, (3 * ch_n) // 4):
+        ch_edges.append((i, ch_n + i))
+    sb = len(ch_verts)
+    ch_verts.extend([(0.0, 0.08, 1.28), (-0.20, 0.08, 0.95), (0.20, 0.08, 0.95)])
+    ch_edges.extend([(sb, sb + 1), (sb, sb + 2)])
+    w_chest = _make_wire_widget("WGT_HFW_Chest", ch_verts, ch_edges)
+
+    # 5. Rigify Rounded Foot / Talon Shoe Outline (`WGT-rig_foot_ik`): flat ground-hugging tapered foot silhouette + ankle loop
+    ft_outline = [
+        (-0.36, -0.58, 0.0), (0.36, -0.58, 0.0),
+        (0.52, -0.18, 0.0), (0.56, 0.44, 0.0),
+        (0.42, 0.94, 0.0), (0.16, 1.16, 0.0),
+        (-0.16, 1.16, 0.0), (-0.42, 0.94, 0.0),
+        (-0.56, 0.44, 0.0), (-0.52, -0.18, 0.0),
+    ]
+    ft_verts = list(ft_outline)
+    nf = len(ft_outline)
+    ft_edges = [(i, (i + 1) % nf) for i in range(nf)]
+    # Subtle elevated heel-to-toe collar bevel (3D readability from side & top views!)
+    ft_top = [(x * 0.78, y * 0.78, 0.24) for (x, y, _) in ft_outline]
+    ft_verts.extend(ft_top)
+    ft_edges.extend([(nf + i, nf + (i + 1) % nf) for i in range(nf)])
+    for i in (0, 1, 4, 7):
+        ft_edges.append((i, nf + i))
+    w_foot_ik = _make_wire_widget("WGT_HFW_FootIK", ft_verts, ft_edges)
+
+    # 6. Rigify Hand / Palm IK Cuff (`WGT-rig_hand_ik`): clean beveled palm frame with forward finger-side arch
+    hd_verts = [
+        (-0.48, -0.22, -0.26), (0.48, -0.22, -0.26), (0.56, 0.62, -0.22), (-0.56, 0.62, -0.22),
+        (-0.48, -0.22, 0.26), (0.48, -0.22, 0.26), (0.56, 0.62, 0.22), (-0.56, 0.62, 0.22),
+        (0.0, 0.86, 0.0), (-0.30, 0.62, 0.0), (0.30, 0.62, 0.0),
+    ]
+    hd_edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+        (8, 9), (8, 10),
+    ]
+    w_hand_ik = _make_wire_widget("WGT_HFW_HandIK", hd_verts, hd_edges)
+
+    # 7. Rigify Curved Shoulder / Clavicle Arc (`WGT-rig_shoulder`): swept rounded boomerang bar
+    sh_verts: list[tuple[float, float, float]] = []
+    sh_edges: list[tuple[int, int]] = []
+    sh_n = 10
+    for i in range(sh_n + 1):
+        t = i / sh_n
+        y = 0.08 + t * 0.92
+        z_arc = 0.24 * math.sin(t * math.pi)
+        sh_verts.append((-0.18, y, z_arc + 0.14))
+        sh_verts.append((0.18, y, z_arc + 0.14))
+        if i > 0:
+            sh_edges.append((2 * (i - 1), 2 * i))
+            sh_edges.append((2 * (i - 1) + 1, 2 * i + 1))
+    sh_edges.extend([(0, 1), (2 * sh_n, 2 * sh_n + 1)])
+    w_shoulder = _make_wire_widget("WGT_HFW_Shoulder", sh_verts, sh_edges)
+
+    # 8. Rigify Curved Neck Collar (`WGT-rig_neck`): crisp open-back C-arc wrapping neck cleanly
+    nk_verts: list[tuple[float, float, float]] = []
+    nk_edges: list[tuple[int, int]] = []
+    nk_n = 20
+    for i in range(nk_n + 1):
+        a = -math.pi * 0.20 + (math.pi * 1.40) * (i / nk_n)
+        nk_verts.append((0.96 * math.cos(a), 0.14 * math.sin(a), 0.96 * math.sin(a)))
+        if i > 0:
+            nk_edges.append((i - 1, i))
+    w_neck = _make_wire_widget("WGT_HFW_Neck", nk_verts, nk_edges)
+
+    # 9. Rigify Contoured Head Crown Halo (`WGT-rig_head`): sculpted headband loop with brow peak
+    hc_verts: list[tuple[float, float, float]] = []
+    hc_edges: list[tuple[int, int]] = []
+    hc_n = 28
+    for i in range(hc_n):
+        a = 2.0 * math.pi * i / hc_n
+        ca, sa = math.cos(a), math.sin(a)
+        hc_verts.append((0.92 * ca, 0.20 + 0.96 * sa, 0.36 + 0.20 * math.cos(2.0 * a)))
+        hc_edges.append((i, (i + 1) % hc_n))
+    hb = len(hc_verts)
+    hc_verts.extend([(0.0, 1.38, 0.56), (-0.22, 1.14, 0.50), (0.22, 1.14, 0.50)])
+    hc_edges.extend([(hb, hb + 1), (hb, hb + 2)])
+    w_head = _make_wire_widget("WGT_HFW_Head", hc_verts, hc_edges)
+
+    # 10. Rigify Curved Chin / Jaw U-Bar (`WGT-rig_jaw`): sleek rounded jaw U-loop
+    jw_verts: list[tuple[float, float, float]] = []
+    jw_edges: list[tuple[int, int]] = []
+    jw_n = 14
+    for i in range(jw_n + 1):
+        a = -math.pi * 0.08 + math.pi * 1.16 * (i / jw_n)
+        jw_verts.append((0.68 * math.cos(a), 0.88 * math.sin(a), -0.14 * math.sin(a)))
+        if i > 0:
+            jw_edges.append((i - 1, i))
+    w_jaw = _make_wire_widget("WGT_HFW_Jaw", jw_verts, jw_edges)
+
+    # 11. Rigify Pole Target Sphere-Diamond (`WGT-rig_pole`): crisp 3-plane compact target visible from every camera angle
+    d_verts: list[tuple[float, float, float]] = [
+        (0.0, 0.0, 0.85), (0.0, 0.0, -0.85),
+        (0.85, 0.0, 0.0), (-0.85, 0.0, 0.0),
+        (0.0, 0.85, 0.0), (0.0, -0.85, 0.0),
+    ]
+    d_edges: list[tuple[int, int]] = [
+        (0, 2), (0, 3), (0, 4), (0, 5),
+        (1, 2), (1, 3), (1, 4), (1, 5),
+        (2, 4), (4, 3), (3, 5), (5, 2),
+    ]
+    for plane in (0, 1):
+        off = len(d_verts)
+        for i in range(16):
+            a = 2.0 * math.pi * i / 16
+            if plane == 0:
+                d_verts.append((0.55 * math.cos(a), 0.55 * math.sin(a), 0.0))
+            else:
+                d_verts.append((0.55 * math.cos(a), 0.0, 0.55 * math.sin(a)))
+            d_edges.append((off + i, off + (i + 1) % 16))
+    w_pole = _make_wire_widget("WGT_HFW_Pole", d_verts, d_edges)
+
+    # 12. Aerodynamic Wing Master Chevron (`WGT_HFW_WingMaster`): swept bird-wing arc + camber curve (Fold/Fan/Camber handle!)
+    wm_verts = [
+        (0.0, 0.0, 0.0), (0.0, 1.35, 0.10),
+        (-0.52, 0.45, 0.06), (0.52, 0.45, 0.06),
+        (-0.88, 0.12, -0.08), (0.88, 0.12, -0.08),
+        (-0.52, 0.88, 0.18), (0.52, 0.88, 0.18),
+        (0.0, 0.72, 0.34), (0.0, 0.72, -0.14),
+    ]
+    wm_edges = [
+        (0, 2), (2, 4), (4, 6), (6, 1),
+        (0, 3), (3, 5), (5, 7), (7, 1),
+        (2, 8), (8, 3), (6, 8), (8, 7), (0, 9), (9, 1),
+    ]
+    w_wing_master = _make_wire_widget("WGT_HFW_WingMaster", wm_verts, wm_edges)
+
+    # 13. Aerodynamic Wingtip IK Diamond Airfoil (`WGT_HFW_WingIK`)
+    wi_verts = [
+        (0.0, -0.55, 0.0), (0.62, 0.18, 0.0), (0.0, 1.15, 0.0), (-0.62, 0.18, 0.0),
+        (0.0, 0.18, 0.32), (0.0, 0.18, -0.32),
+    ]
+    wi_edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 0), (4, 1), (4, 2), (4, 3),
+        (5, 0), (5, 1), (5, 2), (5, 3),
+    ]
+    w_wing_ik = _make_wire_widget("WGT_HFW_WingIK", wi_verts, wi_edges)
+
+    # 14. Slim Quill / Pinion Feather Tweak (`WGT_HFW_Feather`)
+    fe_verts = [
+        (0.0, 0.0, 0.0), (0.0, 1.25, 0.0),
+        (-0.18, 0.38, 0.0), (0.18, 0.38, 0.0),
+        (-0.22, 0.86, 0.0), (0.22, 0.86, 0.0),
+    ]
+    fe_edges = [
+        (0, 1), (0, 2), (2, 4), (4, 1), (0, 3), (3, 5), (5, 1),
+    ]
+    w_feather = _make_wire_widget("WGT_HFW_Feather", fe_verts, fe_edges)
+
+    # 15. Compact Box (generic IK fallback)
     b_verts = [
-        (-0.55, -0.55, -0.38), (0.55, -0.55, -0.38), (0.55, 0.55, -0.38), (-0.55, 0.55, -0.38),
-        (-0.55, -0.55, 0.38), (0.55, -0.55, 0.38), (0.55, 0.55, 0.38), (-0.55, 0.55, 0.38),
+        (-0.48, -0.48, -0.32), (0.48, -0.48, -0.32), (0.48, 0.48, -0.32), (-0.48, 0.48, -0.32),
+        (-0.48, -0.48, 0.32), (0.48, -0.48, 0.32), (0.48, 0.48, 0.32), (-0.48, 0.48, 0.32),
     ]
     b_edges = [
         (0, 1), (1, 2), (2, 3), (3, 0),
@@ -1583,40 +1883,27 @@ def _ensure_control_widgets() -> dict[str, Any]:
     ]
     w_box = _make_wire_widget("WGT_HFW_Box", b_verts, b_edges)
 
-    # Knee / Elbow Pole Target Diamond
-    d_verts = [
-        (0.0, 0.0, 1.0), (0.0, 0.0, -1.0),
-        (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0), (0.0, -1.0, 0.0),
-    ]
-    d_edges = [
-        (0, 2), (0, 3), (0, 4), (0, 5),
-        (1, 2), (1, 3), (1, 4), (1, 5),
-        (2, 4), (4, 3), (3, 5), (5, 2),
-    ]
-    w_diamond = _make_wire_widget("WGT_HFW_Diamond", d_verts, d_edges)
-
-    # 3D Dual-Ring Lollipop Pin for Fingers, Toes, Talons & Hooves (visible from EVERY camera angle!)
+    # 16. 3D Dual-Ring Lollipop Pin for Single-Bone Hooves/Toes/Claws (`WGT_HFW_Pin`)
     p_verts = [(0.0, 0.0, 0.0), (0.0, 0.85, 0.0)]
     p_edges = [(0, 1)]
     p1 = len(p_verts)
     for i in range(12):
         a = 2.0 * math.pi * i / 12
-        p_verts.append((0.32 * math.cos(a), 0.85 + 0.32 * math.sin(a), 0.0))
+        p_verts.append((0.28 * math.cos(a), 0.85 + 0.28 * math.sin(a), 0.0))
         p_edges.append((p1 + i, p1 + (i + 1) % 12))
     p2 = len(p_verts)
     for i in range(12):
         a = 2.0 * math.pi * i / 12
-        p_verts.append((0.0, 0.85 + 0.32 * math.sin(a), 0.32 * math.cos(a)))
+        p_verts.append((0.0, 0.85 + 0.28 * math.sin(a), 0.28 * math.cos(a)))
         p_edges.append((p2 + i, p2 + (i + 1) % 12))
     w_pin = _make_wire_widget("WGT_HFW_Pin", p_verts, p_edges)
 
-    # Elongated Feather / Frill / Plasma Intake Paddle extending clearly outward!
+    # 17. Elongated Frill / Plasma Intake Paddle (`WGT_HFW_Paddle`)
     pad_verts = [
-        (0.0, 0.0, 0.0), (0.0, 1.45, 0.0),
-        (-0.36, 0.55, 0.0), (0.36, 0.55, 0.0),
-        (-0.26, 1.15, 0.0), (0.26, 1.15, 0.0),
-        (0.0, 0.55, 0.24), (0.0, 0.55, -0.24),
+        (0.0, 0.0, 0.0), (0.0, 1.38, 0.0),
+        (-0.32, 0.52, 0.0), (0.32, 0.52, 0.0),
+        (-0.22, 1.08, 0.0), (0.22, 1.08, 0.0),
+        (0.0, 0.52, 0.20), (0.0, 0.52, -0.20),
     ]
     pad_edges = [
         (0, 1), (0, 2), (0, 3), (2, 4), (3, 5), (4, 1), (5, 1),
@@ -1624,11 +1911,11 @@ def _ensure_control_widgets() -> dict[str, Any]:
     ]
     w_paddle = _make_wire_widget("WGT_HFW_Paddle", pad_verts, pad_edges)
 
-    # Beveled Armor Plate / Shield / Canister Square Frame
+    # 18. Beveled Armor Plate Frame (`WGT_HFW_Plate`)
     pl_verts = [
-        (-0.65, 0.0, -0.45), (0.65, 0.0, -0.45), (0.65, 0.0, 0.45), (-0.65, 0.0, 0.45),
-        (-0.42, 0.0, -0.26), (0.42, 0.0, -0.26), (0.42, 0.0, 0.26), (-0.42, 0.0, 0.26),
-        (0.0, 0.0, 0.0), (0.0, 0.45, 0.0),
+        (-0.62, 0.0, -0.42), (0.62, 0.0, -0.42), (0.62, 0.0, 0.42), (-0.62, 0.0, 0.42),
+        (-0.40, 0.0, -0.24), (0.40, 0.0, -0.24), (0.40, 0.0, 0.24), (-0.40, 0.0, 0.24),
+        (0.0, 0.0, 0.0), (0.0, 0.42, 0.0),
     ]
     pl_edges = [
         (0, 1), (1, 2), (2, 3), (3, 0),
@@ -1637,34 +1924,15 @@ def _ensure_control_widgets() -> dict[str, Any]:
     ]
     w_plate = _make_wire_widget("WGT_HFW_Plate", pl_verts, pl_edges)
 
-    # Weapon / Turret / Blaster / Horn Crosshair Sight
-    wp_verts = [(0.85 * math.cos(2.0 * math.pi * i / 16), 0.0, 0.85 * math.sin(2.0 * math.pi * i / 16)) for i in range(16)]
+    # 19. Weapon / Turret / Blaster Crosshair Sight (`WGT_HFW_Weapon`)
+    wp_verts = [(0.82 * math.cos(2.0 * math.pi * i / 16), 0.0, 0.82 * math.sin(2.0 * math.pi * i / 16)) for i in range(16)]
     wp_edges = [(i, (i + 1) % 16) for i in range(16)]
     wb = len(wp_verts)
-    wp_verts.extend([(-1.2, 0.0, 0.0), (1.2, 0.0, 0.0), (0.0, 0.0, -1.2), (0.0, 0.0, 1.2), (0.0, 0.0, 0.0), (0.0, 1.2, 0.0)])
+    wp_verts.extend([(-1.15, 0.0, 0.0), (1.15, 0.0, 0.0), (0.0, 0.0, -1.15), (0.0, 0.0, 1.15), (0.0, 0.0, 0.0), (0.0, 1.15, 0.0)])
     wp_edges.extend([(wb, wb + 1), (wb + 2, wb + 3), (wb + 4, wb + 5)])
     w_weapon = _make_wire_widget("WGT_HFW_Weapon", wp_verts, wp_edges)
 
-    # Contoured 3D Double-Tier Chest / Ribcage Cage (distinct from spine rings & COG!)
-    ch_verts: list[tuple[float, float, float]] = []
-    ch_edges: list[tuple[int, int]] = []
-    ch_segs = 16
-    for tier_y, rx, rz in ((-0.16, 1.05, 0.88), (0.34, 1.18, 0.96)):
-        off = len(ch_verts)
-        for i in range(ch_segs):
-            a = 2.0 * math.pi * i / ch_segs
-            ch_verts.append((rx * math.cos(a), tier_y, rz * math.sin(a)))
-            ch_edges.append((off + i, off + (i + 1) % ch_segs))
-    # 4 vertical rib struts linking lower and upper ribcage hoops
-    for i in (0, ch_segs // 4, ch_segs // 2, (3 * ch_segs) // 4):
-        ch_edges.append((i, ch_segs + i))
-    # Front sternum chevron pointing clearly along +Z
-    sbase = len(ch_verts)
-    ch_verts.extend([(0.0, 0.09, 1.32), (-0.28, -0.16, 0.88), (0.28, -0.16, 0.88), (-0.28, 0.34, 0.96), (0.28, 0.34, 0.96)])
-    ch_edges.extend([(sbase, sbase + 1), (sbase, sbase + 2), (sbase, sbase + 3), (sbase, sbase + 4)])
-    w_chest = _make_wire_widget("WGT_HFW_Chest", ch_verts, ch_edges)
-
-    # 3-Axis Spline IK Knot Gimbal Sphere (Move G + Rotate R + Scale S readable from every view!)
+    # 20. 3-Axis Spline IK Knot Gimbal Sphere (`WGT_HFW_Spline`)
     sp_verts: list[tuple[float, float, float]] = []
     sp_edges: list[tuple[int, int]] = []
     sp_n = 20
@@ -1672,7 +1940,7 @@ def _ensure_control_widgets() -> dict[str, Any]:
         off = len(sp_verts)
         for i in range(sp_n):
             a = 2.0 * math.pi * i / sp_n
-            ca, sa = 1.05 * math.cos(a), 1.05 * math.sin(a)
+            ca, sa = 1.0 * math.cos(a), 1.0 * math.sin(a)
             if plane == 0:
                 sp_verts.append((ca, 0.0, sa))
             elif plane == 1:
@@ -1681,25 +1949,28 @@ def _ensure_control_widgets() -> dict[str, Any]:
                 sp_verts.append((0.0, ca, sa))
             sp_edges.append((off + i, off + (i + 1) % sp_n))
     sb = len(sp_verts)
-    sp_verts.extend([(0.0, 1.45, 0.0), (-0.22, 1.05, 0.0), (0.22, 1.05, 0.0)])
+    sp_verts.extend([(0.0, 1.38, 0.0), (-0.20, 1.0, 0.0), (0.20, 1.0, 0.0)])
     sp_edges.extend([(sb, sb + 1), (sb, sb + 2)])
     w_spline = _make_wire_widget("WGT_HFW_Spline", sp_verts, sp_edges)
 
-    # Compact Visored 3D Head IK Target Cage with forward aiming chevron
-    hi_verts = [
-        (-0.46, -0.34, -0.34), (0.46, -0.34, -0.34), (0.46, 0.50, -0.34), (-0.46, 0.50, -0.34),
-        (-0.46, -0.34, 0.34), (0.46, -0.34, 0.34), (0.46, 0.50, 0.34), (-0.46, 0.50, 0.34),
-        (0.0, 0.88, 0.0), (-0.28, 0.50, 0.0), (0.28, 0.50, 0.0),
-    ]
-    hi_edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        (4, 5), (5, 6), (6, 7), (7, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-        (8, 9), (8, 10), (8, 2), (8, 3), (8, 6), (8, 7),
-    ]
+    # 21. Sculpted Head IK Visor Crown (`WGT_HFW_HeadIK`)
+    hi_verts: list[tuple[float, float, float]] = []
+    hi_edges: list[tuple[int, int]] = []
+    hi_n = 20
+    for z_off in (-0.24, 0.24):
+        off = len(hi_verts)
+        for i in range(hi_n):
+            a = 2.0 * math.pi * i / hi_n
+            hi_verts.append((0.58 * math.cos(a), 0.14 + 0.58 * math.sin(a), z_off))
+            hi_edges.append((off + i, off + (i + 1) % hi_n))
+    for i in (0, hi_n // 4, hi_n // 2, (3 * hi_n) // 4):
+        hi_edges.append((i, hi_n + i))
+    hb2 = len(hi_verts)
+    hi_verts.extend([(0.0, 1.08, 0.0), (-0.24, 0.72, 0.0), (0.24, 0.72, 0.0)])
+    hi_edges.extend([(hb2, hb2 + 1), (hb2, hb2 + 2), (hb2 + 1, hb2 + 2)])
     w_head_ik = _make_wire_widget("WGT_HFW_HeadIK", hi_verts, hi_edges)
 
-    # Sleek Master Finger / Toe / Talon Curl Lever (Rigify super-finger inspired, never clutters hands/feet!)
+    # 22. Rigify Super-Finger Master Curl Obelisk Lever (`WGT_HFW_Curl`)
     cl_verts = [
         (0.0, 0.0, 0.0), (0.0, 0.96, 0.0),
         (-0.075, 0.10, 0.0), (0.075, 0.10, 0.0),
@@ -1713,7 +1984,7 @@ def _ensure_control_widgets() -> dict[str, Any]:
     ]
     w_curl = _make_wire_widget("WGT_HFW_Curl", cl_verts, cl_edges)
 
-    # Crisp 8-Tooth Mechanical Spin Gear Wheel for Chainsaws, Drills, Grinders & Rotors!
+    # 23. Official Rigify-Style 8-Tooth Mechanical Spin Gear (`WGT_HFW_Gear`)
     gr_verts: list[tuple[float, float, float]] = []
     gr_edges: list[tuple[int, int]] = []
     teeth = 8
@@ -1728,7 +1999,6 @@ def _ensure_control_widgets() -> dict[str, Any]:
         a = 2.0 * math.pi * i / 16
         gr_verts.append((0.42 * math.cos(a), 0.0, 0.42 * math.sin(a)))
         gr_edges.append((ig_off + i, ig_off + (i + 1) % 16))
-    # Spin axis spindle indicator along +Y
     ax_off = len(gr_verts)
     gr_verts.extend([(0.0, -0.45, 0.0), (0.0, 0.85, 0.0), (-0.18, 0.55, 0.0), (0.18, 0.55, 0.0)])
     gr_edges.extend([(ax_off, ax_off + 1), (ax_off + 1, ax_off + 2), (ax_off + 1, ax_off + 3)])
@@ -1739,13 +2009,23 @@ def _ensure_control_widgets() -> dict[str, Any]:
         "fk_ring": w_fk_ring,
         "chest": w_chest,
         "spline": w_spline,
+        "head": w_head,
         "head_ik": w_head_ik,
+        "neck": w_neck,
+        "jaw": w_jaw,
+        "shoulder": w_shoulder,
+        "foot_ik": w_foot_ik,
+        "hand_ik": w_hand_ik,
+        "pole": w_pole,
+        "diamond": w_pole,
+        "wing_master": w_wing_master,
+        "wing_ik": w_wing_ik,
+        "feather": w_feather,
         "curl": w_curl,
         "gear": w_gear,
         "root": w_root,
         "cog": w_cog,
         "box": w_box,
-        "diamond": w_diamond,
         "pin": w_pin,
         "paddle": w_paddle,
         "plate": w_plate,
@@ -2201,6 +2481,7 @@ def compute_dynamic_collection_labels(
         "appendages": app_lbl,
         "wings_ik": wings_ik_lbl,
         "wings_fk": wings_fk_lbl,
+        "wings_feathers": "Wing Feathers & Ribs",
         "wings": wings_fk_lbl,
         "front_legs_ik": f"{front_leg_prefix} IK",
         "front_legs_fk": f"{front_leg_prefix} FK",
@@ -2336,6 +2617,8 @@ def _set_bone_color(
             pbone.color.palette = "THEME02"  # Vibrant Orange-Gold (Head IK Target)
         elif category == "spin":
             pbone.color.palette = "THEME10"  # Vivid Magenta-Pink (Chainsaw & Drill Spin Dials)
+        elif category == "wing_master":
+            pbone.color.palette = "THEME07" if side == "C" else ("THEME04" if side == "L" else "THEME01")
         elif category == "frills":
             pbone.color.palette = "THEME12" if side == "L" else ("THEME05" if side == "R" else "THEME07")  # Cyan / Teal
         elif category == "plates":
@@ -2431,6 +2714,7 @@ _LEGACY_SLOT_DEFAULTS = {
     "appendages": "Appendage FK",
     "wings_ik": "Wings IK",
     "wings_fk": "Wings FK",
+    "wings_feathers": "Wing Feathers & Ribs",
     "wings": "Wings FK",
     "front_legs_ik": "Front Legs IK",
     "front_legs_fk": "Front Legs FK",
@@ -2645,6 +2929,7 @@ def build_control_rig(
         "spine_fk": grp_main_coll,
         "wings_ik": grp_main_coll,
         "wings_fk": grp_main_coll,
+        "wings_feathers": grp_sec_coll,
         "front_legs_ik": grp_main_coll,
         "front_legs_fk": grp_main_coll,
         "legs_ik": grp_main_coll,
@@ -2704,6 +2989,8 @@ def build_control_rig(
     app_coll = _slot_coll("appendages", bool(spec.get("appendages")), not (spline_app_active and default_spline_ik >= 0.5))
     wings_ik_coll = _slot_coll("wings_ik", has_wing_ik, default_wings_ik >= 0.5)
     wings_fk_coll = _slot_coll("wings_fk", bool(spec["wings"]), default_wings_ik < 0.5)
+    has_wing_feathers = any(bool(w.get("feather_chains")) for w in spec["wings"])
+    wings_feathers_coll = _slot_coll("wings_feathers", has_wing_feathers, False)
     if wings_fk_coll is not None:
         active_slots["wings"] = active_slots["wings_fk"]
     front_legs_ik_coll = _slot_coll("front_legs_ik", has_front_legs, True)
@@ -2739,6 +3026,9 @@ def build_control_rig(
     ik_setups: list[dict[str, Any]] = []
     spline_setups: list[dict[str, Any]] = []
     curl_setups: list[dict[str, Any]] = []
+    wing_fold_setups: list[dict[str, Any]] = []
+    wing_feather_setups: list[dict[str, Any]] = []
+    wing_rig_meta: list[dict[str, Any]] = []
     saw_driver_setups: list[dict[str, Any]] = []
     spin_driver_setups: list[dict[str, Any]] = []
     ctrl_styles: dict[str, dict[str, Any]] = {}
@@ -3740,7 +4030,7 @@ def build_control_rig(
             h_parent = _find_parent_driver(head_def, neck_parent_eb)
             ctrl_head = _new_bone("CTRL_Head", h_pos, h_pos + fwd_vec * max(0.20, rig_h * 0.16), h_parent, colls=(body_coll,))
             ctrl_styles["CTRL_Head"] = {
-                "widget": "box",
+                "widget": "head",
                 "scale": _fit_scale(head_def, max(0.24, rig_h * 0.16), 0.16, max(1.15, rig_h * 0.30), 1.15),
                 "side": "C", "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
             }
@@ -3763,7 +4053,7 @@ def build_control_rig(
                 cname = f"CTRL_Neck_{neck_handles.index(nb):02d}"
                 c_eb = _new_bone(cname, h_pos, t_pos, fk_np, colls=(body_coll,))
                 ctrl_styles[cname] = {
-                    "widget": "fk_ring",
+                    "widget": "neck",
                     "scale": _fit_scale(
                         nb,
                         max(0.11, rig_h * 0.075) if is_humanoid else max(0.20, rig_h * 0.12),
@@ -3800,7 +4090,7 @@ def build_control_rig(
             mult=1.08,
         )
         ctrl_styles["CTRL_Head"] = {
-            "widget": "box", "scale": hd_sc, "side": "C",
+            "widget": "head", "scale": hd_sc, "side": "C",
             "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
         }
         fk_binds_h[head_def] = _make_bind_child(
@@ -3925,7 +4215,7 @@ def build_control_rig(
                 cname = f"CTRL_Neck_{neck_handles.index(nb):02d}"
                 c_eb = _new_bone(cname, h_pos, t_pos, neck_parent_eb, colls=(body_coll,))
                 ctrl_styles[cname] = {
-                    "widget": "fk_ring",
+                    "widget": "neck",
                     "scale": _fit_scale(nb, max(0.12, rig_h * 0.08) if is_humanoid else max(0.20, rig_h * 0.12), 0.10, max(0.72, rig_h * 0.18), 1.18),
                     "side": "C", "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
                 }
@@ -3944,7 +4234,7 @@ def build_control_rig(
             h_parent = _find_parent_driver(head_def, neck_parent_eb)
             ctrl_head = _new_bone("CTRL_Head", h_pos, h_pos + fwd_vec * max(0.20, rig_h * 0.16), h_parent, colls=(body_coll,))
             ctrl_styles["CTRL_Head"] = {
-                "widget": "box",
+                "widget": "head",
                 "scale": _fit_scale(head_def, max(0.17, rig_h * 0.11) if is_humanoid else max(0.24, rig_h * 0.15), 0.13, max(0.95, rig_h * 0.22), 1.18),
                 "side": "C", "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
             }
@@ -3968,7 +4258,7 @@ def build_control_rig(
             colls=(body_coll,),
         )
         ctrl_styles[cname] = {
-            "widget": "fk_ring",
+            "widget": "jaw",
             "scale": _fit_scale(jb, max(0.16, rig_h * 0.10), min_s=0.08, max_s=max(0.55, rig_h * 0.14), mult=1.15),
             "side": side, "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
         }
@@ -4096,7 +4386,26 @@ def build_control_rig(
                 side=side,
             )
 
-    # --- 6. Flyer Wing Chains: DUAL Wing FK (Flap/Fold) + Wingtip IK (`hfw_ik_fk_wings`) + Full-Segment Follow Sockets! ---
+    # --- 6. Avian / Flyer Wing Controller Rig: Master Fold/Fan/Camber + DUAL Wing FK & IK + Progressive Feather Stacking! ---
+    def _make_wing_plane_mat(origin: Vector, y_dir: Vector, up_hint: Vector) -> tuple[Matrix, float]:
+        yw = y_dir.normalized() if y_dir.length > 1e-4 else Vector((1.0, 0.0, 0.0))
+        zw = up_hint - yw * up_hint.dot(yw)
+        if zw.length < 1e-4:
+            zw = fwd_vec - yw * fwd_vec.dot(yw)
+        if zw.length < 1e-4:
+            zw = Vector((0.0, 0.0, 1.0))
+        zw.normalize()
+        xw = yw.cross(zw).normalized()
+        zw = xw.cross(yw).normalized()
+        m4 = Matrix((
+            (xw.x, yw.x, zw.x, origin.x),
+            (xw.y, yw.y, zw.y, origin.y),
+            (xw.z, yw.z, zw.z, origin.z),
+            (0.0, 0.0, 0.0, 1.0),
+        ))
+        back_sign = 1.0 if xw.dot(fwd_vec) >= 0.0 else -1.0
+        return m4, back_sign
+
     for winfo in spec["wings"]:
         w_full = [b for b in winfo["bones"] if b in def_rest]
         if not w_full:
@@ -4106,23 +4415,84 @@ def build_control_rig(
         w_ik_defs = [b for b in (winfo.get("ik_bones") or []) if b in def_rest]
         w_tip_def = winfo.get("tip_bone")
         w_extra_fk = [b for b in (winfo.get("extra_fk_bones") or []) if b in def_rest]
+        w_feathers = list(winfo.get("feather_chains") or [])
         w_root_parent = _find_parent_driver(w_full[0], spine_parent_eb)
+        w_fold_prop = f"hfw_wing_fold_{side}"
+        w_fan_prop = f"hfw_wing_fan_{side}"
+        w_camber_prop = f"hfw_wing_camber_{side}"
+        is_bat_wing = bool(winfo.get("is_bat_wing", False))
+
+        # Ergonomic 3D Viewport Wing Master (`CTRL_Wing_Master_L/R`):
+        #   - Rotate Z: Accordion Wing Fold / Spread (layers with `hfw_wing_fold_L/R`!)
+        #   - Rotate X: Wing Camber / Flap Cupping (layers with `hfw_wing_camber_L/R`!)
+        #   - Rotate Y: Primary & Secondary Feather Fan / Stack (layers with `hfw_wing_fan_L/R`!)
+        w_sh_pos = def_rest[w_full[0]][0]
+        w_tip_pos = def_rest[w_full[-1]][0]
+        out_dir = (w_tip_pos - w_sh_pos)
+        out_dir = out_dir.normalized() if out_dir.length > 1e-4 else Vector(((-1.0 if side == "L" else 1.0), 0.0, 0.0))
+        wm_pos = w_sh_pos + Vector((0.0, 0.0, max(0.24, rig_h * 0.16))) + out_dir * max(0.16, rig_h * 0.10)
+        wm_mat, wm_bsign = _make_wing_plane_mat(wm_pos, out_dir, Vector((0.0, 0.0, 1.0)))
+        wm_ctrl_nm = f"CTRL_Wing_Master_{side}"
+        wm_eb = _new_bone(
+            wm_ctrl_nm,
+            wm_pos,
+            wm_pos + out_dir * max(0.26, rig_h * 0.16),
+            w_root_parent,
+            matrix=wm_mat,
+            colls=(wings_fk_coll or body_coll, wings_ik_coll) if wings_ik_coll else (wings_fk_coll or body_coll,),
+        )
+        wm_eb.length = max(0.24, rig_h * 0.15)
+        ctrl_styles[wm_ctrl_nm] = {
+            "widget": "wing_master",
+            "scale": max(0.20, min(0.85, rig_h * 0.16)),
+            "side": side,
+            "is_root": False,
+            "is_detail": False,
+            "category": "wing_master",
+            "lock_loc": True,
+            "rot_mode": "XYZ",
+        }
+        wing_ctrls.append(wm_ctrl_nm)
+        wing_ik_ctrls.append(wm_ctrl_nm)
+
+        # Alternating avian accordion Z-fold gains per segment: shoulder sweeps back, elbow closes inward, wrist tucks back!
+        _FOLD_Z_GAINS = (0.92, -1.48, 1.38, 0.45, 0.30) if not is_bat_wing else (0.78, -1.35, 1.18, 0.55, 0.35)
+        _FOLD_X_GAINS = (-0.18, 0.08, -0.06, -0.05, -0.04)
+        _CAMBER_X_GAINS = (-0.24, -0.34, -0.44, -0.38, -0.28)
 
         if len(w_ik_defs) >= 2 and w_tip_def in def_rest:
             pts_w = [def_rest[b][0] for b in w_ik_defs] + [def_rest[w_tip_def][0]]
             for b in w_ik_defs:
                 core_def_bones.add(b)
             core_def_bones.add(w_tip_def)
-            out_dir = Vector(((-1.0 if side == "L" else 1.0), 0.0, 0.0))
 
-            # 6a. Wing FK Chain (`CTRL_FK_Wing_L_0..N`, `CTRL_FK_Wing_L_Tip`)
+            # 6a. Wing FK Chain with Additive Wing-Plane `MCH_WingFold_*` parents (`CTRL_FK_Wing_L_0..N`, `CTRL_FK_Wing_L_Tip`)
             fk_wp = w_root_parent
             fk_binds_w: dict[str, str] = {}
             wg_fk_pairs: list[dict[str, str]] = []
             for idx, bname in enumerate(w_ik_defs):
+                seg_v = pts_w[idx + 1] - pts_w[idx]
+                seg_len = max(0.18, seg_v.length)
+                wf_mat, wf_bsign = _make_wing_plane_mat(pts_w[idx], seg_v, Vector((0.0, 0.0, 1.0)))
+                mf_nm = f"MCH_WingFold_{wname}_{idx}"
+                mf_eb = _new_bone(mf_nm, pts_w[idx], pts_w[idx + 1], fk_wp, matrix=wf_mat, colls=(mch_coll,))
+                mf_eb.length = seg_len
+                wing_fold_setups.append(
+                    {
+                        "mch_bone": mf_nm,
+                        "master_ctrl": wm_ctrl_nm,
+                        "fold_prop": w_fold_prop,
+                        "camber_prop": w_camber_prop,
+                        "z_gain": wf_bsign * _FOLD_Z_GAINS[min(idx, len(_FOLD_Z_GAINS) - 1)],
+                        "x_fold_gain": _FOLD_X_GAINS[min(idx, len(_FOLD_X_GAINS) - 1)],
+                        "x_camber_gain": _CAMBER_X_GAINS[min(idx, len(_CAMBER_X_GAINS) - 1)],
+                        "master_z_sign": wm_bsign,
+                    }
+                )
+
                 fk_nm = f"CTRL_FK_{wname}_{idx}"
-                seg_len = max(0.18, (pts_w[idx + 1] - pts_w[idx]).length)
-                fk_eb = _new_bone(fk_nm, pts_w[idx], pts_w[idx + 1], fk_wp, colls=(wings_fk_coll or body_coll,))
+                fk_eb = _new_bone(fk_nm, pts_w[idx], pts_w[idx + 1], mf_eb, matrix=wf_mat, colls=(wings_fk_coll or body_coll,))
+                fk_eb.length = seg_len
                 ctrl_styles[fk_nm] = {
                     "widget": "fk_ring",
                     "scale": _fit_scale(bname, max(0.20, rig_h * 0.14, seg_len * 0.28), min_s=0.14, max_s=max(0.68, rig_h * 0.18), mult=1.18),
@@ -4144,8 +4514,26 @@ def build_control_rig(
                 if w_extra_fk and (def_rest[w_extra_fk[0]][0] - tip_pos).length > 0.05
                 else (tip_pos + out_dir * max(0.28, rig_h * 0.22))
             )
+            tip_idx_f = len(w_ik_defs)
+            wt_mat, wt_bsign = _make_wing_plane_mat(tip_pos, tip_tail - tip_pos, Vector((0.0, 0.0, 1.0)))
+            mf_tip_nm = f"MCH_WingFold_{wname}_Tip"
+            mf_tip_eb = _new_bone(mf_tip_nm, tip_pos, tip_tail, fk_wp, matrix=wt_mat, colls=(mch_coll,))
+            mf_tip_eb.length = max(0.18, (tip_tail - tip_pos).length)
+            wing_fold_setups.append(
+                {
+                    "mch_bone": mf_tip_nm,
+                    "master_ctrl": wm_ctrl_nm,
+                    "fold_prop": w_fold_prop,
+                    "camber_prop": w_camber_prop,
+                    "z_gain": wt_bsign * _FOLD_Z_GAINS[min(tip_idx_f, len(_FOLD_Z_GAINS) - 1)],
+                    "x_fold_gain": _FOLD_X_GAINS[min(tip_idx_f, len(_FOLD_X_GAINS) - 1)],
+                    "x_camber_gain": _CAMBER_X_GAINS[min(tip_idx_f, len(_CAMBER_X_GAINS) - 1)],
+                    "master_z_sign": wm_bsign,
+                }
+            )
             fk_tip_nm = f"CTRL_FK_{wname}_Tip"
-            fk_tip_eb = _new_bone(fk_tip_nm, tip_pos, tip_tail, fk_wp, colls=(wings_fk_coll or body_coll,))
+            fk_tip_eb = _new_bone(fk_tip_nm, tip_pos, tip_tail, mf_tip_eb, matrix=wt_mat, colls=(wings_fk_coll or body_coll,))
+            fk_tip_eb.length = max(0.18, (tip_tail - tip_pos).length)
             ctrl_styles[fk_tip_nm] = {
                 "widget": "fk_ring",
                 "scale": _fit_scale(w_tip_def, max(0.17, rig_h * 0.12), min_s=0.12, max_s=max(0.52, rig_h * 0.15), mult=1.18),
@@ -4161,7 +4549,7 @@ def build_control_rig(
             wing_ctrls.append(fk_tip_nm)
             limb_fk_chains["wings"].append({"name": wname, "fk_pairs": wg_fk_pairs})
 
-            # 6b. Wing IK Chain (`MCH_IK_Wing_L_*`, `CTRL_IK_Wing_L` wingtip box, `CTRL_Pole_Wing_L` elbow diamond!)
+            # 6b. Wing IK Chain (`MCH_IK_Wing_L_*`, `CTRL_IK_Wing_L` aerodynamic wingtip, `CTRL_Pole_Wing_L` elbow pole!)
             mch_w_chain: list[Any] = []
             ik_binds_w: dict[str, str] = {}
             for idx, bname in enumerate(w_ik_defs):
@@ -4183,7 +4571,7 @@ def build_control_rig(
             ctrl_wtip = _new_bone(ctrl_wtip_nm, tip_pos, tip_tail, ctrl_cog, colls=(wings_ik_coll or body_coll,))
             wing_ik_ctrls.append(ctrl_wtip_nm)
             ctrl_styles[ctrl_wtip_nm] = {
-                "widget": "box",
+                "widget": "wing_ik",
                 "scale": _fit_scale(w_tip_def, max(0.22, rig_h * 0.14), min_s=0.16, max_s=max(0.62, rig_h * 0.17), mult=1.22),
                 "side": side, "is_root": False, "is_detail": False, "category": "body", "lock_loc": False, "rot_mode": "XYZ",
             }
@@ -4192,7 +4580,7 @@ def build_control_rig(
                 prefix="MCH_BindIK_", ik_prop="hfw_ik_fk_wings", ik_invert=False, con_name="HFW_IK_Xform",
             )
 
-            # Dual-space Follow sockets on EVERY wing segment so wing ribs, wing fingers, engines & wing plates track BOTH Wing IK & FK!
+            # Dual-space Follow sockets on EVERY wing segment so feathers, wing ribs, wing fingers & plates track BOTH Wing IK & FK!
             for bname in list(w_ik_defs) + [w_tip_def]:
                 _make_dual_follow_socket(bname, fk_binds_w[bname], ik_binds_w[bname], "hfw_ik_fk_wings")
 
@@ -4202,7 +4590,7 @@ def build_control_rig(
             ctrl_wpole_nm = f"CTRL_Pole_{wname}"
             _new_bone(ctrl_wpole_nm, wpole_pos, wpole_pos + w_fb.normalized() * max(0.14, rig_h * 0.09), ctrl_cog, colls=(wings_ik_coll or body_coll,))
             ctrl_styles[ctrl_wpole_nm] = {
-                "widget": "diamond", "scale": max(0.16, rig_h * 0.11), "side": side,
+                "widget": "pole", "scale": max(0.16, rig_h * 0.11), "side": side,
                 "is_root": False, "is_detail": False, "category": "body", "lock_loc": False,
             }
             ik_setups.append(
@@ -4227,17 +4615,34 @@ def build_control_rig(
                 }
             )
 
-            # Extra outer wing tip FK segments riding on `MCH_Follow_<w_tip_def>`
+            # Extra outer wing tip FK segments riding on `MCH_Follow_<w_tip_def>` with additive `MCH_WingFold_*`
             ex_wp = def_to_driver_eb[w_tip_def]
             for ei, wb in enumerate(w_extra_fk):
                 core_def_bones.add(wb)
                 h_p = def_rest[wb][0]
                 t_p = def_rest[w_extra_fk[ei + 1]][0] if (ei + 1 < len(w_extra_fk)) else (h_p + out_dir * max(0.24, rig_h * 0.18))
+                ex_mat, ex_bsign = _make_wing_plane_mat(h_p, t_p - h_p, Vector((0.0, 0.0, 1.0)))
+                mf_ex_nm = f"MCH_WingFold_{wname}_Outer_{ei:02d}"
+                mf_ex_eb = _new_bone(mf_ex_nm, h_p, t_p, ex_wp, matrix=ex_mat, colls=(mch_coll,))
+                mf_ex_eb.length = max(0.14, (t_p - h_p).length)
+                wing_fold_setups.append(
+                    {
+                        "mch_bone": mf_ex_nm,
+                        "master_ctrl": wm_ctrl_nm,
+                        "fold_prop": w_fold_prop,
+                        "camber_prop": w_camber_prop,
+                        "z_gain": ex_bsign * _FOLD_Z_GAINS[-1],
+                        "x_fold_gain": _FOLD_X_GAINS[-1],
+                        "x_camber_gain": _CAMBER_X_GAINS[-1],
+                        "master_z_sign": wm_bsign,
+                    }
+                )
                 ex_nm = f"CTRL_FK_{wname}_Outer_{ei:02d}"
-                ex_eb = _new_bone(ex_nm, h_p, t_p, ex_wp, colls=(wings_fk_coll or body_coll,))
+                ex_eb = _new_bone(ex_nm, h_p, t_p, mf_ex_eb, matrix=ex_mat, colls=(wings_fk_coll or body_coll,))
+                ex_eb.length = max(0.14, (t_p - h_p).length)
                 ctrl_styles[ex_nm] = {
                     "widget": "fk_ring", "scale": max(0.18, rig_h * 0.13), "side": side,
-                    "is_root": False, "is_detail": False, "category": "body", "lock_loc": True,
+                    "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
                 }
                 _make_bind_child(wb, ex_eb, "hfw_rig_arms_ik", "ROTATION")
                 bake_fk_pairs.append({"ctrl": ex_nm, "def_bone": wb, "mode": "ROTATION"})
@@ -4250,17 +4655,35 @@ def build_control_rig(
             for i, wb in enumerate(w_full):
                 core_def_bones.add(wb)
                 if wb in w_handles:
+                    hi = w_handles.index(wb)
                     h_pos = def_rest[wb][0]
                     t_pos = (
                         def_rest[w_full[i + 1]][0]
                         if (i + 1 < len(w_full))
-                        else (h_pos + Vector(((-1.0 if side == "R" else 1.0) * max(0.28, rig_h * 0.22), 0.0, 0.0)))
+                        else (h_pos + out_dir * max(0.28, rig_h * 0.22))
                     )
-                    cname = f"CTRL_{wname}_{w_handles.index(wb):02d}"
-                    c_eb = _new_bone(cname, h_pos, t_pos, w_parent, colls=(wings_fk_coll or body_coll,))
+                    wf_mat, wf_bsign = _make_wing_plane_mat(h_pos, t_pos - h_pos, Vector((0.0, 0.0, 1.0)))
+                    mf_nm = f"MCH_WingFold_{wname}_{hi:02d}"
+                    mf_eb = _new_bone(mf_nm, h_pos, t_pos, w_parent, matrix=wf_mat, colls=(mch_coll,))
+                    mf_eb.length = max(0.16, (t_pos - h_pos).length)
+                    wing_fold_setups.append(
+                        {
+                            "mch_bone": mf_nm,
+                            "master_ctrl": wm_ctrl_nm,
+                            "fold_prop": w_fold_prop,
+                            "camber_prop": w_camber_prop,
+                            "z_gain": wf_bsign * _FOLD_Z_GAINS[min(hi, len(_FOLD_Z_GAINS) - 1)],
+                            "x_fold_gain": _FOLD_X_GAINS[min(hi, len(_FOLD_X_GAINS) - 1)],
+                            "x_camber_gain": _CAMBER_X_GAINS[min(hi, len(_CAMBER_X_GAINS) - 1)],
+                            "master_z_sign": wm_bsign,
+                        }
+                    )
+                    cname = f"CTRL_{wname}_{hi:02d}"
+                    c_eb = _new_bone(cname, h_pos, t_pos, mf_eb, matrix=wf_mat, colls=(wings_fk_coll or body_coll,))
+                    c_eb.length = max(0.16, (t_pos - h_pos).length)
                     ctrl_styles[cname] = {
                         "widget": "fk_ring", "scale": max(0.26, rig_h * 0.18), "side": side,
-                        "is_root": False, "is_detail": False, "category": "body", "lock_loc": True,
+                        "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
                     }
                     _make_bind_child(wb, c_eb, "hfw_rig_arms_ik", "ROTATION")
                     bake_fk_pairs.append({"ctrl": cname, "def_bone": wb, "mode": "ROTATION"})
@@ -4269,6 +4692,88 @@ def build_control_rig(
                     def_to_driver_eb[wb] = c_eb
                 else:
                     def_to_driver_eb[wb] = w_parent
+
+        # 6c. Progressive Feathers, Wing Plates & Bat Wing Ribs (`MCH_WingFeather_*` -> `CTRL_WingFeather_*` in `Wings_Feather_Tweaks`)!
+        f_count = 0
+        n_fc = max(1, len(w_feathers))
+        for fi, fc in enumerate(w_feathers):
+            fc_bones = [b for b in fc["bones"] if b in def_rest and b not in driven_def_bones]
+            if not fc_bones:
+                continue
+            p_def = fc.get("parent_def")
+            fc_parent = def_to_driver_eb.get(p_def) or _find_parent_driver(fc_bones[0], w_root_parent)
+            if fc_parent is None:
+                continue
+            span_t = float(fc.get("span_t", fi / max(1, n_fc - 1)))
+            order_u = (fi / max(1, n_fc - 1)) if n_fc > 1 else 0.5
+            # Progressive spread gradient: inner feathers fan less, outer primaries fan widest!
+            prog_fan = (order_u - 0.35) * 0.85 if fc.get("kind") != "secondary" else (order_u - 0.50) * 0.45
+            n_fb = len(fc_bones)
+            for bi, fb_nm in enumerate(fc_bones):
+                bh, bt, bm, bl = def_rest[fb_nm]
+                if bi + 1 < n_fb and (def_rest[fc_bones[bi + 1]][0] - bh).length > 0.01:
+                    ftail = def_rest[fc_bones[bi + 1]][0]
+                else:
+                    ftail = bt if (bt - bh).length > 0.02 else (bh - fwd_vec * max(0.14, rig_h * 0.08))
+                fm_mat, fm_bsign = _make_wing_plane_mat(bh, ftail - bh, Vector((0.0, 0.0, 1.0)))
+                f_seg_len = max(0.06, (ftail - bh).length)
+                mf_f_nm = _unique_name(f"MCH_WingFeather_{wname}_{fi:02d}_{bi:02d}")
+                mf_f_eb = _new_bone(mf_f_nm, bh, ftail, fc_parent, matrix=fm_mat, colls=(mch_coll,))
+                mf_f_eb.length = f_seg_len
+
+                # Root feather joint drives stacking (fold) & progressive fan spread; all joints drive smooth aerodynamic camber curl!
+                if bi == 0:
+                    stack_z = fm_bsign * (0.28 + 0.52 * span_t)
+                    fan_z = -fm_bsign * (0.20 + 0.62 * prog_fan)
+                else:
+                    stack_z = fm_bsign * 0.12
+                    fan_z = -fm_bsign * (0.08 * prog_fan)
+                camber_x = -(0.22 + 0.28 * ((bi + 1) / max(1, n_fb)))
+                wing_feather_setups.append(
+                    {
+                        "mch_bone": mf_f_nm,
+                        "master_ctrl": wm_ctrl_nm,
+                        "fold_prop": w_fold_prop,
+                        "fan_prop": w_fan_prop,
+                        "camber_prop": w_camber_prop,
+                        "stack_z": stack_z,
+                        "fan_z": fan_z,
+                        "camber_x": camber_x,
+                        "master_z_sign": wm_bsign,
+                    }
+                )
+
+                cf_nm = _unique_name(f"CTRL_WingFeather_{fc['name']}_{bi:02d}")
+                cf_eb = _new_bone(cf_nm, bh, ftail, mf_f_eb, matrix=fm_mat, colls=(wings_feathers_coll or frill_coll or body_coll,))
+                cf_eb.length = f_seg_len
+                ctrl_styles[cf_nm] = {
+                    "widget": "feather",
+                    "scale": _fit_scale(fb_nm, max(0.08, min(0.36, f_seg_len * 0.65)), 0.06, 0.40, 1.05),
+                    "side": side,
+                    "is_root": False,
+                    "is_detail": True,
+                    "category": "frills",
+                    "lock_loc": True,
+                    "rot_mode": "XYZ",
+                }
+                _make_bind_child(fb_nm, cf_eb, "hfw_rig_arms_ik", "ROTATION")
+                bake_fk_pairs.append({"ctrl": cf_nm, "def_bone": fb_nm, "mode": "ROTATION"})
+                fc_parent = cf_eb
+                def_to_driver_eb[fb_nm] = cf_eb
+                f_count += 1
+
+        wing_rig_meta.append(
+            {
+                "name": wname,
+                "side": side,
+                "master_ctrl": wm_ctrl_nm,
+                "fold_prop": w_fold_prop,
+                "fan_prop": w_fan_prop,
+                "camber_prop": w_camber_prop,
+                "is_bat_wing": is_bat_wing,
+                "feather_bones": f_count,
+            }
+        )
 
     # --- 7. Legs: Quad/Hex Independent Front+Rear IK/FK + Scapula/Shoulders + Aquatic Flipper Tips + Full Follow Sockets! ---
     for lg in spec["legs"]:
@@ -4297,7 +4802,7 @@ def build_control_rig(
                 colls=(body_coll,),
             )
             ctrl_styles[sh_ctrl.name] = {
-                "widget": "fk_ring",
+                "widget": "shoulder",
                 "scale": _fit_scale(sh_bone, max(0.18, rig_h * 0.12), min_s=0.14, max_s=max(0.75, rig_h * 0.18), mult=1.18),
                 "side": side, "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
             }
@@ -4395,7 +4900,7 @@ def build_control_rig(
             colls=(lg_ik_coll,),
         )
         ctrl_styles[ctrl_foot_name] = {
-            "widget": "box",
+            "widget": "foot_ik",
             "scale": _fit_scale(
                 foot_def,
                 max(0.20, rig_h * 0.14),
@@ -4489,7 +4994,7 @@ def build_control_rig(
                 colls=(body_coll,),
             )
             ctrl_styles[c_ctrl.name] = {
-                "widget": "fk_ring",
+                "widget": "shoulder",
                 "scale": _fit_scale(clav, max(0.15, rig_h * 0.10), min_s=0.10, max_s=0.28 if is_humanoid else max(0.65, rig_h * 0.15), mult=1.15),
                 "side": side, "is_root": False, "is_detail": False, "category": "body", "lock_loc": True, "rot_mode": "XYZ",
             }
@@ -4587,7 +5092,7 @@ def build_control_rig(
             colls=(arms_ik_coll,),
         )
         ctrl_styles[ctrl_hand_name] = {
-            "widget": "box",
+            "widget": "hand_ik",
             "scale": _fit_scale(
                 hand_def,
                 max(0.14, rig_h * 0.10),
@@ -5671,6 +6176,79 @@ def build_control_rig(
         sgn = float(spd_item.get("sign", 1.0))
         drv.expression = f"{sgn:.1f} * ({dial_sum} + frame * (ms + gs) * 0.45)"
 
+    # 1g. Avian / Flyer Wing Fold, Feather Fan & Aerodynamic Camber Custom Properties + Drivers!
+    if wing_rig_meta:
+        for wm in wing_rig_meta:
+            for pk, pmin, pmax, pdesc in (
+                (wm["fold_prop"], -0.25, 1.0, f"{wm['name']} Accordion Fold (0 = Spread, 1 = Folded)"),
+                (wm["fan_prop"], -1.0, 1.0, f"{wm['name']} Feather/Rib Fan (-1 = Stacked, +1 = Wide Fan)"),
+                (wm["camber_prop"], -1.0, 1.0, f"{wm['name']} Airfoil Camber (-1 = Upstroke, +1 = Downstroke Cup)"),
+            ):
+                if pk not in arm_obj:
+                    arm_obj[pk] = 0.0
+                try:
+                    arm_obj.id_properties_ui(pk).update(min=pmin, max=pmax, soft_min=pmin, soft_max=pmax, description=pdesc)
+                except Exception:
+                    pass
+
+        def _add_wing_drv_var(drv_obj: Any, vname: str, data_path: str) -> None:
+            vv = drv_obj.variables.new()
+            vv.name = vname
+            vv.type = "SINGLE_PROP"
+            vv.targets[0].id_type = "OBJECT"
+            vv.targets[0].id = arm_obj
+            vv.targets[0].data_path = data_path
+
+        for wfs in wing_fold_setups:
+            pb_wf = pbones.get(wfs["mch_bone"])
+            if pb_wf is None:
+                continue
+            pb_wf.rotation_mode = "XYZ"
+            mc = wfs["master_ctrl"]
+            mzs = float(wfs["master_z_sign"])
+            # Z-axis: Accordion Wing Fold (slider + CTRL_Wing_Master_L/R local Z rotation!)
+            dz = pb_wf.driver_add("rotation_euler", 2).driver
+            dz.type = "SCRIPTED"
+            _add_wing_drv_var(dz, "f", f'["{wfs["fold_prop"]}"]')
+            _add_wing_drv_var(dz, "mz", f'pose.bones["{mc}"].rotation_euler[2]')
+            dz.expression = f"({float(wfs['z_gain']):.4f}) * min(max(f + ({mzs:.1f})*mz, -0.35), 1.15)"
+            # X-axis: Aerodynamic Camber + subtle fold tuck (slider + CTRL_Wing_Master_L/R local X rotation!)
+            dx = pb_wf.driver_add("rotation_euler", 0).driver
+            dx.type = "SCRIPTED"
+            _add_wing_drv_var(dx, "f", f'["{wfs["fold_prop"]}"]')
+            _add_wing_drv_var(dx, "c", f'["{wfs["camber_prop"]}"]')
+            _add_wing_drv_var(dx, "mz", f'pose.bones["{mc}"].rotation_euler[2]')
+            _add_wing_drv_var(dx, "mx", f'pose.bones["{mc}"].rotation_euler[0]')
+            dx.expression = (
+                f"({float(wfs['x_fold_gain']):.4f}) * min(max(f + ({mzs:.1f})*mz, -0.35), 1.15)"
+                f" + ({float(wfs['x_camber_gain']):.4f}) * min(max(c + mx, -1.2), 1.2)"
+            )
+
+        for wfe in wing_feather_setups:
+            pb_fe = pbones.get(wfe["mch_bone"])
+            if pb_fe is None:
+                continue
+            pb_fe.rotation_mode = "XYZ"
+            mc = wfe["master_ctrl"]
+            mzs = float(wfe["master_z_sign"])
+            # Z-axis: Progressive Feather Stacking (with Fold) + Feather Fan Spread (with Fan / Master Y rot!)
+            dz = pb_fe.driver_add("rotation_euler", 2).driver
+            dz.type = "SCRIPTED"
+            _add_wing_drv_var(dz, "f", f'["{wfe["fold_prop"]}"]')
+            _add_wing_drv_var(dz, "fn", f'["{wfe["fan_prop"]}"]')
+            _add_wing_drv_var(dz, "mz", f'pose.bones["{mc}"].rotation_euler[2]')
+            _add_wing_drv_var(dz, "my", f'pose.bones["{mc}"].rotation_euler[1]')
+            dz.expression = (
+                f"({float(wfe['stack_z']):.4f}) * min(max(f + ({mzs:.1f})*mz, -0.35), 1.15)"
+                f" + ({float(wfe['fan_z']):.4f}) * min(max(fn + my, -1.2), 1.2)"
+            )
+            # X-axis: Progressive Aerodynamic Feather Camber Curl
+            dx = pb_fe.driver_add("rotation_euler", 0).driver
+            dx.type = "SCRIPTED"
+            _add_wing_drv_var(dx, "c", f'["{wfe["camber_prop"]}"]')
+            _add_wing_drv_var(dx, "mx", f'pose.bones["{mc}"].rotation_euler[0]')
+            dx.expression = f"({float(wfe['camber_x']):.4f}) * min(max(c + mx, -1.2), 1.2)"
+
     # 2. Dual-space follow sockets (`MCH_Follow_*`) for fingers/toes so they track FK OR IK seamlessly!
     for fs in follow_setups:
         pb_f = pbones.get(fs["follow_mch"])
@@ -5939,6 +6517,7 @@ def build_control_rig(
         "spin_ctrls": spin_ctrls,
         "wing_ctrls": wing_ctrls,
         "wing_ik_ctrls": wing_ik_ctrls,
+        "wing_rig": wing_rig_meta,
         "appendage_ctrls": appendage_ctrls,
         "category_counts": cat_counts,
     }
@@ -7314,11 +7893,18 @@ def mirror_control_rig_pose(arm_obj: Any, source_side: str = "L") -> int:
 
 
 def reset_control_rig_pose(arm_obj: Any) -> None:
-    """Reset all `CTRL_*` pose bones back to their clean rest transforms."""
+    """Reset all `CTRL_*` pose bones and wing fold/fan/camber sliders back to their clean rest transforms."""
     if bpy is None or arm_obj is None or arm_obj.type != "ARMATURE":
         return
     for pb in arm_obj.pose.bones:
         if pb.name.startswith("CTRL_"):
             pb.matrix_basis = Matrix.Identity(4)
+    for pk in (
+        "hfw_wing_fold_L", "hfw_wing_fold_R",
+        "hfw_wing_fan_L", "hfw_wing_fan_R",
+        "hfw_wing_camber_L", "hfw_wing_camber_R",
+    ):
+        if pk in arm_obj:
+            arm_obj[pk] = 0.0
     arm_obj.update_tag()
     bpy.context.view_layer.update()

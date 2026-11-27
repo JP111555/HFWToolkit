@@ -67,7 +67,9 @@ def test_machine_variant_profiles_authentic() -> None:
     assert cor["muscle_color"][0] > 0.85 and cor["muscle_color"][1] < 0.15
 
     assert ovr["profile"] == "overridden"
-    assert ovr["muscle_color"][2] > 0.85 and ovr["muscle_color"][1] > 0.45
+    # Overridden machines keep Standard Amber muscles and change ONLY their optical sensors to Cyan!
+    assert ovr["muscle_color"] == std["muscle_color"]
+    assert ovr["eye_color"][2] > 0.85 and ovr["eye_color"][1] > 0.65
 
 
 def test_apex_machine_shader_controls_and_ue5_mpc(hfw_env, tmp_path: Path) -> None:

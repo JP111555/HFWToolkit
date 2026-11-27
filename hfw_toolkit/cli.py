@@ -116,6 +116,27 @@ def _cmd_doctor(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
     print(f"  DXCompiler DLL    : {diag['dxc_path']} [{'OK' if diag['dxc_found'] else 'MISSING'}]")
     print(f"  Audio Codec (PyAV): {'OK (Sony ATRAC9 + WAV/FLAC/MP3/OGG)' if has_pyav() else 'MISSING (run: pip install av)'}")
     print(f"  Blender Exe       : {diag['blender_exe']} [{'OK' if diag['blender_found'] else 'NOT FOUND'}]")
+    try:
+        from hfw_toolkit.updater import detect_system_pythons, get_local_version_info
+
+        py_info = detect_system_pythons(cfg.toolkit_dir)
+        newest = py_info.get("newest_system_python")
+        py_note = (
+            f"v{py_info['current_version']} ({'venv' if py_info['in_venv'] else 'system'})"
+            + (
+                f" — newer system Python v{newest['version']} available (run Setup_And_Doctor.bat --upgrade-python)"
+                if py_info.get("upgrade_available") and newest
+                else " [NEWEST]"
+            )
+        )
+        print(f"  Python Runtime    : {py_note}")
+        loc_v = get_local_version_info(cfg.toolkit_dir)
+        print(
+            f"  Toolkit Version   : {loc_v['short_sha']} ({loc_v['install_mode']} / {loc_v['branch']})"
+            + f" | Auto-Update ({cfg.update_branch}): {'ON' if cfg.auto_update else 'OFF (opt-in)'}"
+        )
+    except Exception:
+        pass
     if cat_built:
         print(
             f"  Asset Catalog DB  : READY ({cat_stats.get('machines', 0)} machines, "
@@ -1106,11 +1127,67 @@ def _cmd_animations(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
         game.close()
 
 
+def _cmd_update(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
+    from hfw_toolkit.updater import apply_update, check_for_updates
+
+    branch = args.branch or cfg.update_branch or "main"
+    if args.enable_auto is not None:
+        cfg.auto_update = bool(args.enable_auto)
+        cfg.update_branch = branch
+        cfg.save()
+        print(f"[HFWToolkit] Auto-updates ({branch}) set to: {'ENABLED' if cfg.auto_update else 'DISABLED'}")
+        if not args.apply and not args.check:
+            return 0
+
+    if args.apply:
+        print(f"[HFWToolkit] Updating from GitHub ({branch} branch)...")
+        res = apply_update(cfg, branch=branch, force=bool(args.force), reinstall_deps=not args.no_deps)
+        print(f"  Status  : {res['status'].upper()}")
+        print(f"  Message : {res['message']}")
+        for step in res.get("steps") or []:
+            print(f"    • {step}")
+        return 0 if res["status"] in ("updated", "up_to_date") else 1
+
+    st = check_for_updates(cfg, branch=branch)
+    loc = st["local"]
+    rem = st.get("remote")
+    print("=" * 72)
+    print(" HFWToolkit — GitHub Update Check")
+    print("=" * 72)
+    print(f"  Repository    : {st['repo']} (target branch: {st['target_branch']})")
+    print(f"  Install Mode  : {loc['install_mode']} (branch: {loc['branch']}, commit: {loc['short_sha']})")
+    if st.get("error"):
+        print(f"  Remote Check  : {st['error']}")
+        return 1
+    if rem:
+        print(f"  Remote Latest : {rem['short_sha']} ({rem['commit_date']}) — {rem['commit_message']}")
+    if st["update_available"]:
+        print("  Result        : UPDATE AVAILABLE — run `hfw-toolkit update --apply` to update.")
+    elif st.get("ahead_of_remote"):
+        print("  Result        : Local checkout already includes the latest main commit (ahead of main).")
+    else:
+        print("  Result        : Up to date!")
+    print(f"  Auto-Update   : {'ENABLED' if cfg.auto_update else 'DISABLED (opt-in via `hfw-toolkit update --auto-on`)'}")
+    print("=" * 72)
+    return 0
+
+
 def _cmd_web(args: argparse.Namespace, cfg: ToolkitConfig) -> int:
     import uvicorn
     from hfw_toolkit.web import create_app
 
     cfg.ensure_dirs()
+    if cfg.auto_update:
+        try:
+            from hfw_toolkit.updater import apply_update, check_for_updates
+
+            st = check_for_updates(cfg)
+            if st.get("update_available"):
+                print(f"[HFWToolkit] Auto-update enabled — updating from GitHub ({st['target_branch']})...")
+                res = apply_update(cfg)
+                print(f"[HFWToolkit] {res['message']}")
+        except Exception as exc:
+            print(f"[HFWToolkit] Startup auto-update skipped: {exc}")
     cat = AssetCatalog(cfg.index_db_path)
     built = cat.is_built()
     cat.close()
@@ -1218,6 +1295,15 @@ def main(argv: list[str] | None = None) -> int:
     p_w.add_argument("--host", default="127.0.0.1")
     p_w.add_argument("--port", type=int, default=8420)
     p_w.add_argument("--no-browser", action="store_true")
+
+    p_up = sub.add_parser("update", help="Check for or apply updates from GitHub main branch (git or ZIP install)")
+    p_up.add_argument("--check", action="store_true", help="Check GitHub main branch for newer commits (default)")
+    p_up.add_argument("--apply", action="store_true", help="Download & apply latest update from GitHub")
+    p_up.add_argument("--branch", default=None, help="Override target GitHub branch (default: main)")
+    p_up.add_argument("--force", action="store_true", help="Allow updating even with local git changes / non-main branch")
+    p_up.add_argument("--no-deps", action="store_true", help="Skip refreshing pip dependencies after update")
+    p_up.add_argument("--auto-on", dest="enable_auto", action="store_true", default=None, help="Enable opt-in auto-updates on startup")
+    p_up.add_argument("--auto-off", dest="enable_auto", action="store_false", help="Disable auto-updates on startup")
 
     # Audio / Music / SFX / Voicelines subcommand group
     p_au = sub.add_parser("audio", help="Browse, search, index & extract HFW Music, SFX, and Voicelines")
@@ -1351,6 +1437,7 @@ def main(argv: list[str] | None = None) -> int:
         "animations": _cmd_animations,
         "characters": _cmd_characters,
         "assets": _cmd_assets,
+        "update": _cmd_update,
         "web": _cmd_web,
     }
     return dispatch[args.cmd](args, cfg)

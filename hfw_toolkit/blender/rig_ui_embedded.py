@@ -388,6 +388,13 @@ class HFW_OT_NativeResetPose(bpy.types.Operator):
         for pb in arm.pose.bones:
             if pb.name.startswith("CTRL_"):
                 pb.matrix_basis = Matrix.Identity(4)
+        for pk in (
+            "hfw_wing_fold_L", "hfw_wing_fold_R",
+            "hfw_wing_fan_L", "hfw_wing_fan_R",
+            "hfw_wing_camber_L", "hfw_wing_camber_R",
+        ):
+            if pk in arm:
+                arm[pk] = 0.0
         arm.update_tag()
         bpy.context.view_layer.update()
         return {"FINISHED"}
@@ -486,6 +493,46 @@ class HFW_OT_NativeSerpentPose(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HFW_OT_NativeWingPose(bpy.types.Operator):
+    bl_idname = "hfw_rig.wing_pose"
+    bl_label = "Apply Wing Preset"
+    bl_options = {"REGISTER", "UNDO"}
+    preset: bpy.props.StringProperty(default="SPREAD")
+
+    def execute(self, context):
+        arm = _active_hfw_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        if self.preset == "SYNC_LR":
+            for stem in ("hfw_wing_fold", "hfw_wing_fan", "hfw_wing_camber"):
+                kl, kr = f"{stem}_L", f"{stem}_R"
+                if kl in arm and kr in arm:
+                    arm[kr] = float(arm[kl])
+        else:
+            # (fold, fan, camber)
+            presets = {
+                "SPREAD": (0.0, 0.35, 0.05),
+                "GLIDE": (-0.08, 0.60, 0.25),
+                "FLAP": (0.08, 0.25, 0.85),
+                "DIVE": (0.58, -0.45, -0.25),
+                "FOLD": (0.95, -0.75, 0.10),
+            }
+            fv, fnv, cv = presets.get(self.preset, (0.0, 0.0, 0.0))
+            for s in ("L", "R"):
+                if f"hfw_wing_fold_{s}" in arm:
+                    arm[f"hfw_wing_fold_{s}"] = fv
+                if f"hfw_wing_fan_{s}" in arm:
+                    arm[f"hfw_wing_fan_{s}"] = fnv
+                if f"hfw_wing_camber_{s}" in arm:
+                    arm[f"hfw_wing_camber_{s}"] = cv
+                mc = f"CTRL_Wing_Master_{s}"
+                if mc in arm.pose.bones:
+                    arm.pose.bones[mc].matrix_basis = Matrix.Identity(4)
+        arm.update_tag()
+        bpy.context.view_layer.update()
+        return {"FINISHED"}
+
+
 class HFW_OT_NativeMirrorPose(bpy.types.Operator):
     bl_idname = "hfw_rig.mirror_pose"
     bl_label = "Mirror Pose"
@@ -548,27 +595,47 @@ class HFW_OT_NativeToggleLayer(bpy.types.Operator):
 
 class HFW_OT_NativeShaderPreset(bpy.types.Operator):
     bl_idname = "hfw_rig.shader_preset"
-    bl_label = "Apply Machine Shader Preset"
+    bl_label = "Apply Machine Eye or Muscle Preset"
     bl_options = {"REGISTER", "UNDO"}
-    preset: bpy.props.StringProperty(default="PATROL")
+    preset: bpy.props.StringProperty(default="EYE_PATROL")
 
     def execute(self, context):
         arm = _active_hfw_armature(context)
         if arm is None:
             return {"CANCELLED"}
-        presets = {
-            "PATROL": ((0.95, 0.28, 0.02), (0.04, 0.56, 1.0), 0.0),
-            "ALERT": ((0.95, 0.28, 0.02), (1.0, 0.06, 0.02), 1.0),
-            "APEX": ((0.54, 0.05, 1.0), (0.64, 0.05, 1.0), 0.0),
-            "OVERRIDDEN": ((0.02, 0.78, 1.0), (0.04, 0.90, 1.0), 0.0),
+        # Lore-accurate decoupling:
+        #   - EYE_* presets change ONLY eye optics (Overridden turns eyes Cyan while keeping muscles unchanged!)
+        #   - MUSCLE_* presets change ONLY muscle fibers (Standard Amber / Apex Purple / Corrupted Crimson!)
+        eye_presets = {
+            "EYE_PATROL": ((0.04, 0.56, 1.0), 0.0),      # Calm Patrol Blue
+            "EYE_SUSPICIOUS": ((1.0, 0.72, 0.03), 0.0),  # Suspicious Yellow
+            "EYE_ALERT": ((1.0, 0.06, 0.02), 1.0),       # Hostile Combat Red
+            "EYE_OVERRIDDEN": ((0.03, 0.82, 1.0), 0.0),  # Overridden Electric Cyan (Eyes ONLY!)
+            # Legacy preset keys mapped safely without falsely coloring muscles blue on Override
+            "PATROL": ((0.04, 0.56, 1.0), 0.0),
+            "ALERT": ((1.0, 0.06, 0.02), 1.0),
+            "OVERRIDDEN": ((0.03, 0.82, 1.0), 0.0),
         }
-        mc, ec, alert_v = presets.get(self.preset, presets["PATROL"])
-        if "hfw_sh_muscle_color" in arm:
-            arm["hfw_sh_muscle_color"] = mc
-        if "hfw_sh_eye_color" in arm and self.preset != "ALERT":
-            arm["hfw_sh_eye_color"] = ec
-        if "hfw_sh_eye_alert" in arm:
-            arm["hfw_sh_eye_alert"] = alert_v
+        muscle_presets = {
+            "MUSCLE_STANDARD": (0.95, 0.28, 0.02),       # Standard Warm Amber
+            "MUSCLE_APEX": (0.54, 0.05, 1.0),            # Apex Violet-Purple
+            "MUSCLE_CORRUPTED": (1.0, 0.05, 0.01),       # Corrupted Crimson
+            "APEX": (0.54, 0.05, 1.0),
+        }
+        if self.preset in eye_presets:
+            ec, alert_v = eye_presets[self.preset]
+            if "hfw_sh_eye_color" in arm and self.preset not in ("EYE_ALERT", "ALERT"):
+                arm["hfw_sh_eye_color"] = ec
+            if "hfw_sh_eye_alert" in arm:
+                arm["hfw_sh_eye_alert"] = alert_v
+        if self.preset in muscle_presets:
+            mc = muscle_presets[self.preset]
+            if "hfw_sh_muscle_color" in arm:
+                arm["hfw_sh_muscle_color"] = mc
+            if self.preset == "APEX" and "hfw_sh_eye_color" in arm:
+                arm["hfw_sh_eye_color"] = (0.64, 0.05, 1.0)
+                if "hfw_sh_eye_alert" in arm:
+                    arm["hfw_sh_eye_alert"] = 0.0
         arm.update_tag()
         bpy.context.view_layer.update()
         return {"FINISHED"}
@@ -654,6 +721,65 @@ class HFW_PT_RigUI_IKFK(bpy.types.Panel):
             _row_ik(lbl, "arms", "hfw_ik_fk_arms")
         if "wings_ik" in slots and "hfw_ik_fk_wings" in arm:
             _row_ik("Wings", "wings", "hfw_ik_fk_wings")
+
+
+class HFW_PT_RigUI_Wings(bpy.types.Panel):
+    bl_label = "Flyer Wings (Fold, Fan & Camber)"
+    bl_idname = "HFW_PT_rig_ui_wings"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Item"
+    bl_parent_id = "HFW_PT_rig_ui_native"
+
+    @classmethod
+    def poll(cls, context):
+        arm = _active_hfw_armature(context)
+        if not arm:
+            return False
+        meta, _ = _read_meta(arm)
+        return bool(meta.get("wing_rig"))
+
+    def draw(self, context):
+        layout = self.layout
+        arm = _active_hfw_armature(context)
+        meta, slots = _read_meta(arm)
+        wrig = meta.get("wing_rig") or []
+
+        # 1-Click Avian Flight & Fold Poses
+        pr = layout.row(align=True)
+        for pid, plbl in (("SPREAD", "Spread"), ("GLIDE", "Glide"), ("FLAP", "Downstroke"), ("DIVE", "Dive"), ("FOLD", "Fold")):
+            op = pr.operator("hfw_rig.wing_pose", text=plbl)
+            op.preset = pid
+
+        # Select Wing Masters + Sync L=R + Toggle Feather Tweaks
+        tr = layout.row(align=True)
+        masters = [w["master_ctrl"] for w in wrig if w.get("master_ctrl") in arm.pose.bones]
+        if masters:
+            osel = tr.operator("hfw_rig.select_bones", text="Wing Masters", icon="RESTRICT_SELECT_OFF")
+            osel.bone_names_csv = ",".join(masters)
+        osync = tr.operator("hfw_rig.wing_pose", text="Sync L=R", icon="MOD_MIRROR")
+        osync.preset = "SYNC_LR"
+        fcoll_nm = slots.get("wings_feathers")
+        all_c = _all_bcolls(arm)
+        if fcoll_nm and fcoll_nm in all_c:
+            of = tr.operator("hfw_rig.toggle_layer", text="Feathers", depress=all_c[fcoll_nm].is_visible)
+            of.coll_name = fcoll_nm
+
+        for w in wrig:
+            s = w.get("side", "L")
+            box = layout.box()
+            h = box.row(align=True)
+            h.label(text=f"{w.get('name', 'Wing')} ({w.get('feather_bones', 0)} feathers)", icon="OUTLINER_OB_CURVE")
+            mc = w.get("master_ctrl", "")
+            if mc in arm.pose.bones:
+                om = h.operator("hfw_rig.select_bones", text="Ctrl", icon="BONE_DATA")
+                om.bone_names_csv = mc
+            if w.get("fold_prop") in arm:
+                box.prop(arm, f'["{w["fold_prop"]}"]', text="Wing Fold", slider=True)
+            if w.get("fan_prop") in arm:
+                box.prop(arm, f'["{w["fan_prop"]}"]', text="Feather Fan", slider=True)
+            if w.get("camber_prop") in arm:
+                box.prop(arm, f'["{w["camber_prop"]}"]', text="Airfoil Camber", slider=True)
 
 
 class HFW_PT_RigUI_Spinners(bpy.types.Panel):
@@ -749,7 +875,7 @@ class HFW_PT_RigUI_Layers(bpy.types.Panel):
         seen = set()
         for skey in (
             "body", "head_ik", "torso_ik", "spline_ik", "spine_fk", "tail", "appendages",
-            "wings_ik", "wings_fk", "front_legs_ik", "front_legs_fk", "legs_ik", "legs_fk",
+            "wings_ik", "wings_fk", "wings_feathers", "front_legs_ik", "front_legs_fk", "legs_ik", "legs_fk",
             "arms_ik", "arms_fk", "hands_feet", "hf_tweaks", "spinners", "frills", "weapons", "plates",
         ):
             cn = slots.get(skey)
@@ -815,20 +941,35 @@ class HFW_PT_ShaderUI(bpy.types.Panel):
         arm = _active_hfw_armature(context)
         kind = arm.get("hfw_shader_kind")
         if kind == "machine":
-            pr = layout.row(align=True)
-            for lbl, key in (("Patrol", "PATROL"), ("Alert", "ALERT"), ("Apex", "APEX"), ("Override", "OVERRIDDEN")):
+            # Decoupled Eye State presets (NEVER change muscles when overriding or alerting!)
+            ebox = layout.box()
+            ebox.label(text="Eye State (Optics Only)", icon="HIDE_OFF")
+            pr = ebox.row(align=True)
+            for lbl, key in (
+                ("Patrol", "EYE_PATROL"),
+                ("Suspicious", "EYE_SUSPICIOUS"),
+                ("Alert", "EYE_ALERT"),
+                ("Overridden", "EYE_OVERRIDDEN"),
+            ):
                 op = pr.operator("hfw_rig.shader_preset", text=lbl)
                 op.preset = key
             if "hfw_sh_eye_color" in arm:
-                col = layout.column(align=True)
-                r = col.row(align=True)
+                r = ebox.row(align=True)
                 r.prop(arm, '["hfw_sh_eye_color"]', text="Eyes")
                 if "hfw_sh_eye_alert_color" in arm:
                     r.prop(arm, '["hfw_sh_eye_alert_color"]', text="Alert")
                 if "hfw_sh_eye_alert" in arm:
-                    col.prop(arm, '["hfw_sh_eye_alert"]', text="Alert Blend", slider=True)
+                    ebox.prop(arm, '["hfw_sh_eye_alert"]', text="Alert Blend", slider=True)
                 if "hfw_sh_eye_glow" in arm:
-                    col.prop(arm, '["hfw_sh_eye_glow"]', text="Eye Glow", slider=True)
+                    ebox.prop(arm, '["hfw_sh_eye_glow"]', text="Eye Glow", slider=True)
+
+            # Separate Muscle Fiber Variant State (only changes when muscles actually change in-game!)
+            mbox = layout.box()
+            mbox.label(text="Muscle Fiber State", icon="MOD_SIMPLIFY")
+            mr = mbox.row(align=True)
+            for lbl, key in (("Standard", "MUSCLE_STANDARD"), ("Apex", "MUSCLE_APEX"), ("Corrupted", "MUSCLE_CORRUPTED")):
+                op = mr.operator("hfw_rig.shader_preset", text=lbl)
+                op.preset = key
             if "hfw_sh_plasma_charge" in arm:
                 pcol = layout.column(align=True)
                 pcol.prop(arm, '["hfw_sh_plasma_charge"]', text="Plasma Charge", slider=True)
@@ -842,12 +983,16 @@ class HFW_PT_ShaderUI(bpy.types.Panel):
                 col.prop(arm, '["hfw_sh_skin_brightness"]', text="Brightness", slider=True)
             if "hfw_sh_sss_weight" in arm:
                 col.prop(arm, '["hfw_sh_sss_weight"]', text="Subsurface", slider=True)
+            if "hfw_sh_peach_fuzz" in arm:
+                col.prop(arm, '["hfw_sh_peach_fuzz"]', text="Peach Fuzz", slider=True)
+            if "hfw_sh_iris_color" in arm:
+                col.prop(arm, '["hfw_sh_iris_color"]', text="Iris Color")
             if "hfw_sh_hair_color" in arm:
                 col.prop(arm, '["hfw_sh_hair_color"]', text="Hair Color")
 
 
 class HFW_PT_ShaderUI_Muscles(bpy.types.Panel):
-    bl_label = "Muscles, Liquids & Speed"
+    bl_label = "Muscles, Micro-Detail & Liquids"
     bl_idname = "HFW_PT_shader_ui_muscles"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -867,6 +1012,10 @@ class HFW_PT_ShaderUI_Muscles(bpy.types.Panel):
             layout.prop(arm, '["hfw_sh_muscle_color"]', text="Muscle Color")
         if "hfw_sh_muscle_glow" in arm:
             layout.prop(arm, '["hfw_sh_muscle_glow"]', text="Muscle Glow", slider=True)
+        if "hfw_sh_detail_scale" in arm:
+            layout.prop(arm, '["hfw_sh_detail_scale"]', text="Detail Tiling", slider=True)
+        if "hfw_sh_detail_strength" in arm:
+            layout.prop(arm, '["hfw_sh_detail_strength"]', text="Detail Strength", slider=True)
         if "hfw_sh_liquid_mix" in arm:
             layout.prop(arm, '["hfw_sh_liquid_mix"]', text="Override Liquid", slider=True)
             if float(arm["hfw_sh_liquid_mix"]) > 0.01 and "hfw_sh_liquid_color" in arm:
@@ -883,12 +1032,14 @@ _NATIVE_CLASSES = (
     HFW_OT_NativeSwitchIKFK,
     HFW_OT_NativeSelectBones,
     HFW_OT_NativeSerpentPose,
+    HFW_OT_NativeWingPose,
     HFW_OT_NativeMirrorPose,
     HFW_OT_NativeStopSpin,
     HFW_OT_NativeToggleLayer,
     HFW_OT_NativeShaderPreset,
     HFW_PT_RigUI,
     HFW_PT_RigUI_IKFK,
+    HFW_PT_RigUI_Wings,
     HFW_PT_RigUI_Spinners,
     HFW_PT_RigUI_Layers,
     HFW_PT_RigUI_Tools,
