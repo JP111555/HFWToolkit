@@ -45,21 +45,29 @@ def _parse_version_tuple(text: str) -> tuple[int, int, int] | None:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
 
 
-def _is_windows_store_stub(path: Path) -> bool:
+def _is_windows_apps_alias(path: Path) -> bool:
     s = str(path).lower().replace("/", "\\")
     return "\\microsoft\\windowsapps\\" in s
 
 
+_is_windows_store_stub = _is_windows_apps_alias
+
+
 def _probe_python_exe(exe: Path, timeout: float = 3.0) -> dict[str, Any] | None:
-    """Safely probe a candidate Python executable for version and architecture."""
+    """Safely probe a candidate Python executable for version and architecture.
+
+    Note: Fake Windows Store aliases in ``WindowsApps`` exit immediately with code 9009
+    when invoked with ``-c`` (they never launch the Store UI when arguments are passed),
+    while genuine Microsoft Store / MSIX Python Install Manager shims succeed cleanly.
+    """
     try:
-        if not exe.is_file() or _is_windows_store_stub(exe):
+        if not exe.exists():
             return None
         res = subprocess.run(
             [
                 str(exe),
                 "-c",
-                "import sys, platform; print(f'{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}|{platform.architecture()[0]}|{sys.executable}')",
+                "import sys, platform; print(f'HFW_PY_OK|{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}|{platform.architecture()[0]}|{sys.executable}')",
             ],
             capture_output=True,
             text=True,
@@ -68,18 +76,21 @@ def _probe_python_exe(exe: Path, timeout: float = 3.0) -> dict[str, Any] | None:
         )
         if res.returncode != 0:
             return None
-        parts = (res.stdout or "").strip().splitlines()[-1].split("|")
-        if len(parts) < 2:
+        lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip().startswith("HFW_PY_OK|")]
+        if not lines:
             return None
-        vt = _parse_version_tuple(parts[0])
+        parts = lines[-1].split("|")
+        if len(parts) < 3:
+            return None
+        vt = _parse_version_tuple(parts[1])
         if vt is None or vt[:2] < MIN_PYTHON_VERSION:
             return None
-        resolved = Path(parts[2].strip()) if len(parts) >= 3 and parts[2].strip() else exe.resolve()
+        resolved = Path(parts[3].strip()) if len(parts) >= 4 and parts[3].strip() else exe.resolve()
         return {
             "path": str(resolved),
             "version": f"{vt[0]}.{vt[1]}.{vt[2]}",
             "version_tuple": list(vt),
-            "arch": parts[1].strip(),
+            "arch": parts[2].strip(),
             "compatible": True,
         }
     except Exception:
@@ -96,7 +107,7 @@ def detect_system_pythons(toolkit_dir: Path | None = None) -> dict[str, Any]:
             return
         try:
             pp = Path(str(p).strip().strip('"'))
-            if not pp.is_file() or _is_windows_store_stub(pp):
+            if not pp.exists():
                 return
             # Skip the toolkit's own local .venv interpreter when scanning *system* Pythons
             if toolkit_dir is not None:
@@ -105,10 +116,10 @@ def detect_system_pythons(toolkit_dir: Path | None = None) -> dict[str, Any]:
                     return
                 except ValueError:
                     pass
-            key = str(pp.resolve()).lower()
+            key = str(pp).lower() if _is_windows_apps_alias(pp) else str(pp.resolve()).lower()
             if key not in seen_raw:
                 seen_raw.add(key)
-                candidates.append(pp.resolve())
+                candidates.append(pp if _is_windows_apps_alias(pp) else pp.resolve())
         except Exception:
             pass
 
@@ -163,8 +174,19 @@ def detect_system_pythons(toolkit_dir: Path | None = None) -> dict[str, Any]:
         except Exception:
             pass
 
-        # 3. Standard Windows Python install directories
+        # 3. Standard Windows Python install directories (classic + PEP 773 Python Install Manager)
         local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            py_mgr_root = Path(local_app) / "Python"
+            if py_mgr_root.is_dir():
+                _add_candidate(py_mgr_root / "bin" / "python.exe")
+                try:
+                    for child in py_mgr_root.iterdir():
+                        if child.is_dir() and re.match(r"^(?:pythoncore|python)[-_]?3", child.name, re.IGNORECASE):
+                            _add_candidate(child / "python.exe")
+                except OSError:
+                    pass
+
         search_roots = [
             Path(local_app) / "Programs" / "Python" if local_app else None,
             Path(r"C:\Program Files"),
@@ -181,21 +203,22 @@ def detect_system_pythons(toolkit_dir: Path | None = None) -> dict[str, Any]:
             except OSError:
                 pass
 
-    # 4. PATH (`where python` / `shutil.which`)
+    # 4. PATH (`where python` / `where python3` / `shutil.which`)
     if sys.platform == "win32":
-        try:
-            r = subprocess.run(
-                ["where", "python"],
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if r.returncode == 0:
-                for line in (r.stdout or "").splitlines():
-                    _add_candidate(line)
-        except Exception:
-            pass
+        for cmd_name in ("python", "python3"):
+            try:
+                r = subprocess.run(
+                    ["where", cmd_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if r.returncode == 0:
+                    for line in (r.stdout or "").splitlines():
+                        _add_candidate(line)
+            except Exception:
+                pass
     else:
         for nm in ("python3", "python"):
             w = shutil.which(nm)

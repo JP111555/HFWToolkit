@@ -195,3 +195,51 @@ def test_live_game_machines_variants_sacs_and_characters(tmp_path: Path):
     finally:
         cat.close()
         game.close()
+
+
+def test_windows_batch_launchers_find_python_and_crlf(tmp_path):
+    """Both Windows .bat launchers must use CRLF and cleanly discover Python 3.10+ (even with spaces in path)."""
+    import subprocess
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows batch launcher check only applies on Windows")
+
+    root = Path(__file__).resolve().parent.parent
+    for fname in ("Launch_HFW_Studio.bat", "Setup_And_Doctor.bat"):
+        bat_path = root / fname
+        raw = bat_path.read_bytes()
+        assert b"\r\n" in raw, f"{fname} must use Windows CRLF line endings"
+        assert b"\n" not in raw.replace(b"\r\n", b""), f"{fname} contains bare LF line endings"
+
+        text = raw.decode("ascii")
+        idx = text.rfind(":FIND_NEWEST_PYTHON")
+        assert idx > 0
+        probe_bat = tmp_path / f"probe_{fname}"
+        probe_src = (
+            "@echo off\r\n"
+            "setlocal EnableDelayedExpansion\r\n"
+            "call :FIND_NEWEST_PYTHON\r\n"
+            "echo BEST_PY=!BEST_PY!\r\n"
+            "echo BEST_PY_VER=!BEST_PY_VER!\r\n"
+            "echo BEST_SCORE=!BEST_SCORE!\r\n"
+            "exit /b 0\r\n"
+            + text[idx:]
+        )
+        probe_bat.write_bytes(probe_src.encode("ascii"))
+
+        res = subprocess.run(
+            ["cmd", "/c", str(probe_bat)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res.returncode == 0, f"{fname} probe failed: {res.stdout}\n{res.stderr}"
+        combined = (res.stdout or "") + "\n" + (res.stderr or "")
+        assert "cannot find the path" not in combined.lower(), combined
+        assert "not recognized" not in combined.lower(), combined
+
+        kv = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
+        assert kv.get("BEST_PY") and Path(kv["BEST_PY"]).exists(), f"{fname} failed to find Python: {kv}"
+        assert int(kv.get("BEST_SCORE", "0")) >= 31000, f"{fname} score too low: {kv}"
+
