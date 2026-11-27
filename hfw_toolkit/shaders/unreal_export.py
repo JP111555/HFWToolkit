@@ -30,6 +30,7 @@ _HASH_EYE_VB = 0x2A15D368
 _HASH_EYE_IRIS_MASK = 0x5E969132
 _HASH_GLASS_TINT_VB = 0x01943DD3
 _HASH_SAC_FLOW_MAP = 0x7C771B98
+_HASH_SAC_FLOW_MAP_ALT = 0x21F95B28
 _HASH_SAC_FLUID_TEX = 0x23FE87DB
 _HASH_SAC_COLOR_VB = 0x249F1E74
 _HASH_EMISSIVE_TINT_VB = 0x0E470C22
@@ -91,7 +92,7 @@ def detect_ue5_animation_profile(mat: MaterialInfo) -> dict[str, Any]:
             "glow_strength": 5.5,
             "summary": "Animated glowing machine heart/core (1 Hz Abs(Sine) heartbeat + Panner energy scroll + Fresnel rim)",
         }
-    if _HASH_SAC_FLOW_MAP in tb_by_hash and _HASH_SAC_FLUID_TEX in tb_by_hash:
+    if (_HASH_SAC_FLOW_MAP in tb_by_hash or _HASH_SAC_FLOW_MAP_ALT in tb_by_hash) and _HASH_SAC_FLUID_TEX in tb_by_hash:
         col = [0.14, 0.68, 1.0]
         if _HASH_SAC_COLOR_VB in vb_by_hash:
             f4 = vb_by_hash[_HASH_SAC_COLOR_VB].float4
@@ -181,6 +182,7 @@ def generate_ue5_clipboard_t3d(mat: MaterialInfo, has_weather: bool = True) -> s
         for vb in pt.variable_bindings:
             if vb.binding_name_hash == 0x3806EAE3 and 1.5 <= vb.float4[0] <= 128.0:
                 detail_tile = vb.float4[0]
+    detail_tile = min(72.0, max(24.0, detail_tile * 2.25)) if detail_tile < 24.0 else min(96.0, detail_tile * 1.45)
 
     anim = detect_ue5_animation_profile(mat)
     safe = _ue_safe(mat.name)
@@ -393,6 +395,7 @@ def generate_ue5_python_script(
         for vb in pt.variable_bindings:
             if vb.binding_name_hash == 0x3806EAE3 and 1.5 <= vb.float4[0] <= 128.0:
                 detail_tile = vb.float4[0]
+    detail_tile = min(72.0, max(24.0, detail_tile * 2.25)) if detail_tile < 24.0 else min(96.0, detail_tile * 1.45)
 
     anim = detect_ue5_animation_profile(mat)
     safe = _ue_safe(mat.name)
@@ -669,12 +672,29 @@ def generate_ue5_machine_script(
 
     mats_json_str = json.dumps(mat_entries, indent=2)
     controls_json_str = json.dumps(shader_controls, indent=2)
+    rig_spec_json_str = json.dumps(manifest.get("rig_spec") or {}, indent=2)
+    anims_meta = [
+        {
+            "anim_id": a.get("anim_id", ""),
+            "name": a.get("name", ""),
+            "category": a.get("category", ""),
+            "fbx_filename": a.get("fbx_filename", ""),
+            "duration": a.get("duration", 0.0),
+            "sample_rate": a.get("sample_rate", 30.0),
+            "num_frames": a.get("num_frames", 0),
+        }
+        for a in (manifest.get("animations") or ())
+    ]
+    anims_json_str = json.dumps(anims_meta, indent=2)
     bundle_abs = str(Path(bundle_dir).resolve())
 
-    return f'''"""Auto-generated Unreal Engine 5 Rig/Asset & Animated Shader Importer for {disp}.
+    return f'''"""Auto-generated Unreal Engine 5 Rig/Asset, Control Rig, Animations & Animated Shader Importer for {disp}.
 
 Imported automatically by HFWToolkit (`{manifest.get("entity_id", "")}`, `{manifest.get("variant_label", "")}`, kind=`{asset_kind}`):
   - {"Rigged SkeletalMesh + Skeleton" if is_skeletal else "StaticMesh"} (`{fbx_name}`)
+  - Native UE5 Control Rig (`CR_{safe_mach}`) with BOTH Forwards Solve (IK/FK) and Backwards Solve
+    so UE5 Sequencer's "Bake To Control Rig" works out-of-the-box on any imported HFW animation!
+  - Automatic `AnimSequence` import for all {len(anims_meta)} extracted HFW animation FBX clip(s) in `animations/`
   - Shared `MPC_HFW_MachineControl` Material Parameter Collection for 1-click Muscle / Eye / Liquid / Plasma / Speed control
   - ALL {len(mat_entries)} Decima PBR & DXIL-Verified Animated Shaders:
       * Decima Smoothness -> UE5 Roughness (`OneMinus`) + Worn-Metal Edge Recovery (`F0 = RFL^2`)
@@ -686,7 +706,7 @@ Imported automatically by HFWToolkit (`{manifest.get("entity_id", "")}`, `{manif
       * Character/Asset PBR Surface Profiles (Skin SSS, Masked Two-Sided Hair/Foliage, Glossy Eyes, Cloth, Glass)
 
 How to run inside Unreal Engine 5:
-  1. Enable the built-in `Python Editor Script Plugin` in UE5.
+  1. Enable the built-in `Python Editor Script Plugin` (and `Control Rig` plugin) in UE5.
   2. In UE5 Menu -> Tools -> Execute Python Script... -> select this script.
   3. Open `{dest_root}/{"SK_" if is_skeletal else "SM_"}{safe_mach}` and hit Realtime Viewport!
 """
@@ -702,6 +722,7 @@ IS_SKELETAL = {is_skeletal!r}
 DEST_PACKAGE = {dest_root!r}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"{bundle_abs}"
 TEXTURE_DIR = os.path.join(SCRIPT_DIR, "textures")
+ANIM_DIR = os.path.join(SCRIPT_DIR, "animations")
 FBX_CANDIDATES = [
     os.path.join(SCRIPT_DIR, {fbx_name!r}),
     os.path.join(os.path.dirname(SCRIPT_DIR), {fbx_name!r}),
@@ -709,6 +730,8 @@ FBX_CANDIDATES = [
 
 MATERIALS_META = json.loads(r"""{mats_json_str}""")
 SHADER_CONTROLS = json.loads(r"""{controls_json_str}""")
+RIG_SPEC = json.loads(r"""{rig_spec_json_str}""")
+ANIMATIONS_META = json.loads(r"""{anims_json_str}""")
 
 mel = unreal.MaterialEditingLibrary
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -1068,7 +1091,19 @@ def build_single_material(slot_name: str, meta: dict):
                 l_rghs.append((_const(mat, 0.42 if is_m else 0.78, -1340, 2200 + idx * 90), ""))
                 l_nrms.append((n_flat_xy, ""))
             else:
-                dye_lin = lay.get("dye_color_linear") or _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
+                raw_dye = lay.get("dye_color_linear")
+                raw_f0 = lay.get("f0_rgb")
+                if is_m:
+                    d_mx = max(raw_dye[:3]) if (raw_dye and len(raw_dye) >= 3) else 0.0
+                    f_mx = max(raw_f0[:3]) if (raw_f0 and len(raw_f0) >= 3) else 0.0
+                    if f_mx > max(0.18, d_mx * 1.30):
+                        dye_lin = [max(0.14, min(0.96, float(c))) for c in raw_f0[:3]]
+                    elif d_mx >= 0.16:
+                        dye_lin = list(raw_dye[:3])
+                    else:
+                        dye_lin = _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
+                else:
+                    dye_lin = raw_dye or _layer_tint_lin(lay.get("name", ""), lay.get("category", ""), idx)
                 tint_v = _vec(mat, f"L{{idx}}_{{lname}}_Dye", dye_lin, -1560, -560 + idx * 260)
                 # CRITICAL: HFW `Shaders_HRZ2/Materials/*_CLR` is Linear `0.5`-centered (`is_srgb=False`) -> pow(2.0 * tex, 2.2) * Dye!
                 c_tex = import_texture(lay.get("color_file", ""), is_srgb=False, is_normal=False)
@@ -1726,15 +1761,21 @@ def build_single_material(slot_name: str, meta: dict):
         okind = overlay.get("kind", "")
         n_t = _time_scaled(mat, -1100, 960)
 
-        if okind == "elemental_sack_overlay" and "Mask" in sockets:
-            # Exact DXIL mat_id==0 * Mask_Alpha + True Dual-Phase Flow Map (172:0) + Caustics (1703:0) + Fresnel + Wet Specular!
-            n_is0 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 0.0, -560, 820)
-            sac_mask = n_is0
-            if "Mask_Alpha" in sockets:
-                n_sm = _mk(mat, unreal.MaterialExpressionMultiply, -380, 840)
-                mel.connect_material_expressions(n_is0, "", n_sm, "A")
-                mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_sm, "B")
-                sac_mask = n_sm
+        if okind == "elemental_sack_overlay" and ("Mask" in sockets or float(overlay.get("mask_id", 0.0)) < 0.0):
+            # Exact DXIL mat_id==0 / mat_id==20 / full Mask_Alpha + True Dual-Phase Flow Map (172:0) + Caustics (1703:0) + Fresnel!
+            sac_mid = float(overlay.get("mask_id", 0.0))
+            if sac_mid >= 0.0 and "Mask" in sockets:
+                n_is0 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], sac_mid, -560, 820)
+                sac_mask = n_is0
+                if "Mask_Alpha" in sockets:
+                    n_sm = _mk(mat, unreal.MaterialExpressionMultiply, -380, 840)
+                    mel.connect_material_expressions(n_is0, "", n_sm, "A")
+                    mel.connect_material_expressions(sockets["Mask_Alpha"][0], sockets["Mask_Alpha"][1], n_sm, "B")
+                    sac_mask = n_sm
+            elif "Mask_Alpha" in sockets:
+                sac_mask = sockets["Mask_Alpha"][0]
+            else:
+                sac_mask = _const(mat, 1.0, -380, 840)
 
             # Dual-phase flow-map time: phase0 = frac(t*spd + 0.5)*2-1, phase1 = frac(t*spd + 1.0)*2-1, blend = abs(phase0)
             n_fspd = _scalar(mat, "FlowSpeed", float(overlay.get("flow_speed", 0.35)), -1580, 1040)
@@ -1854,7 +1895,7 @@ def build_single_material(slot_name: str, meta: dict):
             mel.connect_material_expressions(n_m2, "", n_em, "B")
             mel.connect_material_property(n_em, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
-            # Blend smooth wet glossy membrane roughness (0.12) onto sac regions!
+            # Blend smooth wet glossy membrane roughness (0.12), luminous liquid diffuse albedo, and dielectric Metallic=0 onto sac regions!
             if "Roughness" in sockets:
                 n_inv_s = _mk(mat, unreal.MaterialExpressionOneMinus, -220, -40)
                 mel.connect_material_expressions(sockets["Roughness"][0], sockets["Roughness"][1], n_inv_s, "")
@@ -1863,6 +1904,22 @@ def build_single_material(slot_name: str, meta: dict):
                 mel.connect_material_expressions(n_inv_s, "", n_wrg, "A")
                 mel.connect_material_expressions(sac_mask, "", n_wrg, "Alpha")
                 mel.connect_material_property(n_wrg, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            n_sbc_tint = _mk(mat, unreal.MaterialExpressionMultiply, 260, -240)
+            n_sbc_tint.set_editor_property("const_b", 0.68)
+            mel.connect_material_expressions(n_gc, "", n_sbc_tint, "A")
+            if base_color_expr is not None:
+                n_sbc_mix = _mk(mat, unreal.MaterialExpressionLinearInterpolate, 440, -200)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_sbc_mix, "A")
+                mel.connect_material_expressions(n_sbc_tint, "", n_sbc_mix, "B")
+                mel.connect_material_expressions(sac_mask, "", n_sbc_mix, "Alpha")
+                mel.connect_material_property(n_sbc_mix, "", unreal.MaterialProperty.MP_BASE_COLOR)
+            if "Reflectance" in sockets and sprof not in _DIELECTRIC_PROFILES:
+                n_inv_sm = _mk(mat, unreal.MaterialExpressionOneMinus, 260, 260)
+                mel.connect_material_expressions(sac_mask, "", n_inv_sm, "")
+                n_smet = _mk(mat, unreal.MaterialExpressionMultiply, 440, 260)
+                mel.connect_material_expressions(n_met, "", n_smet, "A")
+                mel.connect_material_expressions(n_inv_sm, "", n_smet, "B")
+                mel.connect_material_property(n_smet, "", unreal.MaterialProperty.MP_METALLIC)
 
         elif okind == "canister_emissive_overlay" and "Mask" in sockets:
             n_is1 = _build_mask_id_compare(mat, sockets["Mask"][0], sockets["Mask"][1], 1.0, -560, 820)
@@ -2014,9 +2071,28 @@ def build_single_material(slot_name: str, meta: dict):
     # Surface Profile refinements for Characters (Skin SSS, Hair, Brows/Lashes, Peach Fuzz, Eyes, Cloth) and General Assets (Foliage, Glass)!
     sprof = meta.get("surface_profile", "pbr")
     if sprof == "peach_fuzz":
+        # Backlit grazing-angle vellus facial hair (Fresnel^3.4 * PeachFuzzIntensity) matching Blender Cycles!
         mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
-        n_op = _scalar(mat, "PeachFuzzOpacity", 0.0, -360, 620)
-        mel.connect_material_property(n_op, "", unreal.MaterialProperty.MP_OPACITY)
+        mat.set_editor_property("two_sided", True)
+        try:
+            mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_SUBSURFACE)
+        except Exception:
+            pass
+        n_pf_col = _vec(mat, "PeachFuzzColor", [0.82, 0.64, 0.50], -620, 480)
+        n_pf_fr = _mk(mat, unreal.MaterialExpressionFresnel, -620, 620)
+        n_pf_fr.set_editor_property("exponent", 3.4)
+        n_pf_int = _scalar(mat, "PeachFuzzIntensity", float(meta.get("peach_fuzz_intensity", 0.45)), -620, 740)
+        n_pf_op = _mk(mat, unreal.MaterialExpressionMultiply, -380, 660)
+        mel.connect_material_expressions(n_pf_fr, "", n_pf_op, "A")
+        mel.connect_material_expressions(n_pf_int, "", n_pf_op, "B")
+        n_pf_rgh = _scalar(mat, "PeachFuzzRoughness", 0.52, -380, 560)
+        mel.connect_material_property(n_pf_col, "", unreal.MaterialProperty.MP_BASE_COLOR)
+        mel.connect_material_property(n_pf_rgh, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        mel.connect_material_property(n_pf_op, "", unreal.MaterialProperty.MP_OPACITY)
+        try:
+            mel.connect_material_property(n_pf_col, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+        except Exception:
+            pass
     elif sprof == "hair_face":
         mat.set_editor_property("two_sided", True)
         if "Color" not in sockets:
@@ -2031,8 +2107,18 @@ def build_single_material(slot_name: str, meta: dict):
     elif sprof == "skin":
         try:
             mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_SUBSURFACE)
-            n_sss = _vec(mat, "SkinSubsurfaceColor", [0.85, 0.30, 0.20], -360, 620)
+            n_sss = _vec(mat, "SkinSubsurfaceColor", [0.85, 0.28, 0.16], -360, 620)
             mel.connect_material_property(n_sss, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+            tra_f = meta.get("translucency_file", "")
+            if tra_f:
+                tra_tex = import_texture(tra_f, is_srgb=False, is_normal=False)
+                if tra_tex:
+                    n_tra = _tex_node(mat, "SkinTranslucencyAmount", tra_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -620, 740)
+                    n_tra_op = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -360, 740)
+                    n_tra_op.set_editor_property("const_a", 0.18)
+                    n_tra_op.set_editor_property("const_b", 0.85)
+                    mel.connect_material_expressions(n_tra, "R", n_tra_op, "Alpha")
+                    mel.connect_material_property(n_tra_op, "", unreal.MaterialProperty.MP_OPACITY)
         except Exception:
             pass
     elif sprof == "hair":
@@ -2065,6 +2151,20 @@ def build_single_material(slot_name: str, meta: dict):
             mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_CLEAR_COAT)
             n_er = _scalar(mat, "EyeRoughness", 0.04, -360, 620)
             mel.connect_material_property(n_er, "", unreal.MaterialProperty.MP_ROUGHNESS)
+            iris_lin = meta.get("iris_color_linear")
+            if iris_lin and base_color_expr is not None:
+                n_ic = _vec(mat, "IrisColor", [min(1.0, float(c) * 2.25) for c in iris_lin[:3]], -620, 480)
+                n_im = _mk(mat, unreal.MaterialExpressionMultiply, -380, 460)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_im, "A")
+                mel.connect_material_expressions(n_ic, "", n_im, "B")
+                n_il = _mk(mat, unreal.MaterialExpressionLinearInterpolate, -200, 460)
+                mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_il, "A")
+                mel.connect_material_expressions(n_im, "", n_il, "B")
+                if "Mask" in sockets:
+                    mel.connect_material_expressions(sockets["Mask"][0], "G", n_il, "Alpha")
+                else:
+                    n_il.set_editor_property("const_alpha", 0.55)
+                mel.connect_material_property(n_il, "", unreal.MaterialProperty.MP_BASE_COLOR)
         except Exception:
             pass
     elif sprof == "eye_wet":
@@ -2141,6 +2241,388 @@ def import_machine_fbx(built_materials: dict):
     return mesh_asset
 
 
+def import_animations_fbx(mesh_asset):
+    """Import all exported HFW `animations/*.fbx` clips as UE5 `AnimSequence`s bound to `mesh_asset.skeleton`."""
+    if not IS_SKELETAL or mesh_asset is None or not os.path.isdir(ANIM_DIR):
+        return []
+    skel = getattr(mesh_asset, "skeleton", None)
+    if skel is None:
+        return []
+
+    fbx_files = []
+    seen = set()
+    for am in ANIMATIONS_META:
+        fn = am.get("fbx_filename") or ""
+        if fn:
+            fp = os.path.join(ANIM_DIR, fn)
+            if os.path.isfile(fp) and fn not in seen:
+                fbx_files.append((fp, am.get("name") or os.path.splitext(fn)[0]))
+                seen.add(fn)
+    for fn in sorted(os.listdir(ANIM_DIR)):
+        if fn.lower().endswith(".fbx") and fn not in seen:
+            fbx_files.append((os.path.join(ANIM_DIR, fn), os.path.splitext(fn)[0]))
+            seen.add(fn)
+    if not fbx_files:
+        return []
+
+    dest_anim_pkg = DEST_PACKAGE + "/Animations"
+    imported = []
+    for fbx_path, clip_name in fbx_files:
+        try:
+            opts = unreal.FbxImportUI()
+            opts.import_mesh = False
+            opts.import_materials = False
+            opts.import_textures = False
+            opts.import_animations = True
+            opts.skeleton = skel
+            opts.automated_import_should_detect_type = False
+            if hasattr(unreal, "FBXImportType"):
+                opts.original_import_type = unreal.FBXImportType.FBXIT_ANIMATION
+            adata = opts.anim_sequence_import_data
+            adata.import_bone_tracks = True
+            adata.convert_scene = True
+            if hasattr(unreal, "FBXAnimationLengthImportType"):
+                adata.animation_length = unreal.FBXAnimationLengthImportType.FBXALIT_EXPORTED_TIME
+
+            task = unreal.AssetImportTask()
+            task.filename = fbx_path
+            task.destination_path = dest_anim_pkg
+            task.destination_name = "AS_" + _safe(clip_name)
+            task.automated = True
+            task.replace_existing = True
+            task.save = True
+            task.options = opts
+            asset_tools.import_asset_tasks([task])
+            seq = unreal.EditorAssetLibrary.load_asset(f"{{dest_anim_pkg}}/AS_{{_safe(clip_name)}}")
+            if seq:
+                imported.append(seq)
+        except Exception as exc:
+            unreal.log_warning(f"[HFW] AnimSequence import skipped for {{clip_name}}: {{exc}}")
+
+    unreal.log(f"[HFW] Imported {{len(imported)}}/{{len(fbx_files)}} UE5 AnimSequence(s) -> {{dest_anim_pkg}}")
+    return imported
+
+
+def build_ue5_control_rig(mesh_asset):
+    """Build native UE5 `CR_<AssetName>` Control Rig Blueprint with BOTH Forwards Solve (FK+IK) & Backwards Solve!
+
+    Backwards Solve enables UE5 Sequencer's built-in `Bake To Control Rig` directly on any imported `AS_*` animation.
+    """
+    if not IS_SKELETAL or mesh_asset is None or not RIG_SPEC:
+        return None
+    if not hasattr(unreal, "ControlRigBlueprint"):
+        unreal.log_warning("[HFW] Control Rig plugin not enabled in UE5 — skipping CR_ generation.")
+        return None
+
+    cr_pkg = DEST_PACKAGE + "/ControlRig"
+    cr_name = "CR_" + MACHINE_NAME
+    cr_path = f"{{cr_pkg}}/{{cr_name}}"
+    try:
+        if unreal.EditorAssetLibrary.does_asset_exist(cr_path):
+            unreal.EditorAssetLibrary.delete_asset(cr_path)
+
+        blueprint = None
+        if hasattr(unreal, "ControlRigBlueprintFactory"):
+            factory = unreal.ControlRigBlueprintFactory()
+            if hasattr(factory, "create_control_rig_from_skeletal_mesh_or_skeleton"):
+                blueprint = factory.create_control_rig_from_skeletal_mesh_or_skeleton(mesh_asset)
+                if blueprint:
+                    src_path = blueprint.get_path_name().rsplit(".", 1)[0]
+                    if src_path != cr_path:
+                        unreal.EditorAssetLibrary.rename_asset(src_path, cr_path)
+                        blueprint = unreal.EditorAssetLibrary.load_asset(cr_path)
+        if blueprint is None:
+            blueprint = asset_tools.create_asset(cr_name, cr_pkg, unreal.ControlRigBlueprint, unreal.ControlRigBlueprintFactory())
+        if blueprint is None:
+            return None
+
+        hc = blueprint.get_hierarchy_controller()
+        skel = getattr(mesh_asset, "skeleton", None)
+        if skel is not None and hasattr(hc, "import_bones"):
+            hc.import_bones(skel)
+        if hasattr(blueprint, "set_preview_mesh"):
+            blueprint.set_preview_mesh(mesh_asset)
+
+        hier = blueprint.hierarchy
+        color_by_side = {{
+            "L": unreal.LinearColor(0.15, 0.55, 1.0, 1.0),
+            "R": unreal.LinearColor(1.0, 0.22, 0.18, 1.0),
+            "C": unreal.LinearColor(1.0, 0.82, 0.12, 1.0),
+            "ROOT": unreal.LinearColor(0.18, 0.92, 0.36, 1.0),
+        }}
+
+        def _bone_key(bname: str):
+            return unreal.RigElementKey(type=unreal.RigElementType.BONE, name=bname)
+
+        def _has_bone(bname: str) -> bool:
+            return bool(bname) and hier.contains(_bone_key(bname))
+
+        def _add_ctrl(cname: str, bone_name: str, parent_ctrl_key, shape_name: str, side: str, scale_val: float = 1.0):
+            if not _has_bone(bone_name):
+                return None
+            settings = unreal.RigControlSettings()
+            settings.control_type = unreal.RigControlType.EULER_TRANSFORM
+            if hasattr(settings, "shape_name"):
+                settings.shape_name = shape_name
+            if hasattr(settings, "shape_color"):
+                settings.shape_color = color_by_side.get(side, color_by_side["C"])
+            val = hier.make_control_value_from_euler_transform(unreal.EulerTransform())
+            b_xform = hier.get_global_transform(_bone_key(bone_name), initial=True)
+            pkey = parent_ctrl_key if parent_ctrl_key is not None else unreal.RigElementKey()
+            ckey = hc.add_control(cname, pkey, settings, val, setup_undo=False, print_python_command=False)
+            hier.set_global_transform(ckey, b_xform, initial=True)
+            if hasattr(hier, "set_control_shape_transform"):
+                st = unreal.Transform()
+                st.scale3d = unreal.Vector(scale_val, scale_val, scale_val)
+                hier.set_control_shape_transform(ckey, st, initial=True)
+            return ckey
+
+        # 1. Create Control Hierarchy matching Blender HFW Control Rig
+        ctrl_to_bone = []  # (ctrl_name, bone_name) pairs
+        ik_chains = []     # IK effector dicts
+
+        root_b = RIG_SPEC.get("root") or "rootBone"
+        hips_b = RIG_SPEC.get("hips") or "hipsBone"
+        k_root = _add_ctrl("CR_Root", root_b, None, "Circle_Thick", "ROOT", 4.0)
+        if k_root:
+            ctrl_to_bone.append(("CR_Root", root_b))
+        k_cog = _add_ctrl("CR_COG", hips_b, k_root, "Circle_Thick", "ROOT", 2.8)
+        if k_cog:
+            ctrl_to_bone.append(("CR_COG", hips_b))
+
+        # Spine / Neck / Head / Jaw / Tail / Wings FK Controls
+        def _sample(seq, cap):
+            if len(seq) <= cap:
+                return list(seq)
+            idxs = sorted({{int(round(i * (len(seq) - 1) / (cap - 1))) for i in range(cap)}})
+            return [seq[i] for i in idxs]
+
+        sp_parent = k_cog or k_root
+        for idx, sb in enumerate(_sample(RIG_SPEC.get("spine") or [], 8)):
+            k = _add_ctrl(f"CR_Spine_{{idx:02d}}", sb, sp_parent, "Circle_Thin", "C", 2.0)
+            if k:
+                ctrl_to_bone.append((f"CR_Spine_{{idx:02d}}", sb))
+                sp_parent = k
+
+        chest_b = RIG_SPEC.get("chest")
+        if chest_b:
+            k_chest = _add_ctrl("CR_Chest", chest_b, sp_parent, "Box_Thick", "C", 2.4)
+            if k_chest:
+                ctrl_to_bone.append(("CR_Chest", chest_b))
+                sp_parent = k_chest
+
+        nk_parent = sp_parent
+        for idx, nb in enumerate(_sample(RIG_SPEC.get("neck") or [], 8)):
+            k = _add_ctrl(f"CR_Neck_{{idx:02d}}", nb, nk_parent, "Circle_Thin", "C", 1.4)
+            if k:
+                ctrl_to_bone.append((f"CR_Neck_{{idx:02d}}", nb))
+                nk_parent = k
+
+        head_b = RIG_SPEC.get("head")
+        k_head = _add_ctrl("CR_Head", head_b, nk_parent, "Box_Thick", "C", 1.8) if head_b else None
+        if k_head:
+            ctrl_to_bone.append(("CR_Head", head_b))
+        if RIG_SPEC.get("head_ik_supported") and head_b and _has_bone(head_b):
+            k_hik = _add_ctrl("CR_IK_Head", head_b, k_root, "Box_Thick", "C", 2.0)
+            if k_hik:
+                ik_chains.append({{"ctrl_name": "CR_IK_Head", "ik_bones": list(RIG_SPEC.get("neck") or []), "end_bone": head_b, "is_leg": False}})
+
+        for spc in RIG_SPEC.get("spline_chains") or []:
+            sp_bs = [b for b in (spc.get("bones") or []) if _has_bone(b)]
+            if len(sp_bs) >= 5:
+                k_cnt = int(spc.get("knots", 6))
+                for ki, kb in enumerate(_sample(sp_bs, k_cnt)):
+                    kn_nm = f"CR_Spline_{{spc['name']}}_{{ki:02d}}"
+                    k_kn = _add_ctrl(kn_nm, kb, k_root if ki > 0 else (k_cog or k_root), "Circle_Thick", "C", 2.2)
+                    if k_kn:
+                        ctrl_to_bone.append((kn_nm, kb))
+
+        for spn in (RIG_SPEC.get("spinners") or [])[:12]:
+            sb = spn.get("bone")
+            if sb and _has_bone(sb):
+                sp_nm = f"CR_Spin_{{spn['name']}}"
+                k_sp = _add_ctrl(sp_nm, sb, k_head or k_cog or k_root, "Circle_Thick", spn.get("side", "C"), 1.2)
+                if k_sp:
+                    ctrl_to_bone.append((sp_nm, sb))
+
+        for cs in RIG_SPEC.get("chainsaws") or []:
+            pb_s = cs.get("parent_def")
+            if pb_s and _has_bone(pb_s):
+                sw_nm = f"CR_Saw_Spin_{{cs['name']}}"
+                k_sw = _add_ctrl(sw_nm, pb_s, k_head or k_cog or k_root, "Circle_Thick", cs.get("side", "C"), 1.4)
+                if k_sw:
+                    ctrl_to_bone.append((sw_nm, pb_s))
+
+        for idx, jb in enumerate(RIG_SPEC.get("jaws") or []):
+            cn = f"CR_Jaw_{{idx:02d}}"
+            k = _add_ctrl(cn, jb, k_head or nk_parent, "Circle_Thin", "C", 1.0)
+            if k:
+                ctrl_to_bone.append((cn, jb))
+
+        for tinfo in RIG_SPEC.get("tails") or []:
+            tp = k_cog or k_root
+            for idx, tb in enumerate(_sample(tinfo.get("bones") or [], 16)):
+                cn = f"CR_{{tinfo['name']}}_{{idx:02d}}"
+                k = _add_ctrl(cn, tb, tp, "Circle_Thin", tinfo.get("side", "C"), 1.6)
+                if k:
+                    ctrl_to_bone.append((cn, tb))
+                    tp = k
+
+        for app in RIG_SPEC.get("appendages") or []:
+            ap = k_head or nk_parent
+            for idx, ab in enumerate(_sample(app.get("bones") or [], 16)):
+                cn = f"CR_{{app['name']}}_{{idx:02d}}"
+                k = _add_ctrl(cn, ab, ap, "Circle_Thin", app.get("side", "C"), 1.4)
+                if k:
+                    ctrl_to_bone.append((cn, ab))
+                    ap = k
+
+        end_bone_to_ctrl = {{}}
+        for winfo in RIG_SPEC.get("wings") or []:
+            wp = sp_parent
+            wside = winfo.get("side", "C")
+            for idx, wb in enumerate(_sample(winfo.get("bones") or [], 6)):
+                cn = f"CR_{{winfo['name']}}_{{idx:02d}}"
+                k = _add_ctrl(cn, wb, wp, "Circle_Thin", wside, 1.8)
+                if k:
+                    ctrl_to_bone.append((cn, wb))
+                    wp = k
+            w_tip = winfo.get("tip_bone")
+            w_iks = [b for b in (winfo.get("ik_bones") or []) if _has_bone(b)]
+            if w_tip and _has_bone(w_tip) and len(w_iks) >= 2:
+                w_ik_nm = f"CR_IK_{{winfo['name']}}"
+                k_wik = _add_ctrl(w_ik_nm, w_tip, k_cog or k_root, "Box_Thick", wside, 1.8)
+                if k_wik:
+                    ik_chains.append({{"ctrl_name": w_ik_nm, "ik_bones": w_iks, "end_bone": w_tip, "is_leg": False}})
+                    end_bone_to_ctrl[w_tip] = k_wik
+
+        # Legs (Quadruped Shoulders/Scapulae + IK + Flipper Blade FK) & Arms (Clavicles + IK + Flipper Blade FK)
+        for limb in list(RIG_SPEC.get("legs") or []) + list(RIG_SPEC.get("arms") or []):
+            end_b = limb.get("foot_bone") or limb.get("hand_bone")
+            ik_bs = [b for b in (limb.get("ik_bones") or []) if _has_bone(b)]
+            if not end_b or not _has_bone(end_b) or len(ik_bs) < 2:
+                continue
+            side = limb.get("side", "C")
+            sh_b = limb.get("shoulder")
+            if sh_b and _has_bone(sh_b):
+                sh_par = sp_parent if str(limb.get("name", "")).startswith("FrontLeg_") else (k_cog or k_root)
+                sh_nm = f"CR_Shoulder_{{limb['name']}}"
+                k_sh = _add_ctrl(sh_nm, sh_b, sh_par, "Circle_Thin", side, 1.4)
+                if k_sh:
+                    ctrl_to_bone.append((sh_nm, sh_b))
+            cl_b = limb.get("clavicle")
+            if cl_b and _has_bone(cl_b):
+                cl_nm = f"CR_Clavicle_{{side}}"
+                k_cl = _add_ctrl(cl_nm, cl_b, sp_parent, "Circle_Thin", side, 1.3)
+                if k_cl:
+                    ctrl_to_bone.append((cl_nm, cl_b))
+            cname = f"CR_IK_{{limb['name']}}"
+            k_ik = _add_ctrl(cname, end_b, k_root, "Box_Thick", side, 1.8)
+            if k_ik:
+                ik_chains.append({{"ctrl_name": cname, "ik_bones": ik_bs, "end_bone": end_b, "is_leg": "foot_bone" in limb}})
+                end_bone_to_ctrl[end_b] = k_ik
+                ex_par = k_ik
+                for eidx, eb in enumerate(limb.get("extra_fk_bones") or []):
+                    ex_nm = f"CR_FK_{{limb['name']}}_Blade_{{eidx:02d}}"
+                    k_ex = _add_ctrl(ex_nm, eb, ex_par, "Circle_Thin", side, 1.1)
+                    if k_ex:
+                        ctrl_to_bone.append((ex_nm, eb))
+                        ex_par = k_ex
+
+        # Hands / Fingers, Feet / Toes / Talons, and Secondary Articulated Machine Details FK Controls
+        detail_groups = (
+            (RIG_SPEC.get("fingers") or [], 0.45),
+            (RIG_SPEC.get("toes") or [], 0.55),
+            (RIG_SPEC.get("details") or [], 0.70),
+        )
+        ctrl_by_bone = {{bn: unreal.RigElementKey(type=unreal.RigElementType.CONTROL, name=cn) for cn, bn in ctrl_to_bone}}
+        for grp_list, shape_sc in detail_groups:
+            for item in grp_list:
+                p_def = item.get("parent_def")
+                par_k = end_bone_to_ctrl.get(p_def) or ctrl_by_bone.get(p_def) or k_cog or k_root
+                side = item.get("side", "C")
+                for idx, db in enumerate(item.get("bones") or []):
+                    cn = f"CR_FK_{{item['name']}}_{{idx:02d}}"
+                    k = _add_ctrl(cn, db, par_k, "Circle_Thin", side, shape_sc)
+                    if k:
+                        ctrl_to_bone.append((cn, db))
+                        ctrl_by_bone[db] = k
+                        par_k = k
+
+        # 2. Wire RigVM Graph: Forwards Solve (Controls -> Bones + FullBodyIK) AND Backwards Solve (Bones -> Controls)!
+        ctrl = blueprint.get_controller() if hasattr(blueprint, "get_controller") else blueprint.get_controller_by_name("RigVMModel")
+        if ctrl is not None:
+            # --- FORWARDS SOLVE (`RigUnit_BeginExecution`) ---
+            n_fwd = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_BeginExecution", "Execute", unreal.Vector2D(0, 0), "BeginExecution")
+            prev_exec = f"{{n_fwd.get_name()}}.ExecuteContext"
+            x_cur = 320
+
+            for cname, bname in ctrl_to_bone:
+                n_get = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_GetTransform", "Execute", unreal.Vector2D(x_cur - 120, 260), f"Get_{{cname}}")
+                ctrl.set_pin_default_value(f"{{n_get.get_name()}}.Item", f'(Type=Control,Name="{{cname}}")', True)
+                ctrl.set_pin_default_value(f"{{n_get.get_name()}}.Space", "GlobalSpace", True)
+
+                n_set = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_SetTransform", "Execute", unreal.Vector2D(x_cur, 0), f"Set_{{bname}}")
+                ctrl.set_pin_default_value(f"{{n_set.get_name()}}.Item", f'(Type=Bone,Name="{{bname}}")', True)
+                ctrl.set_pin_default_value(f"{{n_set.get_name()}}.Space", "GlobalSpace", True)
+                ctrl.set_pin_default_value(f"{{n_set.get_name()}}.bPropagateToChildren", "True", True)
+
+                ctrl.add_link(prev_exec, f"{{n_set.get_name()}}.ExecuteContext")
+                ctrl.add_link(f"{{n_get.get_name()}}.Transform", f"{{n_set.get_name()}}.Transform")
+                prev_exec = f"{{n_set.get_name()}}.ExecuteContext"
+                x_cur += 340
+
+            # Full-Body IK (`RigUnit_PBIK`) cleanly handles 2-bone human, 3-bone digitigrade theropods, AND 4-leg quadrupeds!
+            if ik_chains and _has_bone(hips_b):
+                try:
+                    n_pbik = ctrl.add_unit_node_from_struct_path("/Script/PBIK.RigUnit_PBIK", "Execute", unreal.Vector2D(x_cur + 60, 0), "HFW_FullBodyIK")
+                    ctrl.set_pin_default_value(f"{{n_pbik.get_name()}}.Root", hips_b, True)
+                    ctrl.add_link(prev_exec, f"{{n_pbik.get_name()}}.ExecuteContext")
+                    for ei, ch in enumerate(ik_chains):
+                        ctrl.add_array_pin(f"{{n_pbik.get_name()}}.Effectors")
+                        pin_e = f"{{n_pbik.get_name()}}.Effectors.{{ei}}"
+                        ctrl.set_pin_default_value(f"{{pin_e}}.Bone", ch["end_bone"], True)
+                        n_gk = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_GetTransform", "Execute", unreal.Vector2D(x_cur - 220, 260 + ei * 180), f"GetIK_{{ch['ctrl_name']}}")
+                        ctrl.set_pin_default_value(f"{{n_gk.get_name()}}.Item", f'(Type=Control,Name="{{ch["ctrl_name"]}}")', True)
+                        ctrl.set_pin_default_value(f"{{n_gk.get_name()}}.Space", "GlobalSpace", True)
+                        ctrl.add_link(f"{{n_gk.get_name()}}.Transform", f"{{pin_e}}.Transform")
+                    prev_exec = f"{{n_pbik.get_name()}}.ExecuteContext"
+                except Exception as exc_ik:
+                    unreal.log_warning(f"[HFW] PBIK node fallback (optional plugin): {{exc_ik}}")
+
+            # --- BACKWARDS SOLVE (`RigUnit_InverseExecution`) -> Enables Sequencer "Bake To Control Rig"! ---
+            n_bwd = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_InverseExecution", "Execute", unreal.Vector2D(0, 960), "InverseExecution")
+            prev_bwd = f"{{n_bwd.get_name()}}.ExecuteContext"
+            bx = 320
+            all_bwd = list(ctrl_to_bone) + [(ch["ctrl_name"], ch["end_bone"]) for ch in ik_chains]
+            for cname, bname in all_bwd:
+                n_gb = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_GetTransform", "Execute", unreal.Vector2D(bx - 120, 1220), f"BwdGet_{{bname}}")
+                ctrl.set_pin_default_value(f"{{n_gb.get_name()}}.Item", f'(Type=Bone,Name="{{bname}}")', True)
+                ctrl.set_pin_default_value(f"{{n_gb.get_name()}}.Space", "GlobalSpace", True)
+
+                n_sc = ctrl.add_unit_node_from_struct_path("/Script/ControlRig.RigUnit_SetTransform", "Execute", unreal.Vector2D(bx, 960), f"BwdSet_{{cname}}")
+                ctrl.set_pin_default_value(f"{{n_sc.get_name()}}.Item", f'(Type=Control,Name="{{cname}}")', True)
+                ctrl.set_pin_default_value(f"{{n_sc.get_name()}}.Space", "GlobalSpace", True)
+                ctrl.set_pin_default_value(f"{{n_sc.get_name()}}.bPropagateToChildren", "True", True)
+
+                ctrl.add_link(prev_bwd, f"{{n_sc.get_name()}}.ExecuteContext")
+                ctrl.add_link(f"{{n_gb.get_name()}}.Transform", f"{{n_sc.get_name()}}.Transform")
+                prev_bwd = f"{{n_sc.get_name()}}.ExecuteContext"
+                bx += 340
+
+        if hasattr(blueprint, "recompile_vm"):
+            blueprint.recompile_vm()
+        unreal.EditorAssetLibrary.save_loaded_asset(blueprint)
+        unreal.log(
+            f"[HFW] Created native UE5 Control Rig {{cr_path}} "
+            f"({{len(ctrl_to_bone)}} FK controls, {{len(ik_chains)}} IK effectors, Forwards + Backwards Solve)!"
+        )
+        return blueprint
+    except Exception as exc:
+        unreal.log_warning(f"[HFW] Control Rig auto-generation warning (mesh/anims/materials unaffected): {{exc}}")
+        return None
+
+
 def run_import():
     _ensure_mpc()
     unreal.log(f"[HFW] Building {{len(MATERIALS_META)}} UE5 materials for {{MACHINE_NAME}} ({{ASSET_KIND}})...")
@@ -2152,7 +2634,10 @@ def run_import():
             built[_safe(slot_name)] = m
         except Exception as exc:
             unreal.log_error(f"[HFW] Failed to build material {{slot_name}}: {{exc}}")
-    import_machine_fbx(built)
+    mesh_asset = import_machine_fbx(built)
+    if IS_SKELETAL and mesh_asset is not None:
+        import_animations_fbx(mesh_asset)
+        build_ue5_control_rig(mesh_asset)
     unreal.log(f"[HFW] Complete! Assets ready in {{DEST_PACKAGE}}")
 
 

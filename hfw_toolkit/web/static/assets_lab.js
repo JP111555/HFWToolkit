@@ -1,5 +1,7 @@
 /**
- * HFWToolkit Web Studio — Characters Prompt Studio & Guerrilla Developer-Directory Asset Catalog.
+ * Unified Characters & Guerrilla Developer-Directory Asset Catalog navigator.
+ * Integrates seamlessly into the consistent 3-pane Studio Shell (Pane 1 Navigator ->
+ * Pane 2 Unified Inspector & Export Midbar -> Pane 3 6-Tab Material & Shader Workspace).
  */
 (function () {
   const $ = (sel) => document.querySelector(sel);
@@ -18,78 +20,29 @@
   let charsInitialized = false;
   let assetsInitialized = false;
   let chKindMode = "main";
+  let asViewMode = "tree"; // "tree" | "list"
   let selectedChar = null;
   let selectedAsset = null;
   let currentTreeDir = "";
 
-  async function pollExportJob(jobId, statusEl) {
-    statusEl.className = "export-status";
-    statusEl.classList.remove("hidden");
-    const iv = setInterval(async () => {
-      try {
-        const js = await api(`/api/export/status/${jobId}`);
-        statusEl.textContent = js.message || js.status;
-        if (js.status === "done") {
-          clearInterval(iv);
-          statusEl.className = "export-status done";
-          statusEl.innerHTML = `
-            <div>${esc(js.message)}</div>
-            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-              ${js.output_blend ? `<button class="btn-primary" data-open-blend="${esc(js.output_blend)}">Open in Blender</button>` : ""}
-              <button class="btn-ghost" data-open-folder="1">Open Exports Folder</button>
-            </div>
-          `;
-          const bOpen = statusEl.querySelector("[data-open-blend]");
-          if (bOpen) {
-            bOpen.addEventListener("click", () => {
-              api("/api/open-blend", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ blend_path: bOpen.dataset.openBlend }),
-              }).catch((e) => alert(e.message));
-            });
-          }
-          const bDir = statusEl.querySelector("[data-open-folder]");
-          if (bDir) {
-            bDir.addEventListener("click", () => {
-              api("/api/open-blend", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ open_folder: true }),
-              }).catch((e) => alert(e.message));
-            });
-          }
-        } else if (js.status === "error") {
-          clearInterval(iv);
-          statusEl.className = "export-status err";
-        }
-      } catch (err) {
-        clearInterval(iv);
-        statusEl.className = "export-status err";
-        statusEl.textContent = err.message;
-      }
-    }, 1200);
-  }
-
   // =========================================================================
-  // CHARACTERS & OUTFITS PROMPT STUDIO
+  // CHARACTERS & OUTFITS (Pane 1 Navigator -> Pane 2 Unified Inspector!)
   // =========================================================================
   async function loadCharacterList() {
     const q = ($("#ch-search")?.value || "").trim();
     const kindParam = chKindMode === "npc" ? "npc" : "";
     const data = await api(`/api/characters?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kindParam)}&limit=180`);
-    const counts = data.counts || {};
-    $("#ch-kpi-bar").innerHTML = `
-      <div class="kpi"><div class="kpi-val">${(counts.characters || 0).toLocaleString()}</div><div class="kpi-lbl">Indexed Characters</div></div>
-      <div class="kpi"><div class="kpi-val">${(counts.outfits || 0).toLocaleString()}</div><div class="kpi-lbl">Outfit Variations</div></div>
-      <div class="kpi"><div class="kpi-val">${(counts.heads || 0).toLocaleString()}</div><div class="kpi-lbl">Modular Heads</div></div>
-      <div class="kpi"><div class="kpi-val">Unified Rig</div><div class="kpi-lbl">Body + Face + Hair</div></div>
-    `;
     const list = $("#ch-list");
+    if (!list) return;
     list.innerHTML = "";
     const items = chKindMode === "main"
       ? data.items.filter((c) => c.character_kind !== "npc")
       : data.items;
+
+    if (!items.length) {
+      list.innerHTML = `<div class="empty-state" style="padding:16px;">No characters match your filter.</div>`;
+      return;
+    }
 
     items.forEach((c) => {
       const el = document.createElement("div");
@@ -102,7 +55,7 @@
           <span>${c.outfit_count > 1 ? `${c.outfit_count} outfits` : esc(c.gender)}</span>
         </div>
       `;
-      el.addEventListener("click", () => selectCharacter(c));
+      el.addEventListener("click", () => selectCharacter(c, ""));
       list.appendChild(el);
     });
   }
@@ -110,116 +63,91 @@
   async function populateHeadsDropdown() {
     const sel = $("#ch-head-select");
     if (!sel || sel.options.length > 2) return;
-    const data = await api("/api/characters/heads?limit=250");
-    sel.innerHTML = `<option value="">Default Character Head</option>`;
-    data.items.forEach((h) => {
-      const opt = document.createElement("option");
-      opt.value = h.facial_id;
-      opt.textContent = `${h.display_name} (${h.gender}) [${h.facial_id}]`;
-      sel.appendChild(opt);
-    });
-  }
-
-  async function selectCharacter(c, preferredOutfitId = "") {
-    selectedChar = c;
-    $$("#ch-list .list-item").forEach((el) => el.classList.remove("active"));
-    $("#ch-detail-title").textContent = `${c.display_name} (${c.tribe})`;
-    $("#ch-detail-meta").innerHTML = `ID: <code>${esc(c.char_id)}</code> • Kind: <strong>${esc(c.character_kind)}</strong> • Gender: <strong>${esc(c.gender)}</strong> • Dev Folder: <code>${esc(c.dev_folder)}</code>`;
-
-    const sel = $("#ch-outfit-select");
-    sel.innerHTML = `<option value="">Default Appearance</option>`;
     try {
-      const odata = await api(`/api/characters/${encodeURIComponent(c.char_id)}/outfits`);
-      odata.items.forEach((o) => {
+      const data = await api("/api/characters/heads?limit=250");
+      sel.innerHTML = `<option value="">Default Head</option>`;
+      data.items.forEach((h) => {
         const opt = document.createElement("option");
-        opt.value = o.outfit_id;
-        opt.textContent = `${o.display_name} (${o.tribe})${o.is_dlc ? " [DLC]" : ""}${o.has_headgear_toggle ? " [HG Toggle]" : ""}`;
-        if (preferredOutfitId && o.outfit_id === preferredOutfitId) opt.selected = true;
+        opt.value = h.facial_id;
+        opt.textContent = `${h.display_name} (${h.gender})`;
         sel.appendChild(opt);
       });
     } catch (_) {}
   }
 
+  async function selectCharacter(c, preferredOutfitId = "") {
+    selectedChar = c;
+    $$("#ch-list .list-item").forEach((el) => {
+      const t = el.querySelector(".list-item-title")?.textContent || "";
+      el.classList.toggle("active", t === c.display_name);
+    });
+
+    // Populate outfits dropdown first
+    const sel = $("#ch-outfit-select");
+    if (sel) {
+      sel.innerHTML = `<option value="">Default Appearance</option>`;
+      try {
+        const odata = await api(`/api/characters/${encodeURIComponent(c.char_id)}/outfits`);
+        odata.items.forEach((o) => {
+          const opt = document.createElement("option");
+          opt.value = o.outfit_id;
+          opt.textContent = `${o.display_name} (${o.tribe})${o.is_dlc ? " [DLC]" : ""}`;
+          if (preferredOutfitId && o.outfit_id === preferredOutfitId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      } catch (_) {}
+    }
+
+    if (window.HFWStudio) {
+      await window.HFWStudio.inspectCharacter(c, {
+        outfit_id: preferredOutfitId || ($("#ch-outfit-select")?.value || ""),
+        facial_override: $("#ch-head-select")?.value || "",
+        headgear: $("#ch-chk-headgear") ? $("#ch-chk-headgear").checked : true,
+        include_hair: $("#ch-chk-hair") ? $("#ch-chk-hair").checked : true,
+        hair_lod: Number($("#ch-hair-lod")?.value || 2),
+      });
+    }
+  }
+
   async function resolvePromptNow(promptText) {
-    const p = (promptText || $("#ch-prompt-input").value || "").trim();
+    const p = (promptText || $("#ch-prompt-input")?.value || "").trim();
     if (!p) return null;
-    $("#ch-prompt-input").value = p;
+    if ($("#ch-prompt-input")) $("#ch-prompt-input").value = p;
     const box = $("#ch-resolve-box");
-    box.className = "export-status";
-    box.classList.remove("hidden");
-    box.textContent = `Resolving "${p}"...`;
+    if (box) {
+      box.className = "export-status";
+      box.classList.remove("hidden");
+      box.textContent = `Resolving "${p}"...`;
+    }
     try {
       const r = await api(`/api/characters/resolve?prompt=${encodeURIComponent(p)}`);
-      box.className = "export-status done";
-      const altsHtml = (r.alternatives || []).slice(0, 4).map((a) =>
-        `<button class="pill-btn" style="padding:3px 9px;font-size:11.5px;" data-alt-prompt="${esc(a.display_name + (a.outfit_name ? " " + a.outfit_name : ""))}">${esc(a.display_name)}${a.outfit_name ? " — " + esc(a.outfit_name) : ""}</button>`
-      ).join(" ");
-      box.innerHTML = `
-        <div><strong>Matched:</strong> ${esc(r.summary)} <span style="opacity:.75;">(confidence ${Math.round((r.confidence || 0) * 100)}%, headgear=${r.headgear ? "ON" : "OFF"}, hair=${r.include_hair ? "ON" : "OFF"})</span></div>
-        ${altsHtml ? `<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;"><span style="font-size:11.5px;opacity:.75;">Alternatives:</span>${altsHtml}</div>` : ""}
-      `;
-      box.querySelectorAll("[data-alt-prompt]").forEach((btn) => {
-        btn.addEventListener("click", () => resolvePromptNow(btn.dataset.altPrompt));
-      });
+      if (box) {
+        box.className = "export-status done";
+        box.innerHTML = `<strong>Matched:</strong> ${esc(r.summary)} (${Math.round((r.confidence || 0) * 100)}%)`;
+      }
       if (r.character) {
-        $("#ch-chk-headgear").checked = !!r.headgear;
-        $("#ch-chk-hair").checked = !!r.include_hair;
-        $("#ch-hair-lod").value = String(r.hair_lod ?? 2);
+        if ($("#ch-chk-headgear")) $("#ch-chk-headgear").checked = !!r.headgear;
+        if ($("#ch-chk-hair")) $("#ch-chk-hair").checked = !!r.include_hair;
+        if ($("#ch-hair-lod")) $("#ch-hair-lod").value = String(r.hair_lod ?? 2);
         await selectCharacter(r.character, r.outfit ? r.outfit.outfit_id : "");
       }
       return r;
     } catch (err) {
-      box.className = "export-status err";
-      box.textContent = err.message;
+      if (box) {
+        box.className = "export-status err";
+        box.textContent = err.message;
+      }
       return null;
     }
   }
 
-  async function triggerCharacterExport(usePrompt, exportFbx) {
-    const st = $("#ch-export-status");
-    const body = usePrompt
-      ? {
-          prompt: ($("#ch-prompt-input").value || "").trim(),
-          hair_lod: Number($("#ch-hair-lod").value || 2),
-          pack_textures: $("#ch-chk-pack").checked,
-          export_fbx: exportFbx,
-        }
-      : {
-          char_id: selectedChar ? selectedChar.char_id : "aloy",
-          outfit_id: $("#ch-outfit-select").value || "",
-          facial_override: $("#ch-head-select").value || "",
-          headgear: $("#ch-chk-headgear").checked,
-          include_hair: $("#ch-chk-hair").checked,
-          hair_lod: Number($("#ch-hair-lod").value || 2),
-          pack_textures: $("#ch-chk-pack").checked,
-          export_fbx: exportFbx,
-        };
-    if (usePrompt && !body.prompt) {
-      alert("Enter a character prompt first (e.g. 'Aloy Carja Blazon no headgear').");
-      return;
-    }
-    st.className = "export-status";
-    st.classList.remove("hidden");
-    st.textContent = "Starting HFW character assembly...";
-    try {
-      const res = await api("/api/characters/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      pollExportJob(res.job_id, st);
-    } catch (err) {
-      st.className = "export-status err";
-      st.textContent = err.message;
-    }
-  }
-
   // =========================================================================
-  // GUERRILLA DEVELOPER-DIRECTORY ASSET CATALOG
+  // GUERRILLA DEV-DIRECTORY ASSET CATALOG (Unified Sidebar Tree / List!)
   // =========================================================================
   async function loadAssetCategories() {
-    const data = await api("/api/assets/categories");
     const sel = $("#as-cat-filter");
+    if (!sel || sel.options.length > 2) return;
+    const data = await api("/api/assets/categories");
     sel.innerHTML = `<option value="">All Categories (${(data.total || 0).toLocaleString()} assets)</option>`;
     (data.categories || []).forEach((c) => {
       const opt = document.createElement("option");
@@ -227,31 +155,37 @@
       opt.textContent = `${c.category} (${c.asset_count} | ${c.rigged_count} rigged)`;
       sel.appendChild(opt);
     });
-    $("#as-kpi-bar").innerHTML = (data.categories || []).slice(0, 6).map((c) => `
-      <div class="kpi" style="cursor:pointer;" data-as-kpi="${esc(c.category)}">
-        <div class="kpi-val">${c.asset_count}</div>
-        <div class="kpi-lbl">${esc(c.category)}</div>
-      </div>
-    `).join("");
-    $("#as-kpi-bar").querySelectorAll("[data-as-kpi]").forEach((k) => {
-      k.addEventListener("click", () => {
-        $("#as-cat-filter").value = k.dataset.asKpi;
-        loadAssetSidebarSearch();
-      });
-    });
+  }
+
+  function setAssetViewMode(mode) {
+    asViewMode = mode;
+    $("#as-view-tree-btn")?.classList.toggle("active", mode === "tree");
+    $("#as-view-list-btn")?.classList.toggle("active", mode === "list");
+    $("#as-tree-bar")?.classList.toggle("hidden", mode !== "tree");
+    $("#as-list-filters")?.classList.toggle("hidden", mode !== "list");
+    if (mode === "tree") {
+      loadAssetTree(currentTreeDir);
+    } else {
+      loadAssetSidebarSearch();
+    }
   }
 
   async function loadAssetSidebarSearch() {
     const q = ($("#as-search")?.value || "").trim();
     const cat = $("#as-cat-filter")?.value || "";
-    const data = await api(`/api/assets/search?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=160`);
+    const data = await api(`/api/assets/search?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=180`);
     const list = $("#as-list");
+    if (!list) return;
     list.innerHTML = "";
+    if (!data.items.length) {
+      list.innerHTML = `<div class="empty-state" style="padding:16px;">No assets match your search.</div>`;
+      return;
+    }
     data.items.forEach((a) => {
       const el = document.createElement("div");
       el.className = "list-item" + (selectedAsset && selectedAsset.dev_path === a.dev_path ? " active" : "");
       el.innerHTML = `
-        <div class="list-item-title">${esc(a.display_name)}</div>
+        <div class="list-item-title">${a.is_skinned ? "🦴" : "🧊"} ${esc(a.display_name)}</div>
         <div class="list-item-sub">
           <span>${esc(a.category)} • ${a.is_skinned ? "Rigged" : "Static"}</span>
           <span>${esc(a.resource_id)}</span>
@@ -265,84 +199,82 @@
   async function loadAssetTree(dirPath) {
     currentTreeDir = dirPath || "";
     const data = await api(`/api/assets/tree?dir=${encodeURIComponent(currentTreeDir)}`);
-    const bc = $("#as-breadcrumbs");
-    const segs = currentTreeDir ? currentTreeDir.split("/") : [];
-    let acc = "";
-    bc.innerHTML = `<button class="pill-btn" style="padding:3px 10px;font-size:12px;" data-bc="">work:/</button>` + segs.map((s) => {
-      acc = acc ? `${acc}/${s}` : s;
-      return `<span style="opacity:.5;">/</span><button class="pill-btn" style="padding:3px 10px;font-size:12px;" data-bc="${esc(acc)}">${esc(s)}</button>`;
-    }).join("");
-    bc.querySelectorAll("[data-bc]").forEach((b) => {
-      b.addEventListener("click", () => loadAssetTree(b.dataset.bc));
-    });
-
-    const grid = $("#as-tree-grid");
-    grid.innerHTML = "";
-    (data.folders || []).forEach((f) => {
-      const card = document.createElement("div");
-      card.className = "list-item";
-      card.style.border = "1px solid #1e293b";
-      card.style.borderRadius = "8px";
-      card.style.padding = "10px 12px";
-      card.innerHTML = `
-        <div class="list-item-title">📁 ${esc(f.name)}</div>
-        <div class="list-item-sub"><span>${f.asset_count} assets</span><span>${esc((f.categories || []).slice(0, 2).join(", "))}</span></div>
-      `;
-      card.addEventListener("click", () => loadAssetTree(f.path));
-      grid.appendChild(card);
-    });
-    (data.assets || []).forEach((a) => {
-      const card = document.createElement("div");
-      card.className = "list-item";
-      card.style.border = "1px solid #334155";
-      card.style.borderRadius = "8px";
-      card.style.padding = "10px 12px";
-      card.innerHTML = `
-        <div class="list-item-title">${a.is_skinned ? "🦴" : "🧊"} ${esc(a.display_name)}</div>
-        <div class="list-item-sub"><span>${esc(a.resource_type)}</span><span>${esc(a.resource_id)}</span></div>
-      `;
-      card.addEventListener("click", () => selectDevAsset(a));
-      grid.appendChild(card);
-    });
-  }
-
-  function selectDevAsset(a) {
-    selectedAsset = a;
-    $("#as-detail-card").classList.remove("hidden");
-    $("#as-detail-title").textContent = a.display_name;
-    $("#as-detail-meta").innerHTML = `
-      Guerrilla Path: <code>work:${esc(a.dev_path)}</code><br/>
-      Category: <strong>${esc(a.category)}</strong> • Type: <code>${esc(a.resource_type)}</code> (<code>${esc(a.resource_id)}</code>) •
-      <strong>${a.is_skinned ? "Rigged Skeletal Asset" : "Static Mesh Asset"}</strong> •
-      ${a.tset_count} TextureSets • ${a.shader_count} Shaders
-    `;
-    $("#as-export-status").classList.add("hidden");
-  }
-
-  async function triggerDevAssetExport(exportFbx) {
-    if (!selectedAsset) return;
-    const st = $("#as-export-status");
-    st.className = "export-status";
-    st.classList.remove("hidden");
-    st.textContent = `Assembling ${selectedAsset.dev_path}...`;
-    try {
-      const res = await api("/api/assets/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          asset: selectedAsset.dev_path,
-          pack_textures: $("#as-chk-pack").checked,
-          export_fbx: exportFbx,
-        }),
+    const bc = $("#as-tree-bar");
+    if (bc) {
+      const segs = currentTreeDir ? currentTreeDir.split("/") : [];
+      let acc = "";
+      bc.innerHTML = `<button class="tree-bc-btn" data-bc="">work:/</button>` + segs.map((s) => {
+        acc = acc ? `${acc}/${s}` : s;
+        return `<span style="opacity:.45;">/</span><button class="tree-bc-btn" data-bc="${esc(acc)}">${esc(s)}</button>`;
+      }).join("");
+      bc.querySelectorAll("[data-bc]").forEach((b) => {
+        b.addEventListener("click", () => loadAssetTree(b.dataset.bc));
       });
-      pollExportJob(res.job_id, st);
-    } catch (err) {
-      st.className = "export-status err";
-      st.textContent = err.message;
+    }
+
+    const list = $("#as-list");
+    if (!list) return;
+    list.innerHTML = "";
+
+    if (currentTreeDir) {
+      const parentPath = currentTreeDir.includes("/") ? currentTreeDir.slice(0, currentTreeDir.lastIndexOf("/")) : "";
+      const upEl = document.createElement("div");
+      upEl.className = "list-item";
+      upEl.innerHTML = `
+        <div class="list-item-title" style="color:#7dd3fc;">⬆ .. (Up One Folder)</div>
+        <div class="list-item-sub"><span>Back to ${esc(parentPath || "work:/")}</span></div>
+      `;
+      upEl.addEventListener("click", () => loadAssetTree(parentPath));
+      list.appendChild(upEl);
+    }
+
+    (data.folders || []).forEach((f) => {
+      const el = document.createElement("div");
+      el.className = "list-item";
+      el.innerHTML = `
+        <div class="list-item-title">📁 ${esc(f.name)}</div>
+        <div class="list-item-sub">
+          <span>${f.asset_count} assets</span>
+          <span>${esc((f.categories || []).slice(0, 2).join(", "))}</span>
+        </div>
+      `;
+      el.addEventListener("click", () => loadAssetTree(f.path));
+      list.appendChild(el);
+    });
+
+    (data.assets || []).forEach((a) => {
+      const el = document.createElement("div");
+      el.className = "list-item" + (selectedAsset && selectedAsset.dev_path === a.dev_path ? " active" : "");
+      el.innerHTML = `
+        <div class="list-item-title">${a.is_skinned ? "🦴" : "🧊"} ${esc(a.display_name)}</div>
+        <div class="list-item-sub">
+          <span>${esc(a.resource_type)}</span>
+          <span>${esc(a.resource_id)}</span>
+        </div>
+      `;
+      el.addEventListener("click", () => selectDevAsset(a));
+      list.appendChild(el);
+    });
+
+    if (!list.children.length) {
+      list.innerHTML = `<div class="empty-state" style="padding:16px;">Empty developer folder.</div>`;
+    }
+  }
+
+  async function selectDevAsset(a) {
+    selectedAsset = a;
+    $$("#as-list .list-item").forEach((el) => {
+      el.classList.toggle("active", (el.textContent || "").includes(a.resource_id));
+    });
+    if (window.HFWStudio) {
+      await window.HFWStudio.inspectAsset(a);
     }
   }
 
   window.HFWAssetsLab = {
+    getSelectedChar() { return selectedChar; },
+    getSelectedAsset() { return selectedAsset; },
+    resolvePromptNow,
     async initCharacters() {
       if (!charsInitialized) {
         charsInitialized = true;
@@ -356,23 +288,43 @@
         $("#ch-search")?.addEventListener("input", () => loadCharacterList());
         $("#ch-btn-resolve")?.addEventListener("click", () => resolvePromptNow());
         $("#ch-prompt-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") resolvePromptNow(); });
-        $$(".ch-chip").forEach((c) => c.addEventListener("click", () => resolvePromptNow(c.dataset.chprompt)));
-        $("#ch-btn-export-blend")?.addEventListener("click", () => triggerCharacterExport(true, false));
-        $("#ch-btn-export-ue5")?.addEventListener("click", () => triggerCharacterExport(true, true));
-        $("#ch-btn-export-sel-blend")?.addEventListener("click", () => triggerCharacterExport(false, false));
-        $("#ch-btn-export-sel-ue5")?.addEventListener("click", () => triggerCharacterExport(false, true));
+        ["#ch-outfit-select", "#ch-head-select", "#ch-chk-headgear", "#ch-chk-hair"].forEach((sel) => {
+          $(sel)?.addEventListener("change", () => {
+            if (selectedChar && window.HFWStudio) {
+              window.HFWStudio.inspectCharacter(selectedChar, {
+                outfit_id: $("#ch-outfit-select")?.value || "",
+                facial_override: $("#ch-head-select")?.value || "",
+                headgear: $("#ch-chk-headgear") ? $("#ch-chk-headgear").checked : true,
+                include_hair: $("#ch-chk-hair") ? $("#ch-chk-hair").checked : true,
+                hair_lod: Number($("#ch-hair-lod")?.value || 2),
+              });
+            }
+          });
+        });
       }
       await Promise.all([loadCharacterList(), populateHeadsDropdown()]);
     },
     async initAssets() {
       if (!assetsInitialized) {
         assetsInitialized = true;
-        $("#as-search")?.addEventListener("input", () => loadAssetSidebarSearch());
+        $("#as-view-tree-btn")?.addEventListener("click", () => setAssetViewMode("tree"));
+        $("#as-view-list-btn")?.addEventListener("click", () => setAssetViewMode("list"));
+        $("#as-search")?.addEventListener("input", () => {
+          const q = ($("#as-search")?.value || "").trim();
+          if (q && asViewMode === "tree") {
+            setAssetViewMode("list");
+          } else if (asViewMode === "list") {
+            loadAssetSidebarSearch();
+          }
+        });
         $("#as-cat-filter")?.addEventListener("change", () => loadAssetSidebarSearch());
-        $("#as-btn-export-blend")?.addEventListener("click", () => triggerDevAssetExport(false));
-        $("#as-btn-export-ue5")?.addEventListener("click", () => triggerDevAssetExport(true));
       }
-      await Promise.all([loadAssetCategories(), loadAssetTree(currentTreeDir), loadAssetSidebarSearch()]);
+      await loadAssetCategories();
+      if (asViewMode === "tree") {
+        await loadAssetTree(currentTreeDir);
+      } else {
+        await loadAssetSidebarSearch();
+      }
     },
   };
 })();

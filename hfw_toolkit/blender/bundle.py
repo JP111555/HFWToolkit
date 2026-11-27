@@ -28,6 +28,7 @@ from hfw_toolkit.extract.textures import (
 )
 from hfw_toolkit.shaders.character_dxil import (
     extract_dxil_outfit_corners,
+    infer_character_eye_color,
     infer_character_hair_color,
     infer_character_skin_tone,
 )
@@ -52,14 +53,23 @@ _HASH_GLASS_TINT_VB = 0x01943DD3     # 41249:0 canister glass shell RGBA tint
 _HASH_CORE_TINT_VB = 0x5D2FABB8      # 32906:0 / 1348:90 core emissive tint RGB
 
 # DXIL-verified elemental sack, canister & outer eye lens bindings (from scratch/dxil_sacks/*.txt)
-_HASH_SAC_FLOW_MAP = 0x7C771B98      # 172:0 (256x256 BC7): RG dual-phase elemental sac flow vectors
-_HASH_SAC_FLUID_TEX = 0x23FE87DB     # 1703:0 (256x256 BC4U): elemental fluid caustics / bubbles
+_HASH_SAC_FLOW_MAP = 0x7C771B98      # 172:0 (256x256 BC7): RG dual-phase elemental sac slosh flow vectors (exclusively on true liquid sacs)
+_HASH_SAC_FLOW_MAP_ALT = 0x21F95B28  # 172:0 rain/wetness flow binding (shared by wet armor plates & canisters — never trigger sac on this alone!)
+_HASH_SAC_FLUID_TEX = 0x23FE87DB     # 1703:0 (256x256 BC4U): elemental fluid caustics / bubbles (exclusively on true liquid sacs)
 _HASH_SAC_COLOR_VB = 0x249F1E74      # PerInstance elemental sac glow RGB
 _HASH_EMISSIVE_TINT_VB = 0x0E470C22  # Canister / elemental window glow RGB (sh=7564:6 / 7036:2)
 _HASH_EYE_IRIS_MASK = 0x5E969132     # 8837:0 / 20273:0 / 15787:3 outer eye lens POM iris glow mask
 
 # Shaders verified from DXIL to emit animated canister fluid/collar glow
 _CANISTER_GLOW_SHADERS: frozenset[str] = frozenset({"7564:6", "7036:2"})
+# Shaders verified across Bilegut, Tideripper, Frostclaw, Fireclaw, Snapmaw & Bellowback to render translucent liquid elemental sacs
+_SAC_LIQUID_SHADERS: frozenset[str] = frozenset({
+    "12898:1", "13431:2", "2880:421",    # Bilegut Metalbite / Adhesive sacs & Frostclaw shared sacs
+    "2345:175", "2345:170", "2174:161",  # Tideripper Purgewater pouches & sacs
+    "10905:4", "10554:1",                # Frostclaw / Fireclaw belly & shoulder sacs
+    "15050:2",                           # Snapmaw Chillwater Lungs sac
+    "24683:7", "24683:9", "10936:48",    # Bellowback Gullet & Cargo Refining sacs
+})
 
 
 # Authentic HFW linear RGB elemental palettes (calibrated for Blender AgX & UE5 ACES)
@@ -219,15 +229,17 @@ MACHINE_VARIANT_PROFILES: dict[str, dict[str, Any]] = {
         "profile": "overridden",
         "label": "Overridden",
         "is_apex": False,
-        "muscle_color": [0.04, 0.52, 1.0],     # Overridden Electric Cyan-Blue muscles
-        "muscle_glow": 2.7,
-        "cable_color": [0.04, 0.52, 1.0],
-        "cable_glow": 3.1,
-        "eye_color": [0.04, 0.62, 1.0],        # Overridden Cyan-Blue optics
-        "eye_alert_color": [1.0, 0.08, 0.01],
+        # Lore-accurate HFW behavior: overriding a machine turns ONLY its optics Electric Cyan —
+        # muscles stay Standard Warm Amber (muscles ONLY turn Purple on Apex or Crimson on Corrupted)!
+        "muscle_color": [0.95, 0.28, 0.02],
+        "muscle_glow": 2.6,
+        "cable_color": [0.95, 0.28, 0.02],
+        "cable_glow": 3.0,
+        "eye_color": [0.03, 0.78, 1.0],        # Overridden Electric Cyan optics
+        "eye_alert_color": [1.0, 0.08, 0.01],  # Hostile Red optics
         "eye_glow": 9.5,
         "core_color": [0.05, 0.58, 1.0],
-        "plasma_color": [0.06, 0.56, 1.0],
+        "plasma_color": [0.46, 0.05, 1.0],
     },
 }
 
@@ -257,6 +269,8 @@ def infer_machine_variant_profile(
     base["liquid_glow_scale"] = 1.0
     base["liquid_override_fac"] = 0.0
     base["liquid_override_color"] = [0.08, 0.62, 1.0]
+    base["detail_tiling_scale"] = 1.0
+    base["detail_strength"] = 0.72
     return base
 
 
@@ -297,6 +311,7 @@ def _extract_material_textures(
     dxc: Any = None,
     skin_profile: dict[str, Any] | None = None,
     hair_profile: dict[str, Any] | None = None,
+    eye_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export textures referenced by `mat`'s primary technique.
 
@@ -341,6 +356,16 @@ def _extract_material_textures(
         if 0.5 < vb_tile.float4[0] <= 128.0:
             detail_tile_x = float(vb_tile.float4[0])
             detail_tile_y = float(vb_tile.float4[1]) if 0.5 < vb_tile.float4[1] <= 128.0 else detail_tile_x
+    # Calibrate HFW machine micro-detail tiling density so brushed titanium, carbon weave, and panel scratches
+    # match HFW's high-frequency in-game micro-relief (never overly large/coarse on 4K UDIM machine sheets!)
+    if asset_kind == "machine":
+        if detail_tile_x < 24.0:
+            boost = max(2.15, 28.0 / max(4.0, detail_tile_x))
+            detail_tile_x = round(min(72.0, detail_tile_x * boost), 2)
+            detail_tile_y = round(min(72.0, detail_tile_y * boost), 2)
+        else:
+            detail_tile_x = round(min(96.0, detail_tile_x * 1.45), 2)
+            detail_tile_y = round(min(96.0, detail_tile_y * 1.45), 2)
 
     def _export_raw_tex(rid: str, label: str, color_space: str | None = None) -> dict[str, Any] | None:
         ckey = f"{rid}|{color_space or 'auto'}"
@@ -571,13 +596,13 @@ def _extract_material_textures(
                         target_dict.setdefault(mtype, fname)
 
         elif tb.resource_type == "Texture":
-            # Case A: Decima's mask-driven Machine Detail Texture2DArray (e.g. 20:0 256x256x23 BC7)!
+            # Case A: Decima's mask-driven Machine Detail Texture2DArray (e.g. 20:0 23-slice BC7 at crisp 512px/slice)!
             if tb.binding_name_hash in _DETAIL_ARRAY_BINDING_HASHES:
                 if rid not in array_atlas_cache:
                     try:
                         tex_obj = game.read_object(ObjectId.parse(rid), read_subgroups=True)
                         array_atlas_cache[rid] = export_texture_array_atlas(
-                            game, tex_obj, tex_dir, cols=5, max_slice_dim=256
+                            game, tex_obj, tex_dir, cols=5, max_slice_dim=512
                         )
                     except Exception:
                         array_atlas_cache[rid] = None
@@ -628,6 +653,23 @@ def _extract_material_textures(
                         _record_bb_layer(entry, src_low)
                     elif (not tb.is_detail_texture) or (asset_kind == "asset" and _is_layered_submaterial(src_str)):
                         _add_packed(entry, src_str)
+                        # Character armor/outfit sibling TextureSetParent recovery: if a character piece binds only
+                        # a single standalone Texture (e.g. `_NMT`) from a unique `models/characters/humans/` TextureSet,
+                        # recover its sibling `MSK` / `CLR` / `MISC` entries so armor plates NEVER lose their textures!
+                        if asset_kind == "character" and not is_submat and "models/characters/humans/" in src_low:
+                            try:
+                                tobj_sib = game.read_object(ObjectId.parse(rid), read_subgroups=True)
+                                ts_par = game.resolve_ref(tobj_sib.get("TextureSetParent")) if isinstance(tobj_sib, dict) else None
+                                if ts_par and ts_par.get("_type") == "TextureSet":
+                                    ts_par_id = str(ts_par["_id"])
+                                    if ts_par_id not in ts_packed_cache:
+                                        ts_packed_cache[ts_par_id] = export_packed_texture_set(
+                                            game, ts_par, tex_dir, max_dimension=max_texture_size
+                                        )
+                                    for sib_e in ts_packed_cache[ts_par_id]:
+                                        _add_packed(sib_e, src_str)
+                            except Exception:
+                                pass
                 else:
                     if rid not in standalone_unpacked_cache:
                         saved: dict[str, str] = {}
@@ -846,14 +888,36 @@ def _extract_material_textures(
     if is_machine_asset and special_shader is None:
         shader_id = pt.shader_id or ""
 
-        # Overlay 1: Elemental Sacks (Cryo, Acid/Metalbite, Blaze/Fire, Purgewater, Adhesive, Fertilizer, Spikesnout!)
-        # Exact DXIL signature: binds 0x7c771b98 (172:0 Flow Map) + 0x23fe87db (1703:0 Fluid Caustics) + mat_id==0 * Mask_Alpha!
-        if _HASH_SAC_FLOW_MAP in tb_by_hash and _HASH_SAC_FLUID_TEX in tb_by_hash:
-            flow_tex = _export_raw_tex(tb_by_hash[_HASH_SAC_FLOW_MAP].resource_id, "HFW_SacFlowMap", "Non-Color")
-            fluid_tex = _export_raw_tex(tb_by_hash[_HASH_SAC_FLUID_TEX].resource_id, "HFW_SacFluidCaustics", "Non-Color")
+        # Overlay 1: Elemental Sacks, Bags & Liquid Bladders (Bilegut, Tideripper, Frostclaw, Fireclaw, Snapmaw, Widemaw, Bellowback, Burrower, Spikesnout!)
+        # Exact DXIL signatures (never match rain-wet armor plates which only bind 0x21F95B28!):
+        #   - 0x7C771B98 (172:0 Sac Slosh Flow Map), OR 0x23FE87DB / 1703:0 (Fluid Caustics), OR verified liquid sac shader,
+        #   - OR explicit dedicated sac-bag material name (excluding canisters, eyes, muscles, and mechanical dispersal tanks).
+        sac_flow_tb = tb_by_hash.get(_HASH_SAC_FLOW_MAP)
+        fluid_tb = tb_by_hash.get(_HASH_SAC_FLUID_TEX) or next(
+            (tb for tb in pt.texture_bindings if tb.resource_id == "1703:0"), None
+        )
+        mat_low = mat.name.lower()
+        sac_ctx_low = f"{mat.name} {mesh_part_hint} {catalog_part_hint}".lower()
+        is_named_sac = (
+            any(
+                k in mat_low
+                for k in (
+                    "_bag_", "bag_clr", "bag_nmt", "belly_sac", "gluesac", "acidsac", "blazesac",
+                    "cryosac", "freezesac", "chillwater_sac", "purgewater_sac", "liquid_sac",
+                    "sac_clr", "sac_nmt", "bladder",
+                )
+            )
+            and "canister" not in sac_ctx_low
+            and "muscle" not in sac_ctx_low
+            and "eye" not in sac_ctx_low
+            and _HASH_EYE_IRIS_MASK not in tb_by_hash
+        )
+        if (fluid_tb is not None) or (sac_flow_tb is not None) or (shader_id in _SAC_LIQUID_SHADERS) or (is_named_sac and (has_tset or has_mapped)):
+            flow_rid = sac_flow_tb.resource_id if sac_flow_tb is not None else "172:0"
+            fluid_rid = fluid_tb.resource_id if fluid_tb is not None else "1703:0"
+            flow_tex = _export_raw_tex(flow_rid, "HFW_SacFlowMap", "Non-Color")
+            fluid_tex = _export_raw_tex(fluid_rid, "HFW_SacFluidCaustics", "Non-Color")
             sac_col = None
-            # Only trust PerInstance 0x249F1E74 when it is NOT one of Decima's runtime-overridden placeholders
-            # (such as [0.135, 0.27, 0.54] default blue, [0.0, 1.0, 0.0] debug green, or [0.057, 0.057, 0.057] gray!).
             if _HASH_SAC_COLOR_VB in vb_by_hash:
                 f4 = vb_by_hash[_HASH_SAC_COLOR_VB].float4
                 if not _is_placeholder_sac_color(f4):
@@ -866,15 +930,68 @@ def _extract_material_textures(
                     variant_hint=variant_hint,
                     machine_hint=machine_hint,
                 )
+
+            # Auto-detect exact DXIL liquid `mask_id` (`0.0` on Bellowback vs `20.0` on Bilegut/Frostclaw/Fireclaw/Tideripper/Snapmaw
+            # vs `-1.0` full Mask_Alpha on pure bubble/bag meshes) by sampling exported Mask + Mask_Alpha pixel coverage!
+            detected_mask_id = 0.0
+            try:
+                mask_arr = None
+                ma_arr = None
+                if not unpack_textures:
+                    for pe in packed_entries:
+                        pk = pe.get("packing", {})
+                        p_fn = tex_dir / pe.get("filename", "")
+                        if not p_fn.is_file():
+                            continue
+                        for lane, pspec in pk.items():
+                            t_ch = pspec.split(".", 1)[0]
+                            if t_ch == "Mask" and mask_arr is None:
+                                im = Image.open(p_fn).convert("RGBA").resize((64, 64), Image.NEAREST)
+                                arr = np.asarray(im, dtype=np.float32) / 255.0
+                                mask_arr = arr[:, :, LANE_TO_IDX.get(lane, 0)]
+                                for l2, ps2 in pk.items():
+                                    if ps2.split(".", 1)[0] == "Mask_Alpha":
+                                        ma_arr = arr[:, :, LANE_TO_IDX.get(l2, 3)]
+                            elif t_ch == "Mask_Alpha" and ma_arr is None:
+                                im = Image.open(p_fn).convert("RGBA").resize((64, 64), Image.NEAREST)
+                                arr = np.asarray(im, dtype=np.float32) / 255.0
+                                ma_arr = arr[:, :, LANE_TO_IDX.get(lane, 3)]
+                else:
+                    if maps.get("Mask") and (tex_dir / maps["Mask"]).is_file():
+                        mask_arr = np.asarray(Image.open(tex_dir / maps["Mask"]).convert("L").resize((64, 64), Image.NEAREST), dtype=np.float32) / 255.0
+                    if maps.get("Mask_Alpha") and (tex_dir / maps["Mask_Alpha"]).is_file():
+                        ma_arr = np.asarray(Image.open(tex_dir / maps["Mask_Alpha"]).convert("L").resize((64, 64), Image.NEAREST), dtype=np.float32) / 255.0
+
+                if mask_arr is not None:
+                    ids = np.round(mask_arr * 20.0)
+                    w = ma_arr if ma_arr is not None else np.ones_like(ids)
+                    cov_0 = float(np.mean((ids == 0.0) * w))
+                    cov_20 = float(np.mean((ids >= 19.5) * w))
+                    cov_19 = float(np.mean(((ids >= 18.5) & (ids < 19.5)) * w))
+                    # In HFW Decima liquid-sac shaders: `0.0` (e.g. Spraybot_Bag / Frog_Body / Seabeast_Body)
+                    # or `20.0` (e.g. Cryobear / Infernobear / Beachlizard) encodes the liquid membrane pixels.
+                    if cov_20 >= 0.015 and cov_20 >= cov_0 * 1.15:
+                        detected_mask_id = 20.0
+                    elif cov_0 >= 0.015:
+                        detected_mask_id = 0.0
+                    elif cov_19 >= 0.015:
+                        detected_mask_id = 19.0
+                    else:
+                        detected_mask_id = 20.0 if cov_20 >= cov_0 else 0.0
+                else:
+                    detected_mask_id = -1.0
+            except Exception:
+                detected_mask_id = 20.0 if shader_id in _SAC_LIQUID_SHADERS else 0.0
+
             emissive_overlay = {
                 "kind": "elemental_sack_overlay",
                 "flow_file": flow_tex["filename"] if flow_tex else "",
                 "fluid_file": fluid_tex["filename"] if fluid_tex else "",
                 "glow_color": sac_col,
-                "glow_strength": 3.4,
+                "glow_strength": 4.6,
                 "flow_speed": 0.35,
                 "flow_strength": 0.14,
-                "mask_id": 0.0,  # Exact DXIL L476: round(Mask * 20) == 0 * Mask_Alpha
+                "mask_id": float(detected_mask_id),
             }
 
         # Overlay 2: Elemental Canisters (Acid 13451:37/69, Water 15271:21/61, Blaze 13323:33/56, Plasma 13567:44, Shock 10036:34)
@@ -1242,6 +1359,17 @@ def _extract_material_textures(
         "skin_tone_linear": list(skin_profile["skin_tone_linear"]) if (uses_skin_lut and skin_profile) else None,
         "uses_hair_lut": uses_hair_lut,
         "hair_color_linear": list(hair_profile["hair_color_linear"]) if (hair_profile and surface_profile in ("hair", "hair_face")) else None,
+        "eye_profile": eye_profile["preset"] if (eye_profile and surface_profile == "eye") else None,
+        "iris_color_linear": list(eye_profile["iris_color_linear"]) if (eye_profile and surface_profile == "eye") else None,
+        "peach_fuzz_intensity": 0.45 if surface_profile == "peach_fuzz" else None,
+        "translucency_file": next(
+            (
+                e["filename"]
+                for e in packed_entries
+                if any(k in (e.get("filename", "") + " " + e.get("source_path", "")).lower() for k in ("translucency", "_tra"))
+            ),
+            "",
+        ),
         "asset_detail_normal_file": asset_detail_normal_file,
     }
 
@@ -1254,6 +1382,7 @@ def export_assembly_bundle(
     unpack_textures: bool = False,
     asset_kind: str = "machine",
     extra_metadata: dict[str, Any] | None = None,
+    animations: int | list[str] | str | None = None,
 ) -> Path:
     """Write a complete self-contained Canonical Assembly Bundle (`assembly.json` + `geometry.npz` + `textures/`).
 
@@ -1296,6 +1425,11 @@ def export_assembly_bundle(
     )
     hair_profile = (
         infer_character_hair_color(character_hint=machine_hint, variant_hint=variant_hint)
+        if asset_kind == "character"
+        else None
+    )
+    eye_profile = (
+        infer_character_eye_color(character_hint=machine_hint, variant_hint=variant_hint)
         if asset_kind == "character"
         else None
     )
@@ -1350,6 +1484,7 @@ def export_assembly_bundle(
             dxc=dxc_tool,
             skin_profile=skin_profile,
             hair_profile=hair_profile,
+            eye_profile=eye_profile,
         )
         pt = mat.primary_technique
         eff_mat_name = mat.name
@@ -1385,6 +1520,10 @@ def export_assembly_bundle(
             "skin_tone_linear": tex_info.get("skin_tone_linear"),
             "uses_hair_lut": bool(tex_info.get("uses_hair_lut", False)),
             "hair_color_linear": tex_info.get("hair_color_linear"),
+            "eye_profile": tex_info.get("eye_profile"),
+            "iris_color_linear": tex_info.get("iris_color_linear"),
+            "peach_fuzz_intensity": tex_info.get("peach_fuzz_intensity"),
+            "translucency_file": tex_info.get("translucency_file", ""),
             "asset_detail_normal_file": tex_info.get("asset_detail_normal_file", ""),
             "variables": [
                 {
@@ -1490,8 +1629,80 @@ def export_assembly_bundle(
         for j in assembly.skeleton.joints
     ]
 
+    # Analyze universal HFW Control Rig chains (shared identically by Blender & UE5!)
+    rig_spec: dict[str, Any] | None = None
+    if len(assembly.skeleton.joints) >= 8:
+        try:
+            from hfw_toolkit.blender.control_rig import analyze_rig_chains
+
+            joint_specs = [
+                {
+                    "name": j.name,
+                    "parent_name": assembly.skeleton.joints[j.parent_index].name
+                    if 0 <= j.parent_index < len(assembly.skeleton.joints)
+                    else None,
+                    "head": j.world_matrix[:3, 3].tolist(),
+                }
+                for j in assembly.skeleton.joints
+            ]
+            rig_spec = analyze_rig_chains(joint_specs)
+        except Exception:
+            rig_spec = None
+
+    # Optional decoded HFW in-game animations (`animations.npz` + `manifest["animations"]`)
+    animations_manifest: list[dict[str, Any]] = []
+    if animations and assembly.skeleton.joints:
+        try:
+            from hfw_toolkit.extract.animations import resolve_animations_for_export
+
+            ent_gid: int | None = None
+            if assembly.entity_id and ":" in assembly.entity_id:
+                try:
+                    ent_gid = ObjectId.parse(assembly.entity_id).group_id
+                except Exception:
+                    ent_gid = None
+            gender_hint = "male" if "male" in f"{assembly.display_name} {assembly.variant_label}".lower() and "female" not in f"{assembly.display_name} {assembly.variant_label}".lower() else "female"
+            decoded_clips = resolve_animations_for_export(
+                game,
+                assembly.skeleton,
+                entity_group_id=ent_gid,
+                asset_kind=asset_kind,
+                animations_spec=animations,
+                gender=gender_hint,
+            )
+            if decoded_clips:
+                anim_arrays: dict[str, np.ndarray] = {}
+                for ai, clip in enumerate(decoded_clips):
+                    akey = f"a{ai}"
+                    anim_arrays[f"{akey}_loc"] = clip["loc"]
+                    anim_arrays[f"{akey}_rot"] = clip["rot_wxyz"]
+                    anim_arrays[f"{akey}_scale"] = clip["scale"]
+                    anim_arrays[f"{akey}_has_loc"] = clip["has_loc"]
+                    anim_arrays[f"{akey}_has_rot"] = clip["has_rot"]
+                    anim_arrays[f"{akey}_has_scale"] = clip["has_scale"]
+                    animations_manifest.append(
+                        {
+                            "key": akey,
+                            "anim_id": clip["anim_id"],
+                            "name": clip["name"],
+                            "category": clip["category"],
+                            "description": clip.get("description", ""),
+                            "skeleton_id": clip["skeleton_id"],
+                            "duration": round(float(clip["duration"]), 4),
+                            "sample_rate": round(float(clip["sample_rate"]), 3),
+                            "num_frames": int(clip["num_frames"]),
+                            "joint_names": clip["joint_names"],
+                            "locomotion_delta_t": clip["locomotion_delta_t"],
+                            "events": clip["events"],
+                            "fbx_filename": f"HFW_{_safe_name(clip['name'], 52)}.fbx",
+                        }
+                    )
+                np.savez_compressed(bundle_dir / "animations.npz", **anim_arrays)
+        except Exception:
+            animations_manifest = []
+
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "asset_kind": asset_kind,
         "texture_mode": "unpacked" if unpack_textures else "packed",
         "entity_id": assembly.entity_id,
@@ -1499,6 +1710,8 @@ def export_assembly_bundle(
         "display_name": assembly.display_name,
         "variant_label": assembly.variant_label,
         "official_variant_name": assembly.official_variant_name,
+        "shader_override_count": int(getattr(assembly, "shader_override_count", 0)),
+        "shader_override_resource_ids": list(getattr(assembly, "shader_override_resource_ids", ()) or ()),
         "shader_controls": (
             variant_profile
             if asset_kind == "machine"
@@ -1508,6 +1721,9 @@ def export_assembly_bundle(
                     "skin_preset": skin_profile["preset"],
                     "hair_color_linear": hair_profile["hair_color_linear"] if hair_profile else [0.045, 0.032, 0.025],
                     "hair_preset": hair_profile["preset"] if hair_profile else "dark_brown",
+                    "iris_color_linear": eye_profile["iris_color_linear"] if eye_profile else [0.106, 0.199, 0.061],
+                    "iris_preset": eye_profile["preset"] if eye_profile else "aloy_green",
+                    "peach_fuzz_intensity": 0.65,
                 }
                 if skin_profile
                 else {}
@@ -1516,6 +1732,8 @@ def export_assembly_bundle(
         "skeleton_id": assembly.skeleton.object_id,
         "joints": joints_manifest,
         "helpers": helpers_manifest,
+        "rig_spec": rig_spec,
+        "animations": animations_manifest,
         "parts": parts_manifest,
         "materials": materials_manifest,
     }
@@ -1539,7 +1757,7 @@ def export_assembly_bundle(
         if script_name != "ue5_import_machine.py":
             # Also provide canonical alias so any automated UE5 pipeline finds it seamlessly
             (bundle_dir / "ue5_import_machine.py").write_text(ue5_py, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[HFWToolkit] Warning: UE5 script generation failed: {exc}")
 
     return bundle_dir

@@ -91,15 +91,20 @@ def _classify_texture_binding(
     if not target_types and source_paths:
         target_types = set(source_paths.keys())
 
-    # A machine's own macro UDIM tile (e.g. PlasmaSpine_Body_02, Raptor_Head_01_NMT whose Mask_Alpha PSD
-    # is named `*_Detail.psd`, or any map packing baked AO / Mask / Mask_Alpha) is ALWAYS a PRIMARY macro
-    # texture, NEVER a tiled micro-detail texture!
-    has_baked_macro_channel = bool(target_types & {"AO", "Mask", "Mask_Alpha"})
+    # A machine's or character's own unique macro UDIM tile (e.g. PlasmaSpine_Body_02, Raptor_Head_01_NMT,
+    # AN_AloyNoraShieldweaverHat_NMT — note "ShieldWEAVEr" contains "weave"!, or any map packing baked
+    # AO / Mask / Mask_Alpha / Curvature / Misc_01) is ALWAYS a PRIMARY macro texture, NEVER a tiled detail map!
+    all_types_hint = target_types | set(source_paths.keys())
+    has_baked_macro_channel = bool(all_types_hint & {"AO", "Mask", "Mask_Alpha", "Curvature", "Misc_01"})
+    is_shared_or_shader_tex = any(
+        kw in all_paths for kw in ("/shared/", "shaders_hrz2/", "tileable", "micro", "shared_detail")
+    )
     is_machine_macro_tile = (
         has_baked_macro_channel
         or (
             (
                 "models/characters/robots/" in all_paths
+                or "models/characters/humans/" in all_paths
                 or "_body_" in all_paths
                 or "_plates_" in all_paths
                 or "_head_" in all_paths
@@ -107,7 +112,7 @@ def _classify_texture_binding(
                 or "_des_" in all_paths
                 or "_dyn_" in all_paths
             )
-            and not any(kw in all_paths for kw in ("/shared/", "tileable", "micro", "shared_detail"))
+            and not is_shared_or_shader_tex
         )
     )
     is_detail = (not is_machine_macro_tile) and any(
@@ -361,3 +366,150 @@ def parse_material(game: HFWGame, render_effect_obj: dict[str, Any]) -> Material
         roles=roles,
         material_tags=sorted(tags),
     )
+
+
+def apply_shader_overrides(
+    game: HFWGame,
+    mat: MaterialInfo,
+    texture_overrides: dict[int, Any] | None = None,
+    variable_overrides: dict[int, dict[str, Any]] | None = None,
+) -> int:
+    """Apply Decima `RenderEffectShaderOverridesResource` texture & variable overrides onto a parsed `MaterialInfo`.
+
+    HFW Apex & Variant machines store their dark obsidian/gold `*_BVar_CLR/MSK/RGH/RFL` `TextureSet` and `Texture`
+    swaps inside `RenderEffectShaderOverridesResource.ShaderOverrides.ShaderTextureOverrides`, keyed 1-to-1 by
+    `BindingNameHash`! Applying them directly on `MaterialInfo` updates both Blender and Unreal Engine 5 outputs.
+
+    Returns the number of bindings modified on `mat`.
+    """
+    if not texture_overrides and not variable_overrides:
+        return 0
+    tex_ov = texture_overrides or {}
+    var_ov = variable_overrides or {}
+    changes = 0
+
+    for tech in mat.techniques:
+        for tb in tech.texture_bindings:
+            ov_res = tex_ov.get(tb.binding_name_hash)
+            if ov_res is None:
+                continue
+            res_obj = ov_res if isinstance(ov_res, dict) else None
+            if res_obj is None:
+                try:
+                    res_obj = game.read_object(ov_res, read_subgroups=True)
+                except Exception:
+                    continue
+            if not res_obj:
+                continue
+
+            res_id = str(res_obj.get("_id", ""))
+            res_type = str(res_obj.get("_type", ""))
+            if not res_id or res_type not in ("TextureSet", "Texture"):
+                continue
+
+            src_paths: dict[str, str] = {}
+            pack_entries: list[dict[str, Any]] = []
+            target_ch = dict(tb.target_channels)
+            bname = f"Tex_{res_id.replace(':', '_')}"
+
+            if res_type == "TextureSet":
+                for desc in res_obj.get("TextureDesc", ()):
+                    tname = ETEXTURE_SET_TYPE.get(desc.get("TextureType", 0), "Invalid")
+                    raw_p = desc.get("Path", "")
+                    if raw_p:
+                        clean = raw_p[5:] if raw_p.lower().startswith("work:") else raw_p
+                        src_paths[tname] = clean
+                        if bname.startswith("Tex_"):
+                            bname = Path(clean).stem
+                for e_i, e in enumerate(res_obj.get("Entries", ())):
+                    etex = game.resolve_ref(e.get("Texture"))
+                    epack = decode_packing_info(int(e.get("PackingInfo", 0)))
+                    pack_entries.append(
+                        {
+                            "entry_index": e_i,
+                            "texture_id": str(etex["_id"]) if etex else None,
+                            "packing": {k: f"{v.tex_type}.{v.source_channel}" for k, v in epack.items()},
+                        }
+                    )
+            elif res_type == "Texture":
+                ts_parent = game.resolve_ref(res_obj.get("TextureSetParent"))
+                if ts_parent:
+                    for desc in ts_parent.get("TextureDesc", ()):
+                        tname = ETEXTURE_SET_TYPE.get(desc.get("TextureType", 0), "Invalid")
+                        raw_p = desc.get("Path", "")
+                        if raw_p:
+                            clean = raw_p[5:] if raw_p.lower().startswith("work:") else raw_p
+                            src_paths[tname] = clean
+                            if bname.startswith("Tex_"):
+                                bname = Path(clean).stem
+                    for e_i, e in enumerate(ts_parent.get("Entries", ())):
+                        etex = game.resolve_ref(e.get("Texture"))
+                        if etex is not None and etex.get("_id") == res_obj.get("_id"):
+                            epack = decode_packing_info(int(e.get("PackingInfo", 0)))
+                            if epack:
+                                target_ch = {k: f"{v.tex_type}.{v.source_channel}" for k, v in epack.items()}
+                            pack_entries.append(
+                                {
+                                    "entry_index": e_i,
+                                    "texture_id": res_id,
+                                    "packing": {k: f"{v.tex_type}.{v.source_channel}" for k, v in epack.items()},
+                                }
+                            )
+                            break
+
+            tb.resource_id = res_id
+            tb.resource_type = res_type
+            tb.binding_kind = res_type
+            tb.name = bname
+            tb.source_paths = src_paths
+            tb.packing_entries = pack_entries
+            tb.target_channels = target_ch
+            tb.semantic_role, tb.is_detail_texture = _classify_texture_binding(
+                tb.binding_kind, tb.target_channels, tb.source_paths, tb.name
+            )
+            changes += 1
+
+        for vb in tech.variable_bindings:
+            ov_v = var_ov.get(vb.binding_name_hash) or var_ov.get(vb.variable_id_hash)
+            if ov_v is None:
+                continue
+            raw_u = (
+                int(ov_v.get("VariableData0", 0)) & 0xFFFFFFFF,
+                int(ov_v.get("VariableData1", 0)) & 0xFFFFFFFF,
+                int(ov_v.get("VariableData2", 0)) & 0xFFFFFFFF,
+                int(ov_v.get("VariableData3", 0)) & 0xFFFFFFFF,
+            )
+            packed_b = struct.pack("<4I", *raw_u)
+            f4 = struct.unpack("<4f", packed_b)
+            i4 = struct.unpack("<4i", packed_b)
+            vb.raw_u32 = raw_u
+            vb.float4 = tuple(round(x, 5) if abs(x) < 1e9 else 0.0 for x in f4)
+            vb.int4 = i4
+            changes += 1
+
+    if changes > 0 and mat.primary_technique is not None:
+        # Refresh derived primary metadata (texture_set_ids, standalone_texture_ids, roles, name, tags)
+        roles: dict[str, list[TextureBindingInfo]] = {}
+        ts_ids: list[str] = []
+        tex_ids: list[str] = []
+        tags = set(mat.material_tags)
+        tags.add("VariantOverride")
+        for tb in mat.primary_technique.texture_bindings:
+            roles.setdefault(tb.semantic_role, []).append(tb)
+            if tb.resource_id:
+                if tb.resource_type == "TextureSet" and tb.resource_id not in ts_ids:
+                    ts_ids.append(tb.resource_id)
+                elif tb.resource_type == "Texture" and tb.resource_id not in tex_ids:
+                    tex_ids.append(tb.resource_id)
+        for preferred in ("Color", "Normal", "Surface_RMA", "Emissive"):
+            if roles.get(preferred):
+                cand = roles[preferred][0].name
+                if cand and not cand.startswith("Tex_"):
+                    mat.name = cand
+                    break
+        mat.roles = roles
+        mat.texture_set_ids = ts_ids
+        mat.standalone_texture_ids = tex_ids
+        mat.material_tags = sorted(tags)
+
+    return changes

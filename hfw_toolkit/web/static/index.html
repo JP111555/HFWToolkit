@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HFWToolkit — Horizon Forbidden West Material &amp; Shader Studio</title>
+  <title>HFWToolkit — Horizon Forbidden West Material, Rig &amp; Shader Studio</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -11,59 +11,78 @@
     <div class="brand">
       <span class="brand-dot"></span>
       <span class="brand-title">HFWToolkit</span>
-      <span class="brand-sub">Decima Machine Assembler &amp; Material/Shader Deep-Dive Studio</span>
+      <span class="brand-sub">Unified Decima Assembler, Rig &amp; Shader Studio</span>
+      <button class="update-pill hidden" id="topbar-update-pill" title="A newer commit is available on GitHub main — click to review or update">⬆ Update Available</button>
     </div>
     <div class="topbar-right">
       <div class="topbar-stats" id="topbar-stats">Loading catalog...</div>
-      <button class="btn-ghost" id="btn-open-setup" title="Configure HFW &amp; Blender paths, inspect version compatibility, or install Blender add-on">⚙️ Setup &amp; Status</button>
+      <button class="btn-ghost" id="btn-open-setup" title="Configure paths, check GitHub updates, inspect Python runtime &amp; install Blender add-on">⚙️ Setup &amp; Updates</button>
     </div>
   </header>
 
-  <div class="layout">
-    <!-- LEFT SIDEBAR -->
+  <div class="layout" id="studio-layout">
+    <!-- PANE 1: UNIFIED LEFT NAVIGATOR SIDEBAR -->
     <aside class="sidebar">
-      <div class="nav-modes" style="flex-wrap:wrap;">
+      <div class="nav-modes">
         <button class="mode-btn active" data-mode="machines">Machines</button>
         <button class="mode-btn" data-mode="characters">Characters</button>
-        <button class="mode-btn" data-mode="assets">Asset Catalog</button>
+        <button class="mode-btn" data-mode="assets">Assets</button>
         <button class="mode-btn" data-mode="audio">Audio</button>
-        <button class="mode-btn" data-mode="texturesets">TextureSets</button>
+        <button class="mode-btn" data-mode="texturesets">Textures</button>
         <button class="mode-btn" data-mode="diff">Diff</button>
       </div>
 
       <!-- Mode 1: Machines -->
       <div class="sidebar-pane" id="pane-machines">
-        <div class="search-box">
-          <input id="machine-search" type="text" placeholder="Search Slitherfang, Clawstrider, Slaughterspine..." />
+        <div class="search-box compact">
+          <input id="machine-search" type="text" placeholder="Search machines... (press /)" />
+        </div>
+        <div class="quick-filter-row" id="machine-filter-chips">
+          <button class="ch-btn active" data-mfilter="">All</button>
+          <button class="ch-btn" data-mfilter="flyer">Flyers</button>
+          <button class="ch-btn" data-mfilter="heavy">Heavyweights</button>
+          <button class="ch-btn" data-mfilter="sac">Elemental Sacs</button>
         </div>
         <div class="list-scroll" id="machine-list"></div>
       </div>
 
-      <!-- Mode 1b: Characters & Outfits -->
+      <!-- Mode 2: Characters & Outfits (Same Sidebar Pattern!) -->
       <div class="sidebar-pane hidden" id="pane-characters">
         <div class="au-kind-tabs">
           <button class="ch-kind-btn active" data-chkind="main">Main Cast</button>
-          <button class="ch-kind-btn" data-chkind="all">All (1,200)</button>
+          <button class="ch-kind-btn" data-chkind="all">All (1.2k)</button>
           <button class="ch-kind-btn" data-chkind="npc">Tribal NPCs</button>
         </div>
         <div class="search-box compact">
-          <input id="ch-search" type="text" placeholder="Filter Aloy, Seyka, Erend, Tenakth, Carja..." />
+          <input id="ch-search" type="text" placeholder="Filter Aloy, Seyka, Erend, Kotallo..." />
+        </div>
+        <div class="search-box compact prompt-mini-box">
+          <div class="prompt-mini-row">
+            <input id="ch-prompt-input" type="text" placeholder="Prompt: Aloy Carja Blazon no headgear" />
+            <button class="btn-primary" id="ch-btn-resolve" style="padding:6px 10px;">Go</button>
+          </div>
+          <div id="ch-resolve-box" class="export-status hidden" style="margin-top:6px;font-size:11px;"></div>
         </div>
         <div class="list-scroll" id="ch-list"></div>
       </div>
 
-      <!-- Mode 1c: Guerrilla Dev-Directory Asset Catalog -->
+      <!-- Mode 3: Dev Asset Catalog (Unified Sidebar Tree / List Toggle!) -->
       <div class="sidebar-pane hidden" id="pane-assets">
+        <div class="view-toggle-bar">
+          <button class="ch-btn active" data-asview="tree" id="as-view-tree-btn">📁 Folder Tree</button>
+          <button class="ch-btn" data-asview="list" id="as-view-list-btn">🔍 Search All</button>
+        </div>
         <div class="search-box compact">
-          <input id="as-search" type="text" placeholder="Search 1,454 dev-dir assets (Bow, Pine, Ruins, Boar...)" />
+          <input id="as-search" type="text" placeholder="Search 1,454 assets (Bow, Pine, Ruins...)" />
         </div>
-        <div class="search-box compact" style="padding-top:0;">
-          <select id="as-cat-filter" style="width:100%;"><option value="">All Categories (Guerrilla Tree)</option></select>
+        <div id="as-list-filters" class="search-box compact hidden" style="padding-top:0;">
+          <select id="as-cat-filter" style="width:100%;"><option value="">All Categories</option></select>
         </div>
+        <div id="as-tree-bar" class="tree-breadcrumb-bar"></div>
         <div class="list-scroll" id="as-list"></div>
       </div>
 
-      <!-- Mode 2: Audio & Music Explorer -->
+      <!-- Mode 4: Audio & Music Explorer -->
       <div class="sidebar-pane hidden" id="pane-audio">
         <div class="au-kind-tabs">
           <button class="au-kind-btn active" data-aukind="music">Music</button>
@@ -71,7 +90,7 @@
           <button class="au-kind-btn" data-aukind="voicelines">Voicelines</button>
         </div>
         <div class="search-box compact">
-          <input id="au-search" type="text" placeholder="Search songs &amp; cues (PlasmaSpine, MQ11, Boss, EndCredits...)" />
+          <input id="au-search" type="text" placeholder="Search songs, cues, quests, speakers..." />
         </div>
         <div class="search-box compact" style="padding-top:0;">
           <select id="au-cat-filter" style="width:100%;"><option value="">All Categories</option></select>
@@ -79,15 +98,15 @@
         <div class="list-scroll" id="au-list"></div>
       </div>
 
-      <!-- Mode 2: Global TextureSet Search -->
+      <!-- Mode 5: Global TextureSet Search -->
       <div class="sidebar-pane hidden" id="pane-texturesets">
-        <div class="search-box">
-          <input id="ts-search" type="text" placeholder="Search 10,660 TextureSets (muscle, plasma, detail, apex...)" />
+        <div class="search-box compact">
+          <input id="ts-search" type="text" placeholder="Search 10,660 TextureSets..." />
         </div>
         <div class="list-scroll" id="ts-list"></div>
       </div>
 
-      <!-- Mode 3: Material Diff -->
+      <!-- Mode 6: Material Diff -->
       <div class="sidebar-pane hidden" id="pane-diff">
         <div class="diff-form">
           <label>Material A (e.g. Standard Plate)</label>
@@ -95,68 +114,146 @@
           <label>Material B (e.g. Apex / Other Plate)</label>
           <input id="diff-b" type="text" placeholder="group:index (e.g. 1818:9261)" />
           <button id="btn-run-diff" class="btn-primary">Compare Materials</button>
-          <p class="hint">Tip: Open any material and click <strong>"Set as Diff A / B"</strong> to compare two materials side-by-side.</p>
+          <p class="hint">Tip: Open any material and click <strong>"Set Diff A / B"</strong> to compare two materials side-by-side.</p>
         </div>
       </div>
     </aside>
 
-    <!-- MIDDLE CONTEXT COLUMN (Machine Parts & Materials) -->
+    <!-- PANE 2: UNIFIED INSPECTOR & EXPORT MIDBAR (Shared across Machines, Characters & Assets!) -->
     <section class="midbar" id="midbar">
       <div class="empty-state" id="mid-empty">
-        <h3>Select a Machine</h3>
-        <p>Pick a machine like <strong>Slitherfang</strong>, <strong>Clawstrider</strong>, or <strong>Slaughterspine</strong> on the left to inspect its rigged parts, armor plates, materials, and shaders — or export a ready-to-pose Blender 5.3 <code>.blend</code>.</p>
+        <h3 id="mid-empty-title">Select an Entity or Asset</h3>
+        <p id="mid-empty-desc">Pick a <strong>Machine</strong>, <strong>Character</strong>, or <strong>Dev Asset</strong> in the navigator on the left to inspect its rig, parts, materials, and Decima shaders — or export directly to Blender 5.3 / Unreal Engine 5.</p>
       </div>
 
-      <div class="hidden" id="mid-machine">
+      <div class="hidden" id="mid-inspector">
         <div class="mid-header">
-          <div>
-            <h2 id="m-title">Machine</h2>
-            <div class="meta-line" id="m-meta"></div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+            <h2 id="m-title">Selection</h2>
+            <span class="badge" id="m-kind-badge">MACHINE</span>
           </div>
+          <div class="meta-line" id="m-meta"></div>
         </div>
 
-        <div class="mid-controls">
+        <!-- Machine-Specific Export Controls -->
+        <div class="mid-controls" id="ctrl-machine">
           <label class="ctrl-label">Variant / Plate Set</label>
           <select id="m-variant"></select>
           <div class="export-row" style="flex-wrap:wrap;">
-            <button id="btn-export-blend" class="btn-primary">Export Ready .blend</button>
-            <button id="btn-export-ue5" class="btn-ghost" title="Export rigged SkeletalMesh FBX + textures + ue5_import_machine.py with all animated shaders!">Export UE5 Rig + Shaders</button>
+            <button id="btn-export-blend" class="btn-primary" style="flex:1;">Export .blend</button>
+            <button id="btn-export-ue5" class="btn-ghost" title="Export rigged FBX + textures + ue5_import_machine.py">UE5 Rig + Shaders</button>
+          </div>
+          <div class="export-row" style="align-items:center;gap:6px;">
+            <label class="chk-inline" title="Generate non-destructive IK/FK/Wing/Spline Control Rig"><input type="checkbox" id="chk-ctrl-rig" checked /> Control Rig</label>
+            <select id="m-anim-mode" class="compact-select" style="flex:1;">
+              <option value="">Anims: None (Rest)</option>
+              <option value="5">Anims: Showcase (5)</option>
+              <option value="all">Anims: Import ALL</option>
+              <option value="category:combat">Anims: Combat</option>
+              <option value="category:movement">Anims: Movement</option>
+              <option value="category:idle">Anims: Idle</option>
+              <option value="category:jump">Anims: Jumps</option>
+              <option value="category:emote">Anims: Emotes</option>
+              <option value="category:mounted">Anims: Mounted</option>
+              <option value="selected">Anims: Checked (0)</option>
+            </select>
           </div>
           <div class="export-row">
-            <label class="chk-inline" title="Unchecked (default): keep native game-packed textures. Checked: split into separate semantic PNG maps."><input type="checkbox" id="chk-unpack" /> Unpack Maps</label>
-            <label class="chk-inline" title="Embed PNG textures inside the .blend file"><input type="checkbox" id="chk-pack" /> Pack .blend</label>
+            <label class="chk-inline"><input type="checkbox" id="chk-unpack" /> Unpack Maps</label>
+            <label class="chk-inline"><input type="checkbox" id="chk-pack" /> Pack .blend</label>
           </div>
-          <div class="export-status hidden" id="export-status"></div>
+        </div>
+
+        <!-- Character-Specific Export Controls (Same Clean Midbar Style!) -->
+        <div class="mid-controls hidden" id="ctrl-character">
+          <label class="ctrl-label">Outfit / Costume Variation</label>
+          <select id="ch-outfit-select"><option value="">Default Appearance</option></select>
+          <div class="export-row" style="gap:6px;">
+            <select id="ch-head-select" class="compact-select" style="flex:1;" title="Optional Modular Head Swap (211 Heads)"><option value="">Default Head</option></select>
+            <select id="ch-hair-lod" class="compact-select" style="width:94px;" title="Hair Mesh LOD">
+              <option value="0">Hair LOD0</option>
+              <option value="1">Hair LOD1</option>
+              <option value="2" selected>Hair LOD2</option>
+              <option value="3">Hair LOD3</option>
+            </select>
+          </div>
+          <div class="export-row" style="flex-wrap:wrap;">
+            <button id="ch-btn-export-sel-blend" class="btn-primary" style="flex:1;">Export .blend</button>
+            <button id="ch-btn-export-sel-ue5" class="btn-ghost">UE5 Rig + Shaders</button>
+          </div>
+          <div class="export-row" style="align-items:center;gap:6px;">
+            <label class="chk-inline"><input type="checkbox" id="ch-chk-ctrl-rig" checked /> Rig</label>
+            <label class="chk-inline"><input type="checkbox" id="ch-chk-headgear" checked /> Headgear</label>
+            <label class="chk-inline"><input type="checkbox" id="ch-chk-hair" checked /> Hair</label>
+            <label class="chk-inline"><input type="checkbox" id="ch-chk-pack" /> Pack</label>
+          </div>
+          <div class="export-row">
+            <select id="ch-anim-mode" class="compact-select" style="flex:1;">
+              <option value="">Anims: None (Rest)</option>
+              <option value="5">Anims: Showcase (5)</option>
+              <option value="all">Anims: ALL Humanoid</option>
+              <option value="category:combat">Anims: Combat</option>
+              <option value="category:movement">Anims: Movement</option>
+              <option value="category:idle">Anims: Idle</option>
+              <option value="category:jump">Anims: Jumps</option>
+              <option value="category:emote">Anims: Emotes</option>
+              <option value="selected">Anims: Checked (0)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Dev Asset-Specific Export Controls (Same Clean Midbar Style!) -->
+        <div class="mid-controls hidden" id="ctrl-asset">
+          <div class="au-path-badge" id="as-dev-path-badge" style="margin:0;">work:models/...</div>
+          <div class="export-row" style="flex-wrap:wrap;">
+            <button id="as-btn-export-blend" class="btn-primary" style="flex:1;">Export .blend</button>
+            <button id="as-btn-export-ue5" class="btn-ghost">UE5 FBX + Shaders</button>
+          </div>
+          <div class="export-row">
+            <label class="chk-inline"><input type="checkbox" id="as-chk-pack" /> Pack Textures Into .blend</label>
+          </div>
+        </div>
+
+        <!-- Unified Export Status Bar -->
+        <div style="padding:0 12px 6px;" id="export-status-wrap" class="hidden">
+          <div class="export-status" id="export-status"></div>
         </div>
 
         <div class="sub-tabs">
           <button class="subtab-btn active" data-subtab="materials">Materials (<span id="m-mat-count">0</span>)</button>
-          <button class="subtab-btn" data-subtab="parts">Parts &amp; Plates (<span id="m-part-count">0</span>)</button>
+          <button class="subtab-btn" data-subtab="parts">Parts (<span id="m-part-count">0</span>)</button>
+          <button class="subtab-btn" data-subtab="animations" id="subtab-anims-btn">Anims (<span id="m-anim-total">…</span>)</button>
         </div>
 
         <div class="search-box compact">
-          <input id="mid-filter" type="text" placeholder="Filter materials or armor plates..." />
+          <input id="mid-filter" type="text" placeholder="Filter materials, parts, or animations..." />
         </div>
+        <div id="mid-anim-bar" class="hidden" style="padding:4px 10px 6px;border-bottom:1px solid #1e293b;"></div>
         <div class="list-scroll" id="mid-list"></div>
       </div>
     </section>
 
-    <!-- MAIN DEEP-DIVE WORKSPACE -->
+    <!-- PANE 3: UNIFIED DEEP-DIVE WORKSPACE -->
     <main class="workspace" id="workspace">
       <div class="empty-state hero" id="ws-empty">
-        <h1>Horizon Forbidden West — Material &amp; Shader Studio</h1>
-        <p>Explore how Guerrilla Games built HFW's machines, packed multi-channel <code>TextureSet</code>s, tiled micro-detail / muscle-fiber normals, and compiled SM 6.6 DXIL shaders — with visual, beginner-friendly explanations, interactive node graphs, and direct Blender 5.3 &amp; Unreal Engine 5 exports.</p>
+        <h1>Horizon Forbidden West — Unified Material, Rig &amp; Shader Studio</h1>
+        <p>Browse <strong>Machines</strong>, <strong>Characters &amp; Outfits</strong>, and Guerrilla's <strong>Dev Asset Catalog</strong> inside one consistent 3-pane studio — inspect packed <code>TextureSet</code>s, explore interactive DXIL Shader Node Graphs with live previews &amp; minimap, and export ready-to-pose Blender 5.3 &amp; Unreal Engine 5 rigs.</p>
         <div class="quick-picks">
-          <button class="pill-btn" data-quick="Slitherfang">Inspect Slitherfang</button>
-          <button class="pill-btn" data-quick="Clawstrider">Inspect Clawstrider</button>
-          <button class="pill-btn" data-quick="Slaughterspine">Inspect Slaughterspine</button>
-          <button class="pill-btn" id="btn-quick-chars">👤 Import Characters &amp; Outfits</button>
-          <button class="pill-btn" id="btn-quick-assets">📁 Browse Dev Asset Catalog</button>
-          <button class="pill-btn" id="btn-quick-audio">🎵 Browse Music, SFX &amp; Voicelines</button>
+          <button class="pill-btn" data-quick="Skydrifter">🦅 Skydrifter</button>
+          <button class="pill-btn" data-quick="Clawstrider">🦖 Clawstrider (Apex)</button>
+          <button class="pill-btn" data-quick="Slaughterspine">⚡ Slaughterspine</button>
+          <button class="pill-btn" data-quick="Bilegut">🧪 Bilegut (Liquid Sacs)</button>
+          <button class="pill-btn ch-chip" data-chprompt="Aloy Carja Blazon no headgear">🏹 Aloy (Carja Blazon)</button>
+          <button class="pill-btn ch-chip" data-chprompt="Seyka">👤 Seyka</button>
+          <button class="pill-btn" id="btn-quick-assets">📁 Browse Dev Assets</button>
+          <button class="pill-btn" id="btn-quick-audio">🎵 Music &amp; Audio</button>
+        </div>
+        <div class="hint" style="margin-top:18px;">
+          Keyboard shortcuts: press <code>/</code> to search • <code>↑ / ↓</code> to step through items • <code>Esc</code> to close modals
         </div>
       </div>
 
-      <!-- Material Inspector View -->
+      <!-- Unified 6-Tab Material & Shader Deep-Dive View (works for Machines, Characters, AND Dev Assets!) -->
       <div class="hidden" id="ws-material">
         <div class="mat-banner">
           <div class="mat-banner-left">
@@ -170,12 +267,12 @@
         </div>
 
         <nav class="ws-tabs">
-          <button class="ws-tab active" data-tab="explain">1. Explain (No HLSL)</button>
-          <button class="ws-tab" data-tab="textures">2. Texture &amp; Channel Lab</button>
-          <button class="ws-tab" data-tab="decima-graph">3. Decima Node Graph</button>
-          <button class="ws-tab" data-tab="ue5-graph">4. Unreal Engine 5 Graph &amp; Export</button>
-          <button class="ws-tab" data-tab="code">5. Readable Code &amp; Glossary</button>
-          <button class="ws-tab" data-tab="dxil">6. Raw DXIL &amp; Bindings</button>
+          <button class="ws-tab active" data-tab="explain">1. Explain</button>
+          <button class="ws-tab" data-tab="textures">2. Texture Lab</button>
+          <button class="ws-tab" data-tab="decima-graph">3. Decima Graph</button>
+          <button class="ws-tab" data-tab="ue5-graph">4. UE5 Graph</button>
+          <button class="ws-tab" data-tab="code">5. Code &amp; Glossary</button>
+          <button class="ws-tab" data-tab="dxil">6. Raw DXIL</button>
         </nav>
 
         <div class="ws-body">
@@ -194,98 +291,10 @@
       <!-- Material Diff View -->
       <div class="hidden" id="ws-diff"></div>
 
-      <!-- Characters & Outfits Prompt Studio -->
-      <div class="hidden" id="ws-characters">
-        <div class="au-wrap">
-          <div class="kpi-bar" id="ch-kpi-bar"></div>
-          <div class="card">
-            <h2 style="margin:0 0 6px;">Natural-Language Character Prompt Studio</h2>
-            <p class="hint" style="margin:0 0 10px;">Type any Horizon Forbidden West character, outfit, tribe, gender, or modifier — e.g. <code>Aloy Carja Blazon no headgear</code>, <code>Aloy Quen Commander</code>, <code>Seyka</code>, <code>Erend</code>, or <code>Tenakth female warrior</code>. Automatically assembles body, outfit, head, braided hair, 8-layer materials, and ONE unified poseable rig for Blender &amp; Unreal Engine 5.</p>
-            <div class="au-controls-row">
-              <input id="ch-prompt-input" type="text" placeholder="Aloy Carja Blazon no headgear" style="flex:1;min-width:260px;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#f8fafc;font-size:14px;" />
-              <button class="btn-primary" id="ch-btn-resolve">Resolve Prompt</button>
-              <button class="btn-primary" id="ch-btn-export-blend">Export Ready .blend</button>
-              <button class="btn-ghost" id="ch-btn-export-ue5">Export UE5 Rig + Shaders</button>
-            </div>
-            <div class="quick-picks" style="margin-top:10px;justify-content:flex-start;">
-              <button class="pill-btn ch-chip" data-chprompt="Aloy">Aloy (Nora Anointed)</button>
-              <button class="pill-btn ch-chip" data-chprompt="Aloy Carja Blazon no headgear">Aloy Carja Blazon (No Headgear)</button>
-              <button class="pill-btn ch-chip" data-chprompt="Aloy Quen Commander">Aloy Quen Commander (DLC)</button>
-              <button class="pill-btn ch-chip" data-chprompt="Seyka">Seyka</button>
-              <button class="pill-btn ch-chip" data-chprompt="Erend">Erend</button>
-              <button class="pill-btn ch-chip" data-chprompt="Kotallo">Kotallo</button>
-              <button class="pill-btn ch-chip" data-chprompt="Tenakth female warrior">Tenakth Female Warrior</button>
-            </div>
-            <div id="ch-resolve-box" class="export-status hidden" style="margin-top:10px;"></div>
-            <div id="ch-export-status" class="export-status hidden" style="margin-top:8px;"></div>
-          </div>
-
-          <div class="card" id="ch-detail-card">
-            <h3 id="ch-detail-title" style="margin:0 0 8px;">Select a Character or Enter a Prompt Above</h3>
-            <div id="ch-detail-meta" class="hint" style="margin-bottom:10px;"></div>
-            <div class="au-controls-row" style="flex-wrap:wrap;gap:12px;">
-              <label class="au-field" style="min-width:240px;flex:1;">
-                <span>Outfit / Costume Variation</span>
-                <select id="ch-outfit-select"><option value="">Default Appearance</option></select>
-              </label>
-              <label class="au-field" style="min-width:220px;flex:1;">
-                <span>Modular Head Swap (211 Heads)</span>
-                <select id="ch-head-select"><option value="">Default Character Head</option></select>
-              </label>
-              <label class="au-field" style="min-width:130px;">
-                <span>Hair LOD</span>
-                <select id="ch-hair-lod">
-                  <option value="0">LOD 0 (Ultra)</option>
-                  <option value="1">LOD 1 (High)</option>
-                  <option value="2" selected>LOD 2 (Balanced)</option>
-                  <option value="3">LOD 3 (Light)</option>
-                </select>
-              </label>
-            </div>
-            <div class="au-controls-row" style="margin-top:10px;flex-wrap:wrap;gap:14px;">
-              <label class="chk-inline"><input type="checkbox" id="ch-chk-headgear" checked /> Show Headgear</label>
-              <label class="chk-inline"><input type="checkbox" id="ch-chk-hair" checked /> Include Braided Hair</label>
-              <label class="chk-inline"><input type="checkbox" id="ch-chk-pack" /> Pack Textures Into .blend</label>
-              <button class="btn-primary" id="ch-btn-export-sel-blend">Export Selected .blend</button>
-              <button class="btn-ghost" id="ch-btn-export-sel-ue5">Export Selected UE5 FBX + Script</button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Guerrilla Developer-Directory Asset Catalog -->
-      <div class="hidden" id="ws-assets">
-        <div class="au-wrap">
-          <div class="kpi-bar" id="as-kpi-bar"></div>
-          <div class="card">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-              <div>
-                <h2 style="margin:0;">Guerrilla Developer-Directory Asset Catalog</h2>
-                <div class="hint">Mirrors Guerrilla's original <code>work:Models/...</code> &amp; <code>DLC/models/...</code> folder tree across Weapons, Animals, Ruins, Eco Trees &amp; Props.</div>
-              </div>
-              <div id="as-breadcrumbs" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
-            </div>
-            <div id="as-tree-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-top:14px;"></div>
-          </div>
-          <div class="card hidden" id="as-detail-card">
-            <h3 id="as-detail-title" style="margin:0 0 6px;">Asset</h3>
-            <div id="as-detail-meta" class="hint" style="margin-bottom:12px;"></div>
-            <div class="au-controls-row" style="flex-wrap:wrap;gap:10px;">
-              <label class="chk-inline"><input type="checkbox" id="as-chk-pack" /> Pack Textures Into .blend</label>
-              <button class="btn-primary" id="as-btn-export-blend">Export Ready .blend (Preserve Dev Folder)</button>
-              <button class="btn-ghost" id="as-btn-export-ue5">Export UE5 FBX + Shaders</button>
-            </div>
-            <div id="as-export-status" class="export-status hidden" style="margin-top:10px;"></div>
-          </div>
-        </div>
-      </div>
-
       <!-- Audio, Music, SFX & Voicelines Studio View -->
       <div class="hidden" id="ws-audio">
         <div class="au-wrap">
           <div class="kpi-bar" id="au-kpi-bar"></div>
-
-          <!-- Sticky Now-Playing Audition Player -->
           <div class="au-player-bar hidden" id="au-player-bar">
             <div class="au-now-meta">
               <div class="au-now-title" id="au-now-title">Now Playing</div>
@@ -295,8 +304,6 @@
             <audio id="au-player" controls style="min-width:290px;max-width:460px;flex:1;"></audio>
             <a class="btn-ghost" id="au-now-dl" href="#" style="text-decoration:none;white-space:nowrap;">⬇ Download</a>
           </div>
-
-          <!-- Extraction Controls Card -->
           <div class="card au-extract-card">
             <div class="au-controls-row">
               <label class="au-field">
@@ -313,19 +320,15 @@
                 <span>Output Folder (optional override)</span>
                 <input id="au-out-dir" type="text" placeholder="exports/Audio" />
               </label>
-              <label class="chk-inline" title="When checked, preserves Guerrilla's reconstructed Music/SFX/Voicelines folder tree. Uncheck for a single flat folder.">
+              <label class="chk-inline">
                 <input type="checkbox" id="au-preserve-structure" checked /> Preserve Developer Directory Structure
               </label>
             </div>
-
-            <!-- Music-Specific Options -->
             <div class="au-controls-row" id="au-music-opts" style="margin-top:8px;">
-              <label class="chk-inline" title="Render a full beat-synced combined song for multi-stem cues"><input type="checkbox" id="au-mix-cues" checked /> Mix Full Songs</label>
-              <label class="chk-inline" title="Also export each individual music layer/stem into a Stems/ subfolder"><input type="checkbox" id="au-export-stems" checked /> Export Individual Stems</label>
-              <label class="chk-inline" title="Also copy bonus DigitalExtras/OST MP3 tracks into Music/OfficialSoundtrack_OST/"><input type="checkbox" id="au-include-ost" /> Include DigitalExtras OST</label>
+              <label class="chk-inline"><input type="checkbox" id="au-mix-cues" checked /> Mix Full Songs</label>
+              <label class="chk-inline"><input type="checkbox" id="au-export-stems" checked /> Export Individual Stems</label>
+              <label class="chk-inline"><input type="checkbox" id="au-include-ost" /> Include DigitalExtras OST</label>
             </div>
-
-            <!-- Voiceline-Specific Options -->
             <div class="au-controls-row hidden" id="au-vo-opts" style="margin-top:8px;">
               <label class="au-field">
                 <span>Spoken Language</span>
@@ -340,18 +343,15 @@
               </label>
               <label class="chk-inline"><input type="checkbox" id="au-write-transcript" checked /> Export Transcript CSV</label>
             </div>
-
             <div class="au-controls-row" style="margin-top:10px;">
               <button class="btn-primary" id="au-btn-extract-selected" disabled>Extract Selected</button>
               <button class="btn-ghost" id="au-btn-extract-matching">Extract All Matching</button>
               <button class="btn-ghost" id="au-btn-extract-all-music" style="border-color:#6366f1;color:#a5b4fc;">🎵 Extract ALL Game Music</button>
-              <button class="btn-ghost hidden" id="au-btn-deep-index" title="Index all ~168k SFX sound graph names &amp; spoken dialogue subtitles into SQLite for instant full-text search">Deep-Index All Clips &amp; Subtitles</button>
+              <button class="btn-ghost hidden" id="au-btn-deep-index">Deep-Index All Clips &amp; Subtitles</button>
               <button class="btn-ghost" id="au-btn-open-folder">Open Output Folder</button>
             </div>
             <div class="export-status hidden" id="au-job-status" style="margin-top:8px;"></div>
           </div>
-
-          <!-- Selected Cue or Directory Detail -->
           <div class="card au-detail-card">
             <div class="au-detail-head" id="au-detail-head">
               <div>
@@ -372,18 +372,42 @@
   <!-- Glossary Tooltip Popover -->
   <div class="glossary-pop hidden" id="glossary-pop"></div>
 
-  <!-- Setup & System Compatibility Modal -->
+  <!-- Setup, Updates & System Runtime Modal -->
   <div class="modal-backdrop hidden" id="setup-modal">
     <div class="modal-card">
       <div class="modal-header">
         <div>
-          <h2 style="margin:0;">Setup, Paths &amp; Multi-Version Compatibility</h2>
-          <span class="hint">Zero-setup static PE64 RTTI scanner — works directly on any Horizon Forbidden West PC install without external dumps or injectors.</span>
+          <h2 style="margin:0;">Setup, GitHub Auto-Updates &amp; System Runtime</h2>
+          <span class="hint">Zero-setup static PE64 RTTI scanner, newest Python detector, and opt-in GitHub <code>main</code> updater.</span>
         </div>
         <button class="btn-ghost" id="btn-close-setup">✕ Close</button>
       </div>
       <div class="modal-body">
         <div id="setup-health-box" class="health-grid"></div>
+
+        <!-- GitHub Updates & Auto-Update Controls -->
+        <div class="card" style="margin-bottom:16px;padding:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+            <div>
+              <div class="card-cat">GitHub Updates (JP111555/HFWToolkit • main)</div>
+              <div id="updater-status-line" style="font-size:12.5px;margin-top:3px;color:#dbe7f7;">Checking update status...</div>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button class="btn-ghost" id="btn-check-updates">Check Now</button>
+              <button class="btn-primary" id="btn-apply-update">Update from main</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+            <label class="chk-inline" title="When enabled, HFWToolkit automatically updates from the GitHub main branch on startup (opt-in; off by default).">
+              <input type="checkbox" id="cfg-auto-update" /> Auto-update from <code>main</code> on startup (opt-in)
+            </label>
+            <label class="chk-inline">
+              <input type="checkbox" id="cfg-check-startup" checked /> Notify in topbar when updates are available
+            </label>
+          </div>
+          <div id="updater-msg" class="export-status hidden" style="margin-top:8px;"></div>
+        </div>
+
         <div class="setup-form">
           <label>Horizon Forbidden West Game Directory (containing <code>HorizonForbiddenWest.exe</code> &amp; <code>LocalCacheWinGame/package</code>)</label>
           <input type="text" id="cfg-game-dir" placeholder="C:\Program Files (x86)\Steam\steamapps\common\Horizon Forbidden West Complete Edition" />
@@ -391,7 +415,7 @@
           <input type="text" id="cfg-blender-exe" placeholder="C:\Program Files\Blender Foundation\Blender 5.3\blender.exe" />
           <div class="setup-actions">
             <button class="btn-primary" id="btn-save-cfg">Save Paths &amp; Reload</button>
-            <button class="btn-ghost" id="btn-autodetect-cfg">Auto-Detect Paths (Steam / Epic / Registry)</button>
+            <button class="btn-ghost" id="btn-autodetect-cfg">Auto-Detect Paths</button>
             <button class="btn-ghost" id="btn-install-addon">Install Blender N-Panel Add-on</button>
             <button class="btn-ghost" id="btn-open-exports">Open Exports Folder</button>
           </div>

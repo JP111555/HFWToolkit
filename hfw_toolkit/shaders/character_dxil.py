@@ -132,6 +132,43 @@ def infer_character_hair_color(
     }
 
 
+# Authentic HFW Character Iris Colors (sRGB -> Linear RGB)
+_EYE_PRESETS_SRGB: dict[str, tuple[float, float, float]] = {
+    "aloy_green":     (0.36, 0.49, 0.29),  # Aloy, Beta, Elisabet green-hazel irises
+    "dark_brown":     (0.28, 0.18, 0.12),  # Seyka, Quen, Kotallo, Zo, Varl, Sylens, Regalla, Talanah
+    "warm_hazel":     (0.45, 0.31, 0.16),  # Erend, Petra, Avad, Alva warm amber-hazel
+    "zenith_blue":    (0.42, 0.57, 0.70),  # Tilda, Gerard, Erik pale ice-blue
+    "grey_hazel":     (0.38, 0.42, 0.38),  # Rost, Dekka, weathered tribal grey-hazel
+}
+
+
+def infer_character_eye_color(
+    character_hint: str = "",
+    variant_hint: str = "",
+    texture_hint: str = "",
+) -> dict[str, Any]:
+    """Select authentic HFW character iris color (linear + sRGB) instead of hardcoding Aloy green for all NPCs."""
+    blob = f"{character_hint} {variant_hint} {texture_hint}".lower()
+
+    if any(k in blob for k in ("aloy", "beta", "elisabet", "sobeck")):
+        preset = "aloy_green"
+    elif any(k in blob for k in ("tilda", "gerard", "erik", "zenith")):
+        preset = "zenith_blue"
+    elif any(k in blob for k in ("erend", "petra", "avad", "alva", "oseram")):
+        preset = "warm_hazel"
+    elif any(k in blob for k in ("rost", "dekka", "elder")):
+        preset = "grey_hazel"
+    else:
+        preset = "dark_brown"
+
+    srgb = _EYE_PRESETS_SRGB[preset]
+    return {
+        "preset": preset,
+        "iris_color_srgb": [round(c, 4) for c in srgb],
+        "iris_color_linear": srgb_to_linear_rgb(srgb),
+    }
+
+
 def _parse_dxil_float(tok: str) -> float | None:
     tok = tok.strip().rstrip(",")
     if tok.startswith("0x") and len(tok) == 18:

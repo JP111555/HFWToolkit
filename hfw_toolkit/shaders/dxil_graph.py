@@ -1195,6 +1195,19 @@ def build_detailed_dxil_graph(
         interesting_vars.sort(key=lambda x: x[0])
         for vi, (_pr, vtitle, vsub, vtargs, vrole, f4) in enumerate(interesting_vars[:5]):
             vid = f"param_v{vi}"
+            # Compute optional inline RGB color swatch for color-like Float4 parameters
+            swatch_css = ""
+            r_v, g_v, b_v = float(f4[0]), float(f4[1]), float(f4[2])
+            if 0.0 <= min(r_v, g_v, b_v) and max(r_v, g_v, b_v) <= 2.0 and (
+                "color" in vrole.lower()
+                or "tint" in vrole.lower()
+                or "glow" in vrole.lower()
+                or (max(r_v, g_v, b_v) > 0.02 and (abs(r_v - g_v) > 0.03 or abs(g_v - b_v) > 0.03))
+            ):
+                sr = min(255, max(0, int(round((min(1.0, max(0.0, r_v)) ** (1.0 / 2.2)) * 255))))
+                sg = min(255, max(0, int(round((min(1.0, max(0.0, g_v)) ** (1.0 / 2.2)) * 255))))
+                sb = min(255, max(0, int(round((min(1.0, max(0.0, b_v)) ** (1.0 / 2.2)) * 255))))
+                swatch_css = f"rgb({sr},{sg},{sb})"
             add_node(
                 vid,
                 "CBufferParam",
@@ -1208,6 +1221,7 @@ def build_detailed_dxil_graph(
                     "targets": vtargs,
                     "role": vrole,
                     "float4": [round(float(x), 4) for x in f4],
+                    "color_swatch": swatch_css,
                     "formula": f"PerInstance CBuffer constant: ({f4[0]:.3f}, {f4[1]:.3f}, {f4[2]:.3f}, {f4[3]:.3f})",
                     "dxil_snippet": [f"ShaderInstance_PerInstance cb0,space8 -> {vsub}"],
                 },
@@ -1294,6 +1308,7 @@ def build_detailed_dxil_graph(
                 **tmeta,
                 "targets": sorted(set(t_targets)),
                 "ssa_var": sv,
+                "preview_url": f"/api/texture/{tmeta['resource_id']}/image?max_dim=96" if tmeta.get("resource_id") else "",
                 "dxil_snippet": [f"L{sinst.line_no}: {sinst.raw}"],
                 "formula": f"GPU {sinst.extra.get('op_kind', 'sample')} on {ttitle}",
             },
@@ -1573,6 +1588,13 @@ def build_detailed_dxil_graph(
         "title": f"Detailed DXIL Math & Decima Specialty Graph — {mat.name} ({ps_prog.shader_model}, {ps_ir.total_instructions if ps_ir else len(parsed.order)} IR ops)",
         "nodes": nodes,
         "edges": edges,
+        "stage_frames": [
+            {"cols": [0], "title": "Inputs, UVs & CBuffer Params", "color": "#f59e0b"},
+            {"cols": [1], "title": "DXIL Texture Samplers", "color": "#22d3ee"},
+            {"cols": [2, 3], "title": "Decima Engine Specialty Nodes", "color": "#e879f9"},
+            {"cols": [4, 5], "title": "Lifted DXIL SSA Math Ops", "color": "#60a5fa"},
+            {"cols": [6], "title": "G-Buffer / Forward Targets", "color": "#f87171"},
+        ],
         "stats": {
             "specialty_nodes": len(specialties),
             "math_nodes": math_nodes_count,

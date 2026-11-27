@@ -53,7 +53,7 @@ MACHINE_CODENAMES: dict[str, str] = {
     "flyegg": "Stingspawn",
     "frog": "Bilegut",
     "giraffe": "Tallneck",
-    "glider": "Skydrifter",
+    "glider": "Glinthawk",
     "goat": "Lancehorn",
     "grey_wolf": "Ravager",
     "greywolf": "Ravager",
@@ -103,7 +103,7 @@ MACHINE_CODENAMES: dict[str, str] = {
     "stallion": "Strider",
     "stingray": "Tideripper",
     "sunwing": "Sunwing",
-    "swooper": "Glinthawk",
+    "swooper": "Skydrifter",
     "thunderhawk": "Stormbird",
     "titan": "Horus",
     "trex": "Thunderjaw",
@@ -402,6 +402,32 @@ class AssetCatalog:
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
+        self._migrate_machine_catalog_v12()
+
+    def _migrate_machine_catalog_v12(self) -> None:
+        """Idempotent fast migration fixing swapped Skydrifter/Glinthawk names and stale contaminated variants."""
+        try:
+            row = self.conn.execute("SELECT value FROM meta WHERE key = 'codename_fix_v12'").fetchone()
+            if row is not None and row["value"] == "1":
+                return
+            with self.conn:
+                # Fix swapped glider (Glinthawk, 4360:48) vs swooper (Skydrifter, 3155:76) display names
+                self.conn.execute(
+                    "UPDATE entities SET display_name = 'Glinthawk' WHERE lower(codename) = 'glider' AND display_name = 'Skydrifter'"
+                )
+                self.conn.execute(
+                    "UPDATE entities SET display_name = 'Skydrifter' WHERE lower(codename) = 'swooper' AND display_name = 'Glinthawk'"
+                )
+                # Remove known cross-species contaminated cached variant rows (Stingspawn<-Bilegut, Stormbird<-Dreadwing)
+                self.conn.execute(
+                    "DELETE FROM entity_variants WHERE entity_group_id = 1859 AND (lower(label) LIKE '%bilegut%' OR destructibility_id LIKE '12669:%' OR destructibility_id LIKE '7278:%')"
+                )
+                self.conn.execute(
+                    "DELETE FROM entity_variants WHERE entity_group_id = 2622 AND (lower(label) LIKE '%dreadwing%' OR destructibility_id LIKE '81822:%')"
+                )
+                self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('codename_fix_v12', '1')")
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.conn.close()

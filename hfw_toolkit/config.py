@@ -161,6 +161,9 @@ class ToolkitConfig:
     exports_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "exports")
     bin_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "bin")
     platform: str = "WinGame"
+    auto_update: bool = False
+    update_branch: str = "main"
+    check_updates_on_startup: bool = True
 
     def __post_init__(self) -> None:
         self.game_dir = Path(self.game_dir)
@@ -297,6 +300,9 @@ class ToolkitConfig:
             "index_db_found": index_ok,
             "index_db_path": str(self.index_db_path),
             "exports_dir": str(self.exports_dir),
+            "auto_update": bool(self.auto_update),
+            "update_branch": self.update_branch or "main",
+            "check_updates_on_startup": bool(self.check_updates_on_startup),
         }
 
     @classmethod
@@ -306,9 +312,12 @@ class ToolkitConfig:
         if cfg_path.exists():
             try:
                 data = json.loads(cfg_path.read_text(encoding="utf-8"))
-                for key in ("game_dir", "rtti_json", "blender_exe", "cache_dir", "exports_dir", "bin_dir", "platform"):
+                for key in ("game_dir", "rtti_json", "blender_exe", "cache_dir", "exports_dir", "bin_dir", "platform", "update_branch"):
                     if key in data and data[key]:
                         kwargs[key] = data[key]
+                for bkey in ("auto_update", "check_updates_on_startup"):
+                    if bkey in data and isinstance(data[bkey], bool):
+                        kwargs[bkey] = data[bkey]
             except Exception:
                 pass
         if env_game := os.environ.get("HFW_GAME_DIR"):
@@ -327,6 +336,9 @@ class ToolkitConfig:
             "exports_dir": str(self.exports_dir),
             "bin_dir": str(self.bin_dir),
             "platform": self.platform,
+            "auto_update": bool(self.auto_update),
+            "update_branch": self.update_branch or "main",
+            "check_updates_on_startup": bool(self.check_updates_on_startup),
         }
         cfg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return cfg_path

@@ -745,10 +745,11 @@ def _ensure_elemental_sack_group(
     ng.interface.new_socket(name="Base Smoothness", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.45
     ng.interface.new_socket(name="Mask", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.0
     ng.interface.new_socket(name="Mask Alpha", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 1.0
+    ng.interface.new_socket(name="Mask ID", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.0
     ng.interface.new_socket(name="Time", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.0
     s_gc = ng.interface.new_socket(name="Sac Glow Color", in_out="INPUT", socket_type="NodeSocketColor")
     s_gc.default_value = (0.14, 0.68, 1.0, 1.0)
-    ng.interface.new_socket(name="Glow Strength", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 6.5
+    ng.interface.new_socket(name="Glow Strength", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 4.6
     ng.interface.new_socket(name="Flow Speed", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.35
     ng.interface.new_socket(name="Flow Strength", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.14
     ng.interface.new_socket(name="Animate Speed", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 1.0
@@ -764,7 +765,8 @@ def _ensure_elemental_sack_group(
     n_out = ng.nodes.new("NodeGroupOutput")
     n_out.location = (960, 0)
 
-    # 1. Exact DXIL sac isolation mask: (round(Mask * 20.0) == 0) * clamp(Mask_Alpha, 0, 1)
+    # 1. Exact DXIL sac isolation mask supporting mat_id==0 (Bellowback), mat_id==20 (Bilegut/Frostclaw/Fireclaw/Tideripper/Snapmaw),
+    #    AND Mask ID < 0.0 (pure liquid bubble/bag meshes driven directly by Mask_Alpha so sacs NEVER turn pure black!)
     m20 = ng.nodes.new("ShaderNodeMath")
     m20.operation = "MULTIPLY"
     m20.inputs[1].default_value = 20.0
@@ -776,19 +778,32 @@ def _ensure_elemental_sack_group(
     rnd.location = (-1200, 420)
     ng.links.new(m20.outputs["Value"], rnd.inputs[0])
 
-    is_zero = ng.nodes.new("ShaderNodeMath")
-    is_zero.operation = "COMPARE"
-    is_zero.inputs[1].default_value = 0.0
-    is_zero.inputs[2].default_value = 0.25
-    is_zero.location = (-1020, 420)
-    ng.links.new(rnd.outputs["Value"], is_zero.inputs[0])
+    is_id = ng.nodes.new("ShaderNodeMath")
+    is_id.operation = "COMPARE"
+    is_id.inputs[2].default_value = 0.60
+    is_id.location = (-1020, 420)
+    ng.links.new(rnd.outputs["Value"], is_id.inputs[0])
+    ng.links.new(n_in.outputs["Mask ID"], is_id.inputs[1])
+
+    use_full = ng.nodes.new("ShaderNodeMath")
+    use_full.operation = "LESS_THAN"
+    use_full.inputs[1].default_value = 0.0
+    use_full.location = (-1020, 580)
+    ng.links.new(n_in.outputs["Mask ID"], use_full.inputs[0])
+
+    id_or_full = ng.nodes.new("ShaderNodeMath")
+    id_or_full.operation = "MAXIMUM"
+    id_or_full.use_clamp = True
+    id_or_full.location = (-880, 480)
+    ng.links.new(is_id.outputs["Value"], id_or_full.inputs[0])
+    ng.links.new(use_full.outputs["Value"], id_or_full.inputs[1])
 
     sac_mask = ng.nodes.new("ShaderNodeMath")
     sac_mask.operation = "MULTIPLY"
     sac_mask.use_clamp = True
-    sac_mask.label = "Sac Mask (mat_id==0 * MaskAlpha)"
-    sac_mask.location = (-820, 380)
-    ng.links.new(is_zero.outputs["Value"], sac_mask.inputs[0])
+    sac_mask.label = "Sac Mask (mat_id==MaskID * MaskAlpha)"
+    sac_mask.location = (-720, 400)
+    ng.links.new(id_or_full.outputs["Value"], sac_mask.inputs[0])
     ng.links.new(n_in.outputs["Mask Alpha"], sac_mask.inputs[1])
 
     # 2. Animated effective time: t_eff = Time * FlowSpeed * AnimateSpeed
@@ -978,23 +993,31 @@ def _ensure_elemental_sack_group(
     ng.links.new(m_mask.outputs["Value"], em_str.inputs[0])
     ng.links.new(n_in.outputs["Glow Strength"], em_str.inputs[1])
 
-    # 7. Wet translucent membrane tint & high-gloss liquid Smoothness (0.88 -> Roughness 0.12) ONLY where sac_mask > 0
+    # 7. Deep saturated translucent liquid diffuse tint (replaces dark rubbery base albedo so sacs NEVER render black!)
+    #    + high-gloss wet membrane Smoothness (0.90 -> Roughness 0.10) ONLY where sac_mask > 0
     tint_w = ng.nodes.new("ShaderNodeMath")
     tint_w.operation = "MULTIPLY"
-    tint_w.inputs[1].default_value = 0.55
+    tint_w.inputs[1].default_value = 0.86
+    tint_w.use_clamp = True
     tint_w.location = (440, 340)
     ng.links.new(sac_mask.outputs["Value"], tint_w.inputs[0])
+
+    liq_albedo = ng.nodes.new("ShaderNodeVectorMath")
+    liq_albedo.operation = "SCALE"
+    liq_albedo.inputs["Scale"].default_value = 0.68
+    liq_albedo.location = (440, 480)
+    ng.links.new(n_in.outputs["Sac Glow Color"], liq_albedo.inputs[0])
 
     mix_bc = ng.nodes.new("ShaderNodeMix")
     mix_bc.data_type = "RGBA"
     mix_bc.location = (680, 340)
     ng.links.new(tint_w.outputs["Value"], mix_bc.inputs["Factor"])
     ng.links.new(n_in.outputs["Base Color"], mix_bc.inputs[6])
-    ng.links.new(n_in.outputs["Sac Glow Color"], mix_bc.inputs[7])
+    ng.links.new(liq_albedo.outputs["Vector"], mix_bc.inputs[7])
 
     mix_sm = ng.nodes.new("ShaderNodeMix")
     mix_sm.data_type = "FLOAT"
-    mix_sm.inputs[3].default_value = 0.88
+    mix_sm.inputs[3].default_value = 0.90
     mix_sm.location = (680, 180)
     ng.links.new(sac_mask.outputs["Value"], mix_sm.inputs["Factor"])
     ng.links.new(n_in.outputs["Base Smoothness"], mix_sm.inputs[2])
@@ -1483,6 +1506,8 @@ def _ensure_machine_shader_control_group(defaults: dict[str, Any] | None = None)
                 "Liquid Glow Scale": float(d.get("liquid_glow_scale", 1.0)),
                 "Plasma Charge": float(d.get("plasma_charge", 1.0 if d.get("is_plasma") else 0.0)),
                 "Animation Speed": float(d.get("animation_speed", 1.0)),
+                "Detail Tiling Scale": float(d.get("detail_tiling_scale", 1.0)),
+                "Detail Strength": float(d.get("detail_strength", 0.72)),
             }
             col_updates = {
                 "Muscle Color": (mc[0], mc[1], mc[2], 1.0),
@@ -1515,6 +1540,8 @@ def _ensure_machine_shader_control_group(defaults: dict[str, Any] | None = None)
         ("Plasma Color", "NodeSocketColor", (pc[0], pc[1], pc[2], 1.0)),
         ("Plasma Charge", "NodeSocketFloat", float(d.get("plasma_charge", 1.0 if d.get("is_plasma") else 0.0))),
         ("Animation Speed", "NodeSocketFloat", float(d.get("animation_speed", 1.0))),
+        ("Detail Tiling Scale", "NodeSocketFloat", float(d.get("detail_tiling_scale", 1.0))),
+        ("Detail Strength", "NodeSocketFloat", float(d.get("detail_strength", 0.72))),
     ]
 
     y = 480
@@ -2684,12 +2711,20 @@ def _build_special_material(
     return False
 
 
-def _ensure_character_control_group(controls: dict[str, Any] | None = None) -> bpy.types.ShaderNodeTree:
-    """Create/update shared `HFW_CharacterControl` node group driving Head + Body skin tone & Hair color seamlessly."""
-    ng_name = "HFW_CharacterControl"
+_ACTIVE_CHAR_CTRL_NAME: str = "HFW_CharacterControl"
+
+
+def _ensure_character_control_group(
+    controls: dict[str, Any] | None = None,
+    ng_name: str | None = None,
+) -> bpy.types.ShaderNodeTree:
+    """Create/update `HFW_CharacterControl` node group driving Head + Body skin tone, SSS, Peach Fuzz, Iris & Hair color."""
+    ng_name = ng_name or _ACTIVE_CHAR_CTRL_NAME
     c = controls or {}
     st = c.get("skin_tone_linear") or [0.453, 0.246, 0.209]
     hc = c.get("hair_color_linear") or [0.045, 0.032, 0.025]
+    ic = c.get("iris_color_linear") or [0.106, 0.199, 0.061]
+    pf = float(c.get("peach_fuzz_intensity", 0.65))
 
     existing = bpy.data.node_groups.get(ng_name)
     if existing is not None:
@@ -2699,6 +2734,10 @@ def _ensure_character_control_group(controls: dict[str, Any] | None = None) -> b
                     n.outputs[0].default_value = (float(st[0]), float(st[1]), float(st[2]), 1.0)
                 elif n.label == "Hair Color" and n.type == "RGB" and c.get("hair_color_linear"):
                     n.outputs[0].default_value = (float(hc[0]), float(hc[1]), float(hc[2]), 1.0)
+                elif n.label == "Iris Color" and n.type == "RGB" and c.get("iris_color_linear"):
+                    n.outputs[0].default_value = (float(ic[0]), float(ic[1]), float(ic[2]), 1.0)
+                elif n.label == "Peach Fuzz Intensity" and n.type == "VALUE" and "peach_fuzz_intensity" in c:
+                    n.outputs[0].default_value = pf
         return existing
 
     ng = bpy.data.node_groups.new(ng_name, "ShaderNodeTree")
@@ -2706,6 +2745,8 @@ def _ensure_character_control_group(controls: dict[str, Any] | None = None) -> b
     ng.interface.new_socket(name="Skin Brightness", in_out="OUTPUT", socket_type="NodeSocketFloat")
     ng.interface.new_socket(name="Subsurface Weight", in_out="OUTPUT", socket_type="NodeSocketFloat")
     ng.interface.new_socket(name="Hair Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    ng.interface.new_socket(name="Iris Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    ng.interface.new_socket(name="Peach Fuzz Intensity", in_out="OUTPUT", socket_type="NodeSocketFloat")
 
     n_out = ng.nodes.new("NodeGroupOutput")
     n_out.location = (220, 0)
@@ -2713,26 +2754,38 @@ def _ensure_character_control_group(controls: dict[str, Any] | None = None) -> b
     rgb = ng.nodes.new("ShaderNodeRGB")
     rgb.label = "Skin Tone"
     rgb.outputs[0].default_value = (float(st[0]), float(st[1]), float(st[2]), 1.0)
-    rgb.location = (-200, 140)
+    rgb.location = (-200, 180)
     ng.links.new(rgb.outputs[0], n_out.inputs["Skin Tone"])
 
     br = ng.nodes.new("ShaderNodeValue")
     br.label = "Skin Brightness"
     br.outputs[0].default_value = 1.0
-    br.location = (-200, -20)
+    br.location = (-200, 20)
     ng.links.new(br.outputs[0], n_out.inputs["Skin Brightness"])
 
     sss = ng.nodes.new("ShaderNodeValue")
     sss.label = "Subsurface Weight"
-    sss.outputs[0].default_value = 0.14
-    sss.location = (-200, -140)
+    sss.outputs[0].default_value = 0.32
+    sss.location = (-200, -100)
     ng.links.new(sss.outputs[0], n_out.inputs["Subsurface Weight"])
 
     hrgb = ng.nodes.new("ShaderNodeRGB")
     hrgb.label = "Hair Color"
     hrgb.outputs[0].default_value = (float(hc[0]), float(hc[1]), float(hc[2]), 1.0)
-    hrgb.location = (-200, -300)
+    hrgb.location = (-200, -260)
     ng.links.new(hrgb.outputs[0], n_out.inputs["Hair Color"])
+
+    irgb = ng.nodes.new("ShaderNodeRGB")
+    irgb.label = "Iris Color"
+    irgb.outputs[0].default_value = (float(ic[0]), float(ic[1]), float(ic[2]), 1.0)
+    irgb.location = (-200, -440)
+    ng.links.new(irgb.outputs[0], n_out.inputs["Iris Color"])
+
+    pfv = ng.nodes.new("ShaderNodeValue")
+    pfv.label = "Peach Fuzz Intensity"
+    pfv.outputs[0].default_value = pf
+    pfv.location = (-200, -600)
+    ng.links.new(pfv.outputs[0], n_out.inputs["Peach Fuzz Intensity"])
 
     return ng
 
@@ -2888,14 +2941,27 @@ def _build_layered_outfit_material(
             layer_dny.append(0.5)
         else:
             # Character Outfit: exact DXIL authored linear RGB Dye Color * pow(2.0 * LinearDetailTex, 2.2)!
+            # CRITICAL: Decima metallic armor corners store a dark diffuse (`0.04..0.09`) in `dye_color_linear`
+            # while their actual metal reflectance color lives in `f0_rgb`! Using `f0_rgb` fixes pitch-black armor plates.
+            is_met = bool(lay.get("is_metallic", False))
             dye_lin = lay.get("dye_color_linear")
-            if dye_lin and len(dye_lin) >= 3:
+            f0_lin = lay.get("f0_rgb")
+            if is_met:
+                d_mx = max(float(c) for c in dye_lin[:3]) if (dye_lin and len(dye_lin) >= 3) else 0.0
+                f_mx = max(float(c) for c in f0_lin[:3]) if (f0_lin and len(f0_lin) >= 3) else 0.0
+                if f_mx > max(0.18, d_mx * 1.30):
+                    tint_rgb = tuple(max(0.14, min(0.96, float(c))) for c in f0_lin[:3])
+                elif d_mx >= 0.16:
+                    tint_rgb = (float(dye_lin[0]), float(dye_lin[1]), float(dye_lin[2]))
+                else:
+                    tint_rgb = _layer_fallback_tint_linear(cname, ccat, idx)
+            elif dye_lin and len(dye_lin) >= 3:
                 tint_rgb = (float(dye_lin[0]), float(dye_lin[1]), float(dye_lin[2]))
             else:
                 tint_rgb = _layer_fallback_tint_linear(cname, ccat, idx)
 
             tint_n = nt.nodes.new("ShaderNodeRGB")
-            tint_n.label = f"{c_tag} ({cname}) Dye"
+            tint_n.label = f"{c_tag} ({cname}) {'Metal F0' if is_met else 'Dye'}"
             tint_n.outputs[0].default_value = (tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0)
             tint_n.location = (-1380, 760 - idx * 300)
 
@@ -2954,8 +3020,24 @@ def _build_layered_outfit_material(
                 white_n.location = (-940, 600 - idx * 300)
                 layer_micro_tex.append(white_n.outputs[0])
 
-            is_met = bool(lay.get("is_metallic", False))
-            layer_mets.append(0.90 if is_met else 0.0)
+            rfl_img = _load_image(tex_dir, lay.get("rfl_file", ""), "Non-Color", img_cache) if is_met else None
+            if rfl_img is not None:
+                trfl = nt.nodes.new("ShaderNodeTexImage")
+                trfl.image = rfl_img
+                trfl.label = f"{c_tag} {cname} Metal Mask"
+                trfl.location = (-1380, 430 - idx * 300)
+                nt.links.new(uv_tile.outputs["Vector"], trfl.inputs["Vector"])
+                rm_mr = nt.nodes.new("ShaderNodeMapRange")
+                rm_mr.clamp = True
+                rm_mr.inputs["From Min"].default_value = 0.25
+                rm_mr.inputs["From Max"].default_value = 0.65
+                rm_mr.inputs["To Min"].default_value = 0.20
+                rm_mr.inputs["To Max"].default_value = 0.95
+                rm_mr.location = (-1100, 430 - idx * 300)
+                nt.links.new(trfl.outputs["Color"], rm_mr.inputs["Value"])
+                layer_mets.append(rm_mr.outputs["Result"])
+            else:
+                layer_mets.append(0.90 if is_met else 0.0)
 
             # Per-corner 16x Micro-Normal (R, G) AND Per-Pixel Micro-Roughness from `*_NMT_RGH_HGT.B` (Decima GLS)!
             dn_socks = _get_submat_nrm_rgh(lay.get("normal_file", ""), -2100 - idx * 240)
@@ -3428,6 +3510,7 @@ def _build_material(
                         sockets.setdefault(f"Normal.{sch}", out_sock)
                     else:
                         sockets.setdefault(stype, out_sock)
+                        sockets.setdefault(f"{stype}.{sch}", out_sock)
 
             y_cursor -= 320
     else:
@@ -3542,9 +3625,34 @@ def _build_material(
             )
             da_grp.label = "HFW Machine Detail Array (Mask -> 23 Slices)"
             da_grp.location = (-160, -140)
-            da_grp.inputs["Tile X"].default_value = float(detail_arr.get("tile_x", 12.0))
-            da_grp.inputs["Tile Y"].default_value = float(detail_arr.get("tile_y", 12.0))
-            da_grp.inputs["Detail Strength"].default_value = 0.65
+            base_tx = float(detail_arr.get("tile_x", 28.0))
+            base_ty = float(detail_arr.get("tile_y", 28.0))
+            # Wire live Detail Tiling Scale & Detail Strength from HFW_MachineShaderControl!
+            dm_ctrl = nt.nodes.new("ShaderNodeGroup")
+            dm_ctrl.node_tree = _ensure_machine_shader_control_group()
+            dm_ctrl.label = "HFW Detail Scale Control"
+            dm_ctrl.location = (-660, -260)
+            if "Detail Tiling Scale" in dm_ctrl.outputs:
+                mul_tx = nt.nodes.new("ShaderNodeMath")
+                mul_tx.operation = "MULTIPLY"
+                mul_tx.inputs[0].default_value = base_tx
+                mul_tx.location = (-400, -180)
+                nt.links.new(dm_ctrl.outputs["Detail Tiling Scale"], mul_tx.inputs[1])
+                nt.links.new(mul_tx.outputs["Value"], da_grp.inputs["Tile X"])
+
+                mul_ty = nt.nodes.new("ShaderNodeMath")
+                mul_ty.operation = "MULTIPLY"
+                mul_ty.inputs[0].default_value = base_ty
+                mul_ty.location = (-400, -320)
+                nt.links.new(dm_ctrl.outputs["Detail Tiling Scale"], mul_ty.inputs[1])
+                nt.links.new(mul_ty.outputs["Value"], da_grp.inputs["Tile Y"])
+            else:
+                da_grp.inputs["Tile X"].default_value = base_tx
+                da_grp.inputs["Tile Y"].default_value = base_ty
+            if "Detail Strength" in dm_ctrl.outputs:
+                nt.links.new(dm_ctrl.outputs["Detail Strength"], da_grp.inputs["Detail Strength"])
+            else:
+                da_grp.inputs["Detail Strength"].default_value = 0.72
             if color_sock is not None:
                 nt.links.new(color_sock, da_grp.inputs["Base Color"])
                 color_sock = da_grp.outputs["Color"]
@@ -3567,7 +3675,7 @@ def _build_material(
         okind = em_overlay.get("kind", "")
         mat["hfw_emissive_overlay"] = okind
 
-        if okind == "elemental_sack_overlay" and "Mask" in sockets:
+        if okind == "elemental_sack_overlay" and ("Mask" in sockets or float(em_overlay.get("mask_id", 0.0)) < 0.0):
             flow_img = _load_image(tex_dir, em_overlay.get("flow_file", ""), "Non-Color", img_cache)
             fluid_img = _load_image(tex_dir, em_overlay.get("fluid_file", ""), "Non-Color", img_cache)
             t_drv = _add_time_driver_node(nt, (-280, 560), "HFW Sac Flow Time")
@@ -3581,9 +3689,11 @@ def _build_material(
             sac_grp.label = "HFW Animated Elemental Sac (Flow Map)"
             sac_grp.location = (40, 520)
             gc = em_overlay.get("glow_color", [0.14, 0.68, 1.0])
-            base_sac_str = float(em_overlay.get("glow_strength", 4.2))
+            base_sac_str = float(em_overlay.get("glow_strength", 4.6))
             sac_grp.inputs["Flow Speed"].default_value = float(em_overlay.get("flow_speed", 0.35))
             sac_grp.inputs["Flow Strength"].default_value = float(em_overlay.get("flow_strength", 0.14))
+            if "Mask ID" in sac_grp.inputs:
+                sac_grp.inputs["Mask ID"].default_value = float(em_overlay.get("mask_id", 0.0))
 
             # Preserve per-sac elemental color (e.g. Bilegut Acid + Adhesive) with optional global override!
             liq_col = nt.nodes.new("ShaderNodeMix")
@@ -3609,7 +3719,8 @@ def _build_material(
             if smooth_sock is not None:
                 nt.links.new(smooth_sock, sac_grp.inputs["Base Smoothness"])
                 smooth_sock = sac_grp.outputs["Smoothness"]
-            nt.links.new(sockets["Mask"], sac_grp.inputs["Mask"])
+            if "Mask" in sockets:
+                nt.links.new(sockets["Mask"], sac_grp.inputs["Mask"])
             if "Mask_Alpha" in sockets:
                 nt.links.new(sockets["Mask_Alpha"], sac_grp.inputs["Mask Alpha"])
             nt.links.new(t_drv.outputs[0], sac_grp.inputs["Time"])
@@ -3945,6 +4056,21 @@ def _build_material(
         nt.links.new(pbr_grp.outputs["Base Color"], bsdf.inputs["Base Color"])
         if sprof in _DIELECTRIC_PROFILES:
             bsdf.inputs["Metallic"].default_value = 0.0
+        elif liquid_mask_sock is not None:
+            # Force translucent liquid sac/fluid membrane pixels to dielectric (Metallic = 0) so liquid NEVER looks dark metallic!
+            inv_liq = nt.nodes.new("ShaderNodeMath")
+            inv_liq.operation = "SUBTRACT"
+            inv_liq.inputs[0].default_value = 1.0
+            inv_liq.use_clamp = True
+            inv_liq.location = (220, 40)
+            nt.links.new(liquid_mask_sock, inv_liq.inputs[1])
+            met_liq = nt.nodes.new("ShaderNodeMath")
+            met_liq.operation = "MULTIPLY"
+            met_liq.use_clamp = True
+            met_liq.location = (360, 40)
+            nt.links.new(pbr_grp.outputs["Metallic"], met_liq.inputs[0])
+            nt.links.new(inv_liq.outputs["Value"], met_liq.inputs[1])
+            nt.links.new(met_liq.outputs["Value"], bsdf.inputs["Metallic"])
         else:
             nt.links.new(pbr_grp.outputs["Metallic"], bsdf.inputs["Metallic"])
         nt.links.new(pbr_grp.outputs["Roughness"], bsdf.inputs["Roughness"])
@@ -4034,19 +4160,124 @@ def _build_material(
     if allow_alpha and "Alpha" in sockets and sprof not in ("skin", "eye", "teeth"):
         nt.links.new(sockets["Alpha"], bsdf.inputs["Alpha"])
 
-    # 7. Character & General Asset PBR Surface Profile refinements (Skin SSS, Hair, Brows/Lashes, Eyes, Foliage, Cloth, Glass)
+    # 7. Photorealistic Decima Character & General Asset Surface Profile Refinements
     if sprof == "peach_fuzz":
-        # Invisible/ultra-subtle facial peach-fuzz shell (never blocks face skin with solid white!)
+        # Backlit Grazing-Angle Facial Peach Fuzz / Vellus Hair (`3996:0`):
+        #   - Grazing silhouette `Facing^3.4` broken up by ultra-fine strand Noise (zero solid white veil face-on!)
+        #   - Warm sunlit `Translucent + Sheen BSDF` driven by `HFW_CharacterControl`
+        #   - Strictly gated by `Light Path -> Is Shadow Ray -> Transparent BSDF` so it NEVER casts shadows onto skin!
         _configure_blended_material(mat)
         nt.nodes.clear()
         out_pf = nt.nodes.new("ShaderNodeOutputMaterial")
-        out_pf.location = (320, 0)
+        out_pf.location = (920, 0)
+
+        c_ctrl_pf = nt.nodes.new("ShaderNodeGroup")
+        c_ctrl_pf.node_tree = _ensure_character_control_group()
+        c_ctrl_pf.label = "HFW Character Control"
+        c_ctrl_pf.location = (-760, 260)
+
+        # Warm golden-blonde sunlit vellus tint derived from character's Skin Tone!
+        pf_hue = nt.nodes.new("ShaderNodeHueSaturation")
+        pf_hue.inputs["Saturation"].default_value = 0.62
+        pf_hue.inputs["Value"].default_value = 1.65
+        pf_hue.label = "Sunlit Vellus Hair Tint"
+        pf_hue.location = (-440, 260)
+        nt.links.new(c_ctrl_pf.outputs["Skin Tone"], pf_hue.inputs["Color"])
+
+        # Grazing-angle silhouette falloff: Layer Weight Facing ^ 3.4
+        lw_pf = nt.nodes.new("ShaderNodeLayerWeight")
+        lw_pf.inputs["Blend"].default_value = 0.48
+        lw_pf.location = (-760, -60)
+        pw_pf = nt.nodes.new("ShaderNodeMath")
+        pw_pf.operation = "POWER"
+        pw_pf.inputs[1].default_value = 3.4
+        pw_pf.use_clamp = True
+        pw_pf.label = "Grazing Rim Falloff (Facing^3.4)"
+        pw_pf.location = (-520, -60)
+        nt.links.new(lw_pf.outputs["Facing"], pw_pf.inputs[0])
+
+        # Ultra-fine micro-hair strand noise breakup so fuzz catches light as microscopic hairs!
+        tc_pf = nt.nodes.new("ShaderNodeTexCoord")
+        tc_pf.location = (-980, -280)
+        ns_pf = nt.nodes.new("ShaderNodeTexNoise")
+        ns_pf.inputs["Scale"].default_value = 420.0
+        ns_pf.inputs["Detail"].default_value = 5.0
+        ns_pf.inputs["Roughness"].default_value = 0.65
+        ns_pf.label = "Micro Vellus Strand Breakup"
+        ns_pf.location = (-740, -280)
+        nt.links.new(tc_pf.outputs["Object"], ns_pf.inputs["Vector"])
+
+        ns_mr = nt.nodes.new("ShaderNodeMapRange")
+        ns_mr.clamp = True
+        ns_mr.inputs["From Min"].default_value = 0.34
+        ns_mr.inputs["From Max"].default_value = 0.72
+        ns_mr.inputs["To Min"].default_value = 0.25
+        ns_mr.inputs["To Max"].default_value = 1.0
+        ns_mr.location = (-500, -280)
+        nt.links.new(ns_pf.outputs["Fac"], ns_mr.inputs["Value"])
+
+        m_fn = nt.nodes.new("ShaderNodeMath")
+        m_fn.operation = "MULTIPLY"
+        m_fn.location = (-280, -140)
+        nt.links.new(pw_pf.outputs["Value"], m_fn.inputs[0])
+        nt.links.new(ns_mr.outputs["Result"], m_fn.inputs[1])
+
+        m_int = nt.nodes.new("ShaderNodeMath")
+        m_int.operation = "MULTIPLY"
+        m_int.location = (-100, -100)
+        nt.links.new(m_fn.outputs["Value"], m_int.inputs[0])
+        if "Peach Fuzz Intensity" in c_ctrl_pf.outputs:
+            nt.links.new(c_ctrl_pf.outputs["Peach Fuzz Intensity"], m_int.inputs[1])
+        else:
+            m_int.inputs[1].default_value = 0.65
+
+        m_op = nt.nodes.new("ShaderNodeMath")
+        m_op.operation = "MULTIPLY"
+        m_op.inputs[1].default_value = 0.52
+        m_op.use_clamp = True
+        m_op.label = "Final Grazing Opacity"
+        m_op.location = (80, -60)
+        nt.links.new(m_int.outputs["Value"], m_op.inputs[0])
+
+        # Soft backlit Translucent + velvety Sheen micro-hair shader
         tr_pf = nt.nodes.new("ShaderNodeBsdfTransparent")
-        tr_pf.location = (60, 0)
-        nt.links.new(tr_pf.outputs["BSDF"], out_pf.inputs["Surface"])
+        tr_pf.location = (120, -240)
+        tl_pf = nt.nodes.new("ShaderNodeBsdfTranslucent")
+        tl_pf.location = (-120, 260)
+        nt.links.new(pf_hue.outputs["Color"], tl_pf.inputs["Color"])
+        sh_pf = nt.nodes.new("ShaderNodeBsdfSheen") if hasattr(bpy.types, "ShaderNodeBsdfSheen") else nt.nodes.new("ShaderNodeBsdfDiffuse")
+        sh_pf.location = (-120, 120)
+        nt.links.new(pf_hue.outputs["Color"], sh_pf.inputs["Color"])
+        if "Roughness" in sh_pf.inputs:
+            sh_pf.inputs["Roughness"].default_value = 0.45
+
+        mx_fuzz = nt.nodes.new("ShaderNodeMixShader")
+        mx_fuzz.inputs["Fac"].default_value = 0.55
+        mx_fuzz.label = "Backlit Translucent + Sheen"
+        mx_fuzz.location = (120, 200)
+        nt.links.new(tl_pf.outputs["BSDF"], mx_fuzz.inputs[1])
+        nt.links.new(sh_pf.outputs["BSDF"], mx_fuzz.inputs[2])
+
+        mx_vis = nt.nodes.new("ShaderNodeMixShader")
+        mx_vis.label = "Transparent <-> Grazing Vellus Hair"
+        mx_vis.location = (420, 60)
+        nt.links.new(m_op.outputs["Value"], mx_vis.inputs["Fac"])
+        nt.links.new(tr_pf.outputs["BSDF"], mx_vis.inputs[1])
+        nt.links.new(mx_fuzz.outputs["Shader"], mx_vis.inputs[2])
+
+        # Mandatory Light Path Shadow-Ray Bypass -> ZERO shadow cast onto face skin!
+        lp_pf = nt.nodes.new("ShaderNodeLightPath")
+        lp_pf.location = (420, 280)
+        mx_shd = nt.nodes.new("ShaderNodeMixShader")
+        mx_shd.label = "Shadow-Ray Bypass (Zero Skin Shadow!)"
+        mx_shd.location = (680, 40)
+        nt.links.new(lp_pf.outputs["Is Shadow Ray"], mx_shd.inputs["Fac"])
+        nt.links.new(mx_vis.outputs["Shader"], mx_shd.inputs[1])
+        nt.links.new(tr_pf.outputs["BSDF"], mx_shd.inputs[2])
+        nt.links.new(mx_shd.outputs["Shader"], out_pf.inputs["Surface"])
         return mat
     elif sprof == "hair_face":
-        # Eyebrow, Eyelash & Facial Hair cards: hashed alpha cutout + dark auburn/brown strand tint!
+        # Eyebrow, Eyelash & Facial Hair cards: hashed alpha cutout + character hair tint!
         _configure_blended_material(mat)
         if hasattr(mat, "blend_method"):
             try:
@@ -4055,24 +4286,86 @@ def _build_material(
                 pass
         if color_sock is None:
             bsdf.inputs["Base Color"].default_value = (0.14, 0.075, 0.045, 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.52
+        bsdf.inputs["Roughness"].default_value = 0.50
         if "Alpha" in sockets:
             nt.links.new(sockets["Alpha"], bsdf.inputs["Alpha"])
         elif "Mask_Alpha" in sockets:
             nt.links.new(sockets["Mask_Alpha"], bsdf.inputs["Alpha"])
     elif sprof == "skin":
+        # Photorealistic Decima Human Skin: Blender 5.3 RANDOM_WALK_SKIN + TRA Translucency map + Micro-Pore Normal + Dual-Lobe Specular!
+        if hasattr(bsdf, "subsurface_method"):
+            try:
+                bsdf.subsurface_method = "RANDOM_WALK_SKIN"
+            except Exception:
+                try:
+                    bsdf.subsurface_method = "RANDOM_WALK"
+                except Exception:
+                    pass
         if "Subsurface Weight" in bsdf.inputs:
-            if char_ctrl_node is not None:
-                nt.links.new(char_ctrl_node.outputs["Subsurface Weight"], bsdf.inputs["Subsurface Weight"])
+            tra_sock = sockets.get("Translucency_Amount") or sockets.get("Mask_Alpha")
+            base_sss_sock = char_ctrl_node.outputs["Subsurface Weight"] if char_ctrl_node is not None else None
+            if tra_sock is not None:
+                # Wire Decima's per-pixel `Translucency_Amount` (`Head_Shared_RGH.A`) -> ears/nostrils/lips scatter warmly!
+                tra_mr = nt.nodes.new("ShaderNodeMapRange")
+                tra_mr.clamp = True
+                tra_mr.inputs["From Min"].default_value = 0.0
+                tra_mr.inputs["From Max"].default_value = 1.0
+                tra_mr.inputs["To Min"].default_value = 0.45
+                tra_mr.inputs["To Max"].default_value = 1.40
+                tra_mr.label = "Decima TRA Translucency Remap"
+                tra_mr.location = (180, -140)
+                nt.links.new(tra_sock, tra_mr.inputs["Value"])
+                sss_mul = nt.nodes.new("ShaderNodeMath")
+                sss_mul.operation = "MULTIPLY"
+                sss_mul.use_clamp = True
+                sss_mul.location = (360, -140)
+                if base_sss_sock is not None:
+                    nt.links.new(base_sss_sock, sss_mul.inputs[0])
+                else:
+                    sss_mul.inputs[0].default_value = 0.32
+                nt.links.new(tra_mr.outputs["Result"], sss_mul.inputs[1])
+                nt.links.new(sss_mul.outputs["Value"], bsdf.inputs["Subsurface Weight"])
+            elif base_sss_sock is not None:
+                nt.links.new(base_sss_sock, bsdf.inputs["Subsurface Weight"])
             else:
-                bsdf.inputs["Subsurface Weight"].default_value = 0.14
+                bsdf.inputs["Subsurface Weight"].default_value = 0.32
         if "Subsurface Scale" in bsdf.inputs:
-            bsdf.inputs["Subsurface Scale"].default_value = 0.006
+            bsdf.inputs["Subsurface Scale"].default_value = 0.016
         if "Subsurface Radius" in bsdf.inputs:
-            bsdf.inputs["Subsurface Radius"].default_value = (1.0, 0.35, 0.18)
+            bsdf.inputs["Subsurface Radius"].default_value = (1.0, 0.32, 0.15)
+        if "Subsurface IOR" in bsdf.inputs:
+            bsdf.inputs["Subsurface IOR"].default_value = 1.40
+        if "Subsurface Anisotropy" in bsdf.inputs:
+            bsdf.inputs["Subsurface Anisotropy"].default_value = 0.25
+        # Dual-lobe skin specular (natural sebaceous sheen on cheeks/nose/forehead!)
+        if "Specular IOR Level" in bsdf.inputs:
+            bsdf.inputs["Specular IOR Level"].default_value = 0.46
         if "Coat Weight" in bsdf.inputs:
-            bsdf.inputs["Coat Weight"].default_value = 0.05
-            bsdf.inputs["Coat Roughness"].default_value = 0.42
+            bsdf.inputs["Coat Weight"].default_value = 0.14
+            bsdf.inputs["Coat Roughness"].default_value = 0.28
+        if "Coat IOR" in bsdf.inputs:
+            bsdf.inputs["Coat IOR"].default_value = 1.38
+        # Fine close-up micro-pore skin normal detail layered gently on top of 4K Head Normal map!
+        if "Normal" in bsdf.inputs:
+            tc_pore = nt.nodes.new("ShaderNodeTexCoord")
+            tc_pore.location = (-280, -680)
+            ns_pore = nt.nodes.new("ShaderNodeTexNoise")
+            ns_pore.inputs["Scale"].default_value = 480.0
+            ns_pore.inputs["Detail"].default_value = 6.0
+            ns_pore.inputs["Roughness"].default_value = 0.58
+            ns_pore.label = "Skin Micro-Pore Grain"
+            ns_pore.location = (-60, -680)
+            nt.links.new(tc_pore.outputs["Object"], ns_pore.inputs["Vector"])
+            bmp_pore = nt.nodes.new("ShaderNodeBump")
+            bmp_pore.inputs["Strength"].default_value = 0.06
+            bmp_pore.inputs["Distance"].default_value = 0.0004
+            bmp_pore.label = "Micro-Pore Relief"
+            bmp_pore.location = (360, -560)
+            nt.links.new(ns_pore.outputs["Fac"], bmp_pore.inputs["Height"])
+            for lnk in list(bsdf.inputs["Normal"].links):
+                nt.links.new(lnk.from_socket, bmp_pore.inputs["Normal"])
+                nt.links.remove(lnk)
+            nt.links.new(bmp_pore.outputs["Normal"], bsdf.inputs["Normal"])
     elif sprof == "snow":
         if "Subsurface Weight" in bsdf.inputs:
             bsdf.inputs["Subsurface Weight"].default_value = 0.25
@@ -4094,51 +4387,81 @@ def _build_material(
         if "Alpha" not in sockets and "Mask_Alpha" in sockets:
             nt.links.new(sockets["Mask_Alpha"], bsdf.inputs["Alpha"])
         if "Anisotropic" in bsdf.inputs:
-            bsdf.inputs["Anisotropic"].default_value = 0.65
+            bsdf.inputs["Anisotropic"].default_value = 0.68
         if "Sheen Weight" in bsdf.inputs:
-            bsdf.inputs["Sheen Weight"].default_value = 0.22
+            bsdf.inputs["Sheen Weight"].default_value = 0.28
+            if "Sheen Roughness" in bsdf.inputs:
+                bsdf.inputs["Sheen Roughness"].default_value = 0.42
         if "Coat Weight" in bsdf.inputs:
             # Subtle dielectric hair specular sheen driven by `181:1.R` (NOT Metallic copper!)
             if rfl_sock is not None:
                 hc_m = nt.nodes.new("ShaderNodeMath")
                 hc_m.operation = "MULTIPLY"
-                hc_m.inputs[1].default_value = 0.16
+                hc_m.inputs[1].default_value = 0.18
                 hc_m.use_clamp = True
                 hc_m.location = (260, -140)
                 nt.links.new(rfl_sock, hc_m.inputs[0])
                 nt.links.new(hc_m.outputs["Value"], bsdf.inputs["Coat Weight"])
             else:
-                bsdf.inputs["Coat Weight"].default_value = 0.10
+                bsdf.inputs["Coat Weight"].default_value = 0.12
             if "Coat Roughness" in bsdf.inputs:
-                bsdf.inputs["Coat Roughness"].default_value = 0.36
+                bsdf.inputs["Coat Roughness"].default_value = 0.34
         if smooth_sock is None:
-            bsdf.inputs["Roughness"].default_value = 0.46
+            bsdf.inputs["Roughness"].default_value = 0.44
     elif sprof == "eye":
-        # Human eyeball: dark crisp iris & pupil + clean sclera + wet glossy clearcoat!
-        bsdf.inputs["Roughness"].default_value = 0.04
+        # Photorealistic Human Eyeball (`Eyes_NMT_40_4_MSK_AO.png`: G = Full Iris Disc, R = Inner Heterochromia Ring, B = Sclera)!
+        bsdf.inputs["Roughness"].default_value = 0.03
         if "Coat Weight" in bsdf.inputs:
             bsdf.inputs["Coat Weight"].default_value = 1.0
-            bsdf.inputs["Coat Roughness"].default_value = 0.02
+            bsdf.inputs["Coat Roughness"].default_value = 0.015
         if "IOR" in bsdf.inputs:
-            bsdf.inputs["IOR"].default_value = 1.42
-        # Darken neutral grayscale Eyes_NMT iris slightly via Mask so irises aren't washed out
-        if color_sock is not None and "Mask" in sockets:
-            iris_col = nt.nodes.new("ShaderNodeRGB")
-            iris_col.label = "Character Iris Tint"
-            iris_col.outputs[0].default_value = (0.16, 0.28, 0.14, 1.0)
-            iris_col.location = (180, 420)
+            bsdf.inputs["IOR"].default_value = 1.40
+        eye_ctrl = nt.nodes.new("ShaderNodeGroup")
+        ic_init = {"iris_color_linear": mat_meta.get("iris_color_linear")} if mat_meta.get("iris_color_linear") else None
+        eye_ctrl.node_tree = _ensure_character_control_group(ic_init)
+        eye_ctrl.label = "HFW Character Iris Control"
+        eye_ctrl.location = (-80, 460)
+        iris_mask_sock = sockets.get("Mask.G") or sockets.get("Mask")
+        if color_sock is not None and iris_mask_sock is not None:
+            # Boost neutral-0.45 `Eyes_CLR` iris luminance by 2.2x * IrisColor inside the full Green iris disc mask!
+            iris_boost = nt.nodes.new("ShaderNodeVectorMath")
+            iris_boost.operation = "SCALE"
+            iris_boost.inputs["Scale"].default_value = 2.25
+            iris_boost.label = "Iris Albedo Scale (2.25x)"
+            iris_boost.location = (140, 440)
+            if "Iris Color" in eye_ctrl.outputs:
+                nt.links.new(eye_ctrl.outputs["Iris Color"], iris_boost.inputs[0])
+            else:
+                ic_d = mat_meta.get("iris_color_linear") or [0.106, 0.199, 0.061]
+                iris_boost.inputs[0].default_value = (ic_d[0], ic_d[1], ic_d[2])
+
             iris_mx = nt.nodes.new("ShaderNodeMix")
             iris_mx.data_type = "RGBA"
             iris_mx.blend_type = "MULTIPLY"
-            iris_mx.label = "Iris Tint (Masked)"
-            iris_mx.location = (340, 320)
-            nt.links.new(sockets["Mask"], iris_mx.inputs["Factor"])
-            # Intercept BSDF Base Color cleanly
+            iris_mx.clamp_result = True
+            iris_mx.label = "Character Iris Tint (Full Mask.G Disc)"
+            iris_mx.location = (360, 320)
+            nt.links.new(iris_mask_sock, iris_mx.inputs["Factor"])
             for lnk in list(bsdf.inputs["Base Color"].links):
                 nt.links.new(lnk.from_socket, iris_mx.inputs[6])
                 nt.links.remove(lnk)
-            nt.links.new(iris_col.outputs[0], iris_mx.inputs[7])
+            nt.links.new(iris_boost.outputs["Vector"], iris_mx.inputs[7])
             nt.links.new(iris_mx.outputs[2], bsdf.inputs["Base Color"])
+            # Subtle warm pinkish Sclera Subsurface Scattering ONLY outside the full iris disc (`1 - Mask.G`)!
+            if "Subsurface Weight" in bsdf.inputs:
+                scl_inv = nt.nodes.new("ShaderNodeMath")
+                scl_inv.operation = "MULTIPLY_ADD"
+                scl_inv.inputs[1].default_value = -0.14
+                scl_inv.inputs[2].default_value = 0.14
+                scl_inv.use_clamp = True
+                scl_inv.label = "Sclera SSS Mask"
+                scl_inv.location = (220, -60)
+                nt.links.new(iris_mask_sock, scl_inv.inputs[0])
+                nt.links.new(scl_inv.outputs["Value"], bsdf.inputs["Subsurface Weight"])
+                if "Subsurface Scale" in bsdf.inputs:
+                    bsdf.inputs["Subsurface Scale"].default_value = 0.008
+                if "Subsurface Radius" in bsdf.inputs:
+                    bsdf.inputs["Subsurface Radius"].default_value = (1.0, 0.35, 0.24)
     elif sprof == "eye_wet":
         # Crystal-clear physical wet cornea / tearline shell: pure Transparent + Fresnel Glossy catchlights (ZERO milky veil!)
         _configure_blended_material(mat)
@@ -4557,10 +4880,212 @@ def _build_part_mesh_object(
     return obj
 
 
+def _load_control_rig_module():
+    """Load sibling `control_rig.py` cleanly inside Blender 5.3 with zero external dependencies."""
+    import importlib.util
+
+    cr_path = Path(__file__).resolve().parent / "control_rig.py"
+    if not cr_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("hfw_control_rig", str(cr_path))
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _bind_native_shader_drivers(
+    arm_obj: Any,
+    asset_kind: str,
+    shader_controls: dict[str, Any] | None,
+    has_plasma_charge: bool = False,
+) -> None:
+    """Expose native keyframeable shader Custom Properties on `arm_obj` & wire pure-C AVERAGE drivers
+    directly into `HFW_MachineShaderControl` / `HFW_PlasmaChargeControl` / `HFW_CharacterControl`!
+
+    Works 100% natively in vanilla Blender WITHOUT the HFWToolkit add-on AND even with Python disabled!
+    """
+    if arm_obj is None:
+        return
+    sc = shader_controls or {}
+
+    def _set_col_prop(key: str, rgb: Any, desc: str) -> None:
+        vals = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+        arm_obj[key] = vals
+        try:
+            arm_obj.id_properties_ui(key).update(
+                min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, subtype="COLOR", description=desc
+            )
+        except Exception:
+            pass
+
+    def _set_flt_prop(key: str, val: float, mn: float, mx: float, desc: str, *, factor: bool = False) -> None:
+        arm_obj[key] = float(val)
+        try:
+            kw: dict[str, Any] = {"min": mn, "max": mx, "soft_min": mn, "soft_max": mx, "description": desc}
+            if factor:
+                kw["subtype"] = "FACTOR"
+            arm_obj.id_properties_ui(key).update(**kw)
+        except Exception:
+            pass
+
+    def _drive_scalar(sock: Any, prop_key: str) -> None:
+        try:
+            sock.driver_remove("default_value")
+        except Exception:
+            pass
+        try:
+            fc = sock.driver_add("default_value")
+            drv = fc.driver
+            drv.type = "AVERAGE"
+            v = drv.variables.new()
+            v.name = "val"
+            v.type = "SINGLE_PROP"
+            v.targets[0].id_type = "OBJECT"
+            v.targets[0].id = arm_obj
+            v.targets[0].data_path = f'["{prop_key}"]'
+        except Exception:
+            pass
+
+    def _drive_color(sock: Any, prop_key: str) -> None:
+        for ch in range(3):
+            try:
+                sock.driver_remove("default_value", ch)
+            except Exception:
+                pass
+            try:
+                fc = sock.driver_add("default_value", ch)
+                drv = fc.driver
+                drv.type = "AVERAGE"
+                v = drv.variables.new()
+                v.name = "c"
+                v.type = "SINGLE_PROP"
+                v.targets[0].id_type = "OBJECT"
+                v.targets[0].id = arm_obj
+                v.targets[0].data_path = f'["{prop_key}"][{ch}]'
+            except Exception:
+                pass
+
+    if asset_kind == "machine":
+        ctrl_ng = bpy.data.node_groups.get("HFW_MachineShaderControl")
+        plasma_ng = bpy.data.node_groups.get("HFW_PlasmaChargeControl")
+        if ctrl_ng is None and plasma_ng is None:
+            return
+        arm_obj["hfw_shader_kind"] = "machine"
+        mc = sc.get("muscle_color", [0.95, 0.28, 0.02])
+        ec = sc.get("eye_color", [0.04, 0.56, 1.0])
+        eac = sc.get("eye_alert_color", [1.0, 0.08, 0.01])
+        lc = sc.get("liquid_override_color", [0.08, 0.62, 1.0])
+        pc = sc.get("plasma_color", [0.46, 0.05, 1.0])
+        p_def = float(sc.get("plasma_charge", 1.0 if (has_plasma_charge or sc.get("is_plasma")) else 0.0))
+
+        _set_col_prop("hfw_sh_muscle_color", mc, "Machine optical muscle fiber glow color")
+        _set_flt_prop("hfw_sh_muscle_glow", 1.0, 0.0, 4.0, "Machine muscle & cable emission strength")
+        _set_col_prop("hfw_sh_eye_color", ec, "Calm / patrol eye optics color")
+        _set_col_prop("hfw_sh_eye_alert_color", eac, "Hostile / combat alert eye optics color")
+        _set_flt_prop("hfw_sh_eye_alert", 0.0, 0.0, 1.0, "Eye Alert blend (0 = Patrol, 1 = Alert)", factor=True)
+        _set_flt_prop("hfw_sh_eye_glow", 1.0, 0.0, 4.0, "Eye optics emission strength")
+        _set_col_prop("hfw_sh_liquid_color", lc, "Override color for elemental sacs & canisters")
+        _set_flt_prop("hfw_sh_liquid_mix", float(sc.get("liquid_override_fac", 0.0)), 0.0, 1.0, "Override native sac/canister liquid colors", factor=True)
+        _set_flt_prop("hfw_sh_liquid_glow", float(sc.get("liquid_glow_scale", 1.0)), 0.0, 4.0, "Elemental liquid & canister glow strength")
+        _set_flt_prop("hfw_sh_anim_speed", float(sc.get("animation_speed", 1.0)), 0.0, 4.0, "Animated muscle/liquid/scan shader speed")
+        _set_flt_prop("hfw_sh_detail_scale", float(sc.get("detail_tiling_scale", 1.0)), 0.25, 4.0, "Machine micro-detail normal/roughness UV tiling multiplier")
+        _set_flt_prop("hfw_sh_detail_strength", float(sc.get("detail_strength", 0.72)), 0.0, 1.5, "Machine micro-detail surface relief strength")
+        if has_plasma_charge or sc.get("is_plasma"):
+            _set_col_prop("hfw_sh_plasma_color", pc, "Plasma charge-up emission color")
+            _set_flt_prop("hfw_sh_plasma_charge", p_def, 0.0, 1.0, "Plasma Charge-Up (0 = Idle, 1 = Full Charge)", factor=True)
+            arm_obj["hfw_plasma_charge"] = p_def
+
+        col_map = {
+            "Muscle Color": "hfw_sh_muscle_color",
+            "Eye Color": "hfw_sh_eye_color",
+            "Eye Alert Color": "hfw_sh_eye_alert_color",
+            "Liquid Override Color": "hfw_sh_liquid_color",
+            "Plasma Color": "hfw_sh_plasma_color",
+        }
+        val_map = {
+            "Muscle Glow Scale": "hfw_sh_muscle_glow",
+            "Eye Alert State": "hfw_sh_eye_alert",
+            "Eye Glow Scale": "hfw_sh_eye_glow",
+            "Liquid Override Mix": "hfw_sh_liquid_mix",
+            "Liquid Glow Scale": "hfw_sh_liquid_glow",
+            "Animation Speed": "hfw_sh_anim_speed",
+            "Detail Tiling Scale": "hfw_sh_detail_scale",
+            "Detail Strength": "hfw_sh_detail_strength",
+            "Plasma Charge": "hfw_sh_plasma_charge",
+        }
+        if ctrl_ng is not None:
+            for n in ctrl_ng.nodes:
+                if n.type == "RGB" and n.label in col_map and col_map[n.label] in arm_obj:
+                    _drive_color(n.outputs[0], col_map[n.label])
+                elif n.type == "VALUE" and n.label in val_map and val_map[n.label] in arm_obj:
+                    _drive_scalar(n.outputs[0], val_map[n.label])
+        if plasma_ng is not None and "hfw_sh_plasma_charge" in arm_obj:
+            for n in plasma_ng.nodes:
+                if n.type == "VALUE" and n.label == "Plasma Charge":
+                    _drive_scalar(n.outputs[0], "hfw_sh_plasma_charge")
+
+    elif asset_kind == "character":
+        char_ng = bpy.data.node_groups.get(_ACTIVE_CHAR_CTRL_NAME) or bpy.data.node_groups.get("HFW_CharacterControl")
+        if char_ng is None:
+            return
+        arm_obj["hfw_shader_kind"] = "character"
+        arm_obj["hfw_char_ctrl_ng"] = char_ng.name
+        st = sc.get("skin_tone_linear") or [0.453, 0.246, 0.209]
+        hc = sc.get("hair_color_linear") or [0.045, 0.032, 0.025]
+        ic = sc.get("iris_color_linear") or [0.106, 0.199, 0.061]
+        pf = float(sc.get("peach_fuzz_intensity", 0.65))
+        _set_col_prop("hfw_sh_skin_tone", st, "Shared DXIL 570:0 Skin LUT tone across Head & Body")
+        _set_flt_prop("hfw_sh_skin_brightness", 1.0, 0.25, 2.0, "Skin albedo brightness multiplier")
+        _set_flt_prop("hfw_sh_sss_weight", 0.32, 0.0, 1.0, "RANDOM_WALK_SKIN subsurface scattering weight")
+        _set_flt_prop("hfw_sh_peach_fuzz", pf, 0.0, 2.0, "Backlit grazing facial peach fuzz / vellus hair intensity")
+        _set_col_prop("hfw_sh_iris_color", ic, "Character iris color tint")
+        _set_col_prop("hfw_sh_hair_color", hc, "Shared DXIL 382:0 Hair LUT color")
+        for n in char_ng.nodes:
+            if n.type == "RGB" and n.label == "Skin Tone":
+                _drive_color(n.outputs[0], "hfw_sh_skin_tone")
+            elif n.type == "RGB" and n.label == "Hair Color":
+                _drive_color(n.outputs[0], "hfw_sh_hair_color")
+            elif n.type == "RGB" and n.label == "Iris Color":
+                _drive_color(n.outputs[0], "hfw_sh_iris_color")
+            elif n.type == "VALUE" and n.label == "Skin Brightness":
+                _drive_scalar(n.outputs[0], "hfw_sh_skin_brightness")
+            elif n.type == "VALUE" and n.label == "Subsurface Weight":
+                _drive_scalar(n.outputs[0], "hfw_sh_sss_weight")
+            elif n.type == "VALUE" and n.label == "Peach Fuzz Intensity":
+                _drive_scalar(n.outputs[0], "hfw_sh_peach_fuzz")
+
+
+def _embed_native_rig_ui_in_blend() -> None:
+    """Embed self-contained `hfw_rig_ui.py` (`use_module = True`) into the .blend so Rig & Shader UI works WITHOUT the add-on!"""
+    ui_src_path = Path(__file__).resolve().with_name("rig_ui_embedded.py")
+    if not ui_src_path.is_file():
+        return
+    try:
+        src_text = ui_src_path.read_text(encoding="utf-8")
+        txt = bpy.data.texts.get("hfw_rig_ui.py")
+        if txt is None:
+            txt = bpy.data.texts.new("hfw_rig_ui.py")
+        txt.clear()
+        txt.write(src_text)
+        txt.use_module = True
+        # Register immediately in the active Blender session too
+        ns: dict[str, Any] = {"__name__": "hfw_rig_ui"}
+        exec(compile(src_text, "hfw_rig_ui.py", "exec"), ns)
+        reg_fn = ns.get("register")
+        if callable(reg_fn):
+            reg_fn()
+    except Exception as exc:
+        print(f"[HFWToolkit] Note: Embedded native Rig UI skipped ({exc})")
+
+
 def import_bundle_into_scene(
     bundle_dir: str | Path,
     enable_detail_nodes: bool = True,
     pack_textures: bool = False,
+    build_control_rig_layer: bool = True,
+    import_animations: bool = True,
 ) -> bpy.types.Object:
     """Import a Canonical Assembly Bundle directly into the active Blender scene."""
     bundle_path = Path(bundle_dir)
@@ -4592,10 +5117,22 @@ def import_bundle_into_scene(
             sub_colls[ckey] = _get_or_create_collection(f"{disp}_{ckey}", root_coll)
 
     # Pre-initialize shared shader control node groups BEFORE building materials!
+    global _ACTIVE_CHAR_CTRL_NAME
     if asset_kind == "machine":
         _ensure_machine_shader_control_group(shader_controls)
     elif asset_kind == "character":
-        _ensure_character_control_group(shader_controls)
+        # Keep canonical `HFW_CharacterControl` for solo character scenes; auto-namespace when importing multiple characters!
+        if bpy.data.node_groups.get("HFW_CharacterControl") is None:
+            _ACTIVE_CHAR_CTRL_NAME = "HFW_CharacterControl"
+        else:
+            safe_tag = "".join(ch if ch.isalnum() else "_" for ch in disp).strip("_")[:24] or "Char"
+            cand = f"HFW_CharacterControl_{safe_tag}"
+            idx_c = 1
+            while bpy.data.node_groups.get(cand) is not None:
+                idx_c += 1
+                cand = f"HFW_CharacterControl_{safe_tag}_{idx_c}"
+            _ACTIVE_CHAR_CTRL_NAME = cand
+        _ensure_character_control_group(shader_controls, ng_name=_ACTIVE_CHAR_CTRL_NAME)
 
     img_cache: dict[str, bpy.types.Image] = {}
     mat_map: dict[str, bpy.types.Material] = {}
@@ -4612,41 +5149,12 @@ def import_bundle_into_scene(
     if shader_controls:
         arm_obj["hfw_variant_profile"] = str(shader_controls.get("profile", "standard"))
 
-    # If this is a Plasma-charging machine (Slaughterspine!), expose a single live `hfw_plasma_charge` slider (0..1)
-    # on the Armature driving `HFW_PlasmaChargeControl` across every PlasmaSpike, PlasmaCharger, PlasmaCore, Body & Muscle!
+    # Wire native keyframeable Armature shader drivers & embed add-on-free `hfw_rig_ui.py`!
     has_plasma_charge = any(
         (mmeta.get("emissive_overlay") or {}).get("kind") == "plasma_charge_overlay"
         for mmeta in manifest["materials"].values()
     )
-    if has_plasma_charge:
-        arm_obj["hfw_plasma_charge"] = 1.0
-        try:
-            ui_m = arm_obj.id_properties_ui("hfw_plasma_charge")
-            ui_m.update(
-                min=0.0,
-                max=1.0,
-                soft_min=0.0,
-                soft_max=1.0,
-                description="Slaughterspine Plasma Charge-Up (0.0 = Uncharged Idle, 1.0 = Full Electric Purple Plasma Charge)",
-            )
-        except Exception:
-            pass
-        ctrl_ng = bpy.data.node_groups.get("HFW_PlasmaChargeControl")
-        if ctrl_ng is not None:
-            for n in ctrl_ng.nodes:
-                if n.type == "VALUE" and n.label == "Plasma Charge":
-                    try:
-                        fc = n.outputs[0].driver_add("default_value")
-                        drv = fc.driver
-                        drv.type = "AVERAGE"
-                        var = drv.variables.new()
-                        var.name = "chg"
-                        var.type = "SINGLE_PROP"
-                        var.targets[0].id_type = "OBJECT"
-                        var.targets[0].id = arm_obj
-                        var.targets[0].data_path = '["hfw_plasma_charge"]'
-                    except Exception:
-                        pass
+    _bind_native_shader_drivers(arm_obj, asset_kind, shader_controls, has_plasma_charge=has_plasma_charge)
 
     created = 0
     for pmeta in manifest["parts"]:
@@ -4691,22 +5199,59 @@ def import_bundle_into_scene(
             pass
 
     npz.close()
+
+    # Build non-destructive `DEF + MCH + CTRL` Control Rig + import any extracted HFW animations!
+    has_bundle_anims = bool(manifest.get("animations")) and (bundle_path / "animations.npz").exists()
+    rig_summary_str = ""
+    anim_count = 0
+    if arm_obj.type == "ARMATURE" and (build_control_rig_layer or (import_animations and has_bundle_anims)):
+        cr_mod = _load_control_rig_module()
+        if cr_mod is not None:
+            if build_control_rig_layer and len(joint_names) >= 8 and asset_kind in ("machine", "character"):
+                try:
+                    # Default to Control Rig ON (1.0) when posing, or Game Anim ON (0.0) when clips were loaded!
+                    def_master = 0.0 if (import_animations and has_bundle_anims) else 1.0
+                    rinfo = cr_mod.build_control_rig(arm_obj, default_master=def_master, rebuild=True)
+                    rig_summary_str = (
+                        f", ControlRig({rinfo['archetype']}: {rinfo['control_count']} ctrls, "
+                        f"{rinfo['ik_limb_count']} IK limbs)"
+                    )
+                except Exception as exc:
+                    print(f"[HFWToolkit] Warning: Control Rig build skipped ({exc})")
+            if import_animations and has_bundle_anims:
+                try:
+                    acts = cr_mod.import_animations_into_armature(
+                        arm_obj,
+                        bundle_path,
+                        activate_first=True,
+                        switch_to_anim_mode=True,
+                    )
+                    anim_count = len(acts)
+                except Exception as exc:
+                    print(f"[HFWToolkit] Warning: Animation import skipped ({exc})")
+
+    # Always embed the add-on-free `hfw_rig_ui.py` so both Rig Controls & Shader Controls work natively in `Item`!
+    _embed_native_rig_ui_in_blend()
+
+    anim_summary_str = f", {anim_count} HFW animations" if anim_count else ""
     print(
         f"[HFWToolkit] Imported '{disp}' ({variant}, textures={manifest.get('texture_mode', 'packed')}): "
-        f"{len(joint_names)} bones, {len(helper_bone_map)} helpers, {created} parts, {len(mat_map)} materials."
+        f"{len(joint_names)} bones, {len(helper_bone_map)} helpers, {created} parts, {len(mat_map)} materials"
+        f"{rig_summary_str}{anim_summary_str}."
     )
     return arm_obj
 
 
 def _cli_main() -> None:
     if "--" not in sys.argv:
-        print("Usage: blender --background --python blender_builder.py -- <bundle_dir> <out.blend> [--pack] [--no-detail] [--export-fbx <out.fbx>]")
+        print("Usage: blender --background --python blender_builder.py -- <bundle_dir> <out.blend> [--pack] [--no-detail] [--no-control-rig] [--export-fbx <out.fbx>]")
         sys.exit(2)
     args = sys.argv[sys.argv.index("--") + 1 :]
     bundle_dir = Path(args[0])
     out_blend = Path(args[1])
     pack = "--pack" in args
     enable_detail = "--no-detail" not in args
+    build_ctrl = "--no-control-rig" not in args
     export_fbx: Path | None = None
     if "--export-fbx" in args:
         idx = args.index("--export-fbx")
@@ -4714,7 +5259,13 @@ def _cli_main() -> None:
             export_fbx = Path(args[idx + 1])
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_bundle_into_scene(bundle_dir, enable_detail_nodes=enable_detail, pack_textures=pack)
+    arm_obj = import_bundle_into_scene(
+        bundle_dir,
+        enable_detail_nodes=enable_detail,
+        pack_textures=pack,
+        build_control_rig_layer=build_ctrl,
+        import_animations=True,
+    )
 
     out_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(out_blend.resolve()))
@@ -4722,6 +5273,19 @@ def _cli_main() -> None:
 
     if export_fbx is not None:
         export_fbx.parent.mkdir(parents=True, exist_ok=True)
+        # Export base SkeletalMesh FBX in clean bind pose using ONLY deform (`DEF`) bones (no CTRL_/MCH_ pollution!)
+        prev_action = arm_obj.animation_data.action if (arm_obj and arm_obj.animation_data) else None
+        prev_master = float(arm_obj.get("hfw_rig_master", 0.0)) if arm_obj else 0.0
+        if arm_obj and arm_obj.type == "ARMATURE":
+            if "hfw_rig_master" in arm_obj:
+                arm_obj["hfw_rig_master"] = 0.0
+            if arm_obj.animation_data:
+                arm_obj.animation_data.action = None
+            for pb in arm_obj.pose.bones:
+                pb.matrix_basis = Matrix.Identity(4)
+            arm_obj.update_tag()
+            bpy.context.view_layer.update()
+
         bpy.ops.object.select_all(action="DESELECT")
         for obj in bpy.context.scene.objects:
             if not obj.hide_viewport and not obj.hide_render:
@@ -4731,6 +5295,7 @@ def _cli_main() -> None:
                 filepath=str(export_fbx.resolve()),
                 use_selection=True,
                 object_types={"ARMATURE", "MESH"},
+                use_armature_deform_only=True,
                 add_leaf_bones=False,
                 bake_anim=False,
                 mesh_smooth_type="FACE",
@@ -4744,6 +5309,67 @@ def _cli_main() -> None:
             print(f"[HFWToolkit] Saved UE5-ready rigged FBX: {export_fbx}")
         except Exception as exc:
             print(f"[HFWToolkit] Warning: FBX export failed ({exc})")
+
+        # Export any imported HFW game animations as UE5-ready skeletal `.fbx` clips in `animations/`!
+        if arm_obj and arm_obj.type == "ARMATURE":
+            game_acts = [a for a in bpy.data.actions if a.get("hfw_anim_kind") in ("game_def", "baked_def")]
+            if game_acts:
+                cr_mod = _load_control_rig_module()
+                anim_dir = export_fbx.parent / "animations"
+                anim_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = bundle_dir / "assembly.json"
+                fbx_name_by_aid: dict[str, str] = {}
+                if manifest_path.exists():
+                    try:
+                        mjson = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        for am in mjson.get("animations") or ():
+                            fbx_name_by_aid[str(am.get("anim_id", ""))] = str(am.get("fbx_filename", ""))
+                    except Exception:
+                        pass
+
+                bpy.ops.object.select_all(action="DESELECT")
+                arm_obj.select_set(True)
+                bpy.context.view_layer.objects.active = arm_obj
+                exported_clips = 0
+                for act in game_acts:
+                    try:
+                        if cr_mod is not None:
+                            cr_mod.assign_action_to_armature(arm_obj, act)
+                        else:
+                            arm_obj.animation_data.action = act
+                        f0, f1 = act.frame_range
+                        bpy.context.scene.frame_start = int(round(f0))
+                        bpy.context.scene.frame_end = max(int(round(f0)) + 1, int(round(f1)))
+                        bpy.context.scene.frame_set(bpy.context.scene.frame_start)
+                        bpy.context.view_layer.update()
+
+                        aid = str(act.get("hfw_anim_id", ""))
+                        fname = fbx_name_by_aid.get(aid) or f"{act.name}.fbx"
+                        if not fname.lower().endswith(".fbx"):
+                            fname += ".fbx"
+                        afbx = anim_dir / fname
+                        bpy.ops.export_scene.fbx(
+                            filepath=str(afbx.resolve()),
+                            use_selection=True,
+                            object_types={"ARMATURE"},
+                            use_armature_deform_only=True,
+                            add_leaf_bones=False,
+                            bake_anim=True,
+                            bake_anim_use_all_bones=True,
+                            bake_anim_use_nla_strips=False,
+                            bake_anim_use_all_actions=False,
+                            bake_anim_force_startend_keying=True,
+                            bake_anim_simplify_factor=0.0,
+                        )
+                        exported_clips += 1
+                    except Exception as exc:
+                        print(f"[HFWToolkit] Warning: Animation FBX export failed for {act.name} ({exc})")
+                print(f"[HFWToolkit] Exported {exported_clips} UE5 AnimSequence FBX clip(s) -> {anim_dir}")
+
+        if arm_obj and prev_action is not None and arm_obj.animation_data:
+            arm_obj.animation_data.action = prev_action
+        if arm_obj and "hfw_rig_master" in arm_obj:
+            arm_obj["hfw_rig_master"] = prev_master
 
 
 if __name__ == "__main__":
