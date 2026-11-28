@@ -243,3 +243,94 @@ def test_windows_batch_launchers_find_python_and_crlf(tmp_path):
         assert kv.get("BEST_PY") and Path(kv["BEST_PY"]).exists(), f"{fname} failed to find Python: {kv}"
         assert int(kv.get("BEST_SCORE", "0")) >= 31000, f"{fname} score too low: {kv}"
 
+
+def test_live_dreadwing_wings_and_horus_titan(tmp_path):
+    """Verify Dreadwing recovers all 3 dynamic Bat_wings membranes and Horus (Titan) assembles with titan rig & shared mesh instancing."""
+    from hfw_toolkit.config import ToolkitConfig
+
+    cfg = ToolkitConfig.load()
+    if not cfg.package_dir.exists() or not cfg.index_db_path.exists():
+        pytest.skip("Live HFW game files / catalog not present")
+
+    from hfw_toolkit.blender.bundle import export_assembly_bundle
+    from hfw_toolkit.decima import AssetCatalog, HFWGame, ObjectId
+    from hfw_toolkit.extract.machine_assembler import assemble_machine, resolve_machine_entity_id
+
+    game = HFWGame(cfg)
+    cat = AssetCatalog(cfg.index_db_path)
+    try:
+        # 1. Dreadwing recovers Left, Right & Tail wing membranes (`Bat_wings_CLR`) on Standard & Apex
+        dw_oid, dw_code, dw_disp = resolve_machine_entity_id(game, cat, "Dreadwing")
+        dw_asm = assemble_machine(game, dw_oid, codename=dw_code, display_name=dw_disp, variant_index=0)
+        dw_wings = {p.name: p for p in dw_asm.parts if p.name.startswith("Wing_Membrane_")}
+        assert {"Wing_Membrane_L", "Wing_Membrane_R", "Wing_Membrane_Tail"} <= set(dw_wings)
+        assert all(p.enabled_by_default and p.is_skinned and p.collection == "Body" for p in dw_wings.values())
+
+        # 2. Horus (`14110:7066`) is cataloged under Machines with all 3 Burning Shores variants
+        horus_rows = cat.list_machines("Horus")
+        assert horus_rows, "Horus should be indexed in the Machines catalog on Burning Shores installs"
+        h_oid, h_code, h_disp = resolve_machine_entity_id(game, cat, "Horus")
+        assert str(h_oid) == "14110:7066"
+
+        # 3. Horus Complete Boss (`v0`, LOD 2) assembles cleanly with 1,229 joints, titan rig (4 legs + 6 arms + 7 splines), and shared-mesh NPZ dedup
+        h_asm = assemble_machine(game, h_oid, codename=h_code, display_name=h_disp, variant_index=0, lod_index=2)
+        assert len(h_asm.available_variants) >= 3
+        assert len(h_asm.skeleton.joints) == 1229
+        assert len(h_asm.parts) >= 1800
+        jspecs = [
+            {
+                "name": j.name,
+                "parent_name": h_asm.skeleton.joints[j.parent_index].name if 0 <= j.parent_index < len(h_asm.skeleton.joints) else None,
+                "head": j.world_matrix[:3, 3].tolist(),
+            }
+            for j in h_asm.skeleton.joints
+        ]
+        spec = analyze_rig_chains(jspecs)
+        assert spec["archetype"] == "titan"
+        assert len(spec["legs"]) == 4
+        assert len(spec["arms"]) == 6
+        assert len(spec["spline_chains"]) >= 6
+
+        # 4. Horus Drill Tentacles (`v2`, 254 joints, 3 Spline IK tentacles + drill spinners) exports with shared_mesh_id dedup
+        hd_asm = assemble_machine(game, h_oid, codename=h_code, display_name=h_disp, variant_index=2, lod_index=2)
+        assert len(hd_asm.skeleton.joints) == 254
+        hd_dir = tmp_path / "Horus_Drills"
+        export_assembly_bundle(game, hd_asm, hd_dir, max_texture_size=256)
+        hd_manifest = json.loads((hd_dir / "assembly.json").read_text(encoding="utf-8"))
+        assert hd_manifest["rig_spec"]["archetype"] == "titan"
+        assert len(hd_manifest["rig_spec"]["spline_chains"]) == 3
+        assert len(hd_manifest["rig_spec"]["spinners"]) >= 18
+        shared_ids = [p.get("shared_mesh_id") for p in hd_manifest["parts"] if p.get("shared_mesh_id")]
+        assert len(shared_ids) > len(set(shared_ids)), "Expected shared static mesh instancing in bundle"
+
+        # 5. Horus DXIL 26-TB layered hull shaders, crimson eyes, foliage LUTs, zero StarMoss_clr misnaming, and UE5 AST!
+        from hfw_toolkit.blender.bundle import infer_machine_variant_profile
+        from hfw_toolkit.shaders.titan_dxil import extract_titan_hull_spec, is_titan_layered_material
+        from hfw_toolkit.shaders.unreal_export import generate_ue5_machine_script
+
+        horus_vprof = infer_machine_variant_profile("Titan", "Horus")
+        assert horus_vprof["eye_color"][0] > 0.9 and horus_vprof["eye_color"][2] < 0.05, horus_vprof
+
+        # All 250+ hull materials on Boss v0 are recognized & parsed via DXIL; zero misnamed StarMoss_clr!
+        titan_boss_mats = [m for m in h_asm.materials.values() if is_titan_layered_material(m)]
+        assert len(titan_boss_mats) >= 240, f"Expected >=240 Titan layered hull materials, got {len(titan_boss_mats)}"
+        assert not any(m.name.lower() == "starmoss_clr" for m in h_asm.materials.values()), "No Horus material should be misnamed StarMoss_clr"
+        sample_spec = extract_titan_hull_spec(game, titan_boss_mats[0])
+        assert sample_spec is not None and sample_spec["dxil_parsed"] is True
+        assert len(sample_spec["corners"]) == 8
+        assert sample_spec["corners"][0]["color_lut_idx"] in (4, 5, 1)  # Faro dark gunmetal charcoal / climbing grip
+
+        # Drill Tentacles bundle exports titan_layered slices on disk, molten Drill_03 heat glow, and valid UE5 Python!
+        hd_mats = hd_manifest["materials"]
+        assert all(m.get("titan_layered") for m in hd_mats.values())
+        assert all((m["titan_layered"] or {}).get("dxil_parsed") for m in hd_mats.values())
+        assert any(((m["titan_layered"] or {}).get("heat_glow_default", 0.0) or 0.0) > 0.5 for m in hd_mats.values())
+        assert (hd_dir / "textures" / "HFW_Titan_CleanCLR_s11.png").is_file()
+        assert (hd_dir / "textures" / "HFW_Titan_DmgCLR_s11.png").is_file()
+        ue_src = generate_ue5_machine_script(hd_manifest, hd_dir)
+        ast.parse(ue_src)
+    finally:
+        cat.close()
+        game.close()
+
+

@@ -661,6 +661,9 @@ def generate_ue5_machine_script(
             "emissive_overlay": mmeta.get("emissive_overlay"),
             "surface_profile": mmeta.get("surface_profile", "pbr"),
             "outfit_layered": mmeta.get("outfit_layered"),
+            "titan_layered": mmeta.get("titan_layered"),
+            "uses_foliage_lut": bool(mmeta.get("uses_foliage_lut", False)),
+            "foliage_tint_linear": mmeta.get("foliage_tint_linear"),
             "uses_skin_lut": bool(mmeta.get("uses_skin_lut", False)),
             "skin_tone_linear": mmeta.get("skin_tone_linear"),
             "uses_hair_lut": bool(mmeta.get("uses_hair_lut", False)),
@@ -1286,6 +1289,231 @@ def build_single_material(slot_name: str, meta: dict):
         return mat
 
     # ------------------------------------------------------------------
+    # HFW DXIL HORUS / FAS-BOR7 TITAN 26-TB GROUP-132 LAYERED HULL SHADER
+    # ------------------------------------------------------------------
+    titan = meta.get("titan_layered")
+    if titan and titan.get("corners"):
+        corners = titan["corners"][:8]
+        dom_c = int(titan.get("dominant_corner", 0))
+        act_ids = [int(c["corner"]) for c in corners if c.get("active")] or [dom_c]
+
+        nmt_tex = import_texture(titan.get("macro_nmt_file", ""), is_srgb=False, is_normal=False)
+        msk_tex = import_texture(titan.get("macro_msk_file", ""), is_srgb=False, is_normal=False)
+        misc_tex = import_texture(titan.get("macro_misc_file", ""), is_srgb=False, is_normal=False)
+        t_mn = _tex_node(mat, "TitanMacroNMT_AO_CRV", nmt_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1720, 1820) if nmt_tex else None
+        t_mk = _tex_node(mat, "TitanMacroMSK", msk_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1720, -1060) if msk_tex else None
+        t_ms = _tex_node(mat, "TitanMacroMISC", misc_tex, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1720, 1460) if misc_tex else None
+
+        uv_cache = {{}}
+        pair_cache = {{}}
+        tex_node_cache = {{}}
+
+        def _t_uv(sc: float):
+            k = round(float(sc), 2)
+            if k not in uv_cache:
+                u = _mk(mat, unreal.MaterialExpressionTextureCoordinate, -2100, -480 + len(uv_cache) * 120)
+                u.set_editor_property("u_tiling", k)
+                u.set_editor_property("v_tiling", k)
+                uv_cache[k] = u
+            return uv_cache[k]
+
+        def _t_sample(fname: str, sc: float, pname: str, y: int):
+            if not fname:
+                return None
+            k = (fname, round(float(sc), 2))
+            if k not in tex_node_cache:
+                tx = import_texture(fname, is_srgb=False, is_normal=False)
+                if not tx:
+                    tex_node_cache[k] = None
+                    return None
+                tn = _tex_node(mat, pname, tx, unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, -1820, y)
+                mel.connect_material_expressions(_t_uv(sc), "", tn, "UVs")
+                tex_node_cache[k] = tn
+            return tex_node_cache[k]
+
+        def _t_lerp(a, b, alpha_n, alpha_pin: str, x: int, y: int):
+            if alpha_n is None or a == b:
+                return a
+            n = _mk(mat, unreal.MaterialExpressionLinearInterpolate, x, y)
+            mel.connect_material_expressions(a[0], a[1], n, "A")
+            mel.connect_material_expressions(b[0], b[1], n, "B")
+            mel.connect_material_expressions(alpha_n, alpha_pin, n, "Alpha")
+            return (n, "")
+
+        c_map = {{}}
+        for slot_i, ci in enumerate(act_ids):
+            cinfo = corners[ci]
+            si = int(cinfo.get("slice_idx", 11))
+            ts = float(cinfo.get("tile_scale", 16.0))
+            yb = -640 + slot_i * 360
+            pk = (si, round(ts, 2))
+            if pk not in pair_cache:
+                cc = _t_sample(cinfo.get("clean_clr_file", ""), ts, f"TitanCleanCLR_s{{si:02d}}", yb)
+                dc = _t_sample(cinfo.get("dmg_clr_file", ""), ts, f"TitanDmgCLR_s{{si:02d}}", yb + 120)
+                cr = _t_sample(cinfo.get("clean_rfl_file", ""), ts, f"TitanCleanRFL_s{{si:02d}}", yb + 240)
+                dr = _t_sample(cinfo.get("dmg_rfl_file", ""), ts, f"TitanDmgRFL_s{{si:02d}}", yb + 340)
+                cn = _t_sample(cinfo.get("clean_nmt_file", ""), ts, f"TitanCleanNMT_s{{si:02d}}", yb + 440)
+                dn = _t_sample(cinfo.get("dmg_nmt_file", ""), ts, f"TitanDmgNMT_s{{si:02d}}", yb + 540)
+
+                if cc and dc:
+                    raw_c = _t_lerp((cc, "RGB"), (dc, "RGB"), t_ms, "R", -1480, yb)
+                elif cc:
+                    raw_c = (cc, "RGB")
+                else:
+                    raw_c = (_vec(mat, f"TitanFallback_s{{si:02d}}", [0.5, 0.5, 0.5], -1480, yb), "")
+
+                if cr and dr:
+                    rfl_e = _t_lerp((cr, "R"), (dr, "R"), t_ms, "R", -1480, yb + 240)
+                    pm_e = _t_lerp((cr, "B"), (dr, "B"), t_ms, "R", -1480, yb + 320)
+                elif cr:
+                    rfl_e, pm_e = (cr, "R"), (cr, "B")
+                else:
+                    rfl_e, pm_e = (_const(mat, 0.22, -1480, yb + 240), ""), (_const(mat, 1.0, -1480, yb + 320), "")
+
+                if cn and dn:
+                    sm_e = _t_lerp((cn, "B"), (dn, "B"), t_ms, "R", -1480, yb + 440)
+                elif cn:
+                    sm_e = (cn, "B")
+                else:
+                    sm_e = (_const(mat, 0.45, -1480, yb + 440), "")
+
+                pair_cache[pk] = {{"raw": raw_c, "rfl": rfl_e, "pm": pm_e, "sm": sm_e}}
+
+            pd = pair_cache[pk]
+            plut = cinfo.get("paint_lut_srgb") or [0.502, 0.502, 0.502]
+            l_idx = int(cinfo.get("color_lut_idx", 0))
+            if l_idx == 0:
+                c_col = pd["raw"]
+            else:
+                v_l = _vec(mat, f"TitanC{{ci}}_PaintLUT_{{l_idx}}", [c * 2.0 for c in plut[:3]], -1320, yb - 40)
+                m_l = _mk(mat, unreal.MaterialExpressionMultiply, -1180, yb)
+                mel.connect_material_expressions(pd["raw"][0], pd["raw"][1], m_l, "A")
+                mel.connect_material_expressions(v_l, "", m_l, "B")
+                c_col = _t_lerp(pd["raw"], (m_l, ""), pd["pm"][0], pd["pm"][1], -1020, yb)
+            c_map[ci] = {{"col": c_col, "rfl": pd["rfl"], "sm": pd["sm"]}}
+
+        dom_e = c_map.get(dom_c) or next(iter(c_map.values()))
+        c8 = [c_map.get(i, dom_e) for i in range(8)]
+        if t_mk and len(act_ids) > 1:
+            def _t_tri(arr, y0: int):
+                c00 = _t_lerp(arr[0], arr[1], t_mk, "R", -780, y0)
+                c10 = _t_lerp(arr[2], arr[6], t_mk, "R", -780, y0 + 110)
+                c01 = _t_lerp(arr[3], arr[5], t_mk, "R", -780, y0 + 220)
+                c11 = _t_lerp(arr[4], arr[7], t_mk, "R", -780, y0 + 330)
+                cb0 = _t_lerp(c00, c10, t_mk, "G", -580, y0 + 55)
+                cb1 = _t_lerp(c01, c11, t_mk, "G", -580, y0 + 275)
+                return _t_lerp(cb0, cb1, t_mk, "B", -380, y0 + 165)
+            srgb_e = _t_tri([d["col"] for d in c8], -480)
+            rfl_e = _t_tri([d["rfl"] for d in c8], 240)
+            sm_e = _t_tri([d["sm"] for d in c8], 820)
+        else:
+            srgb_e, rfl_e, sm_e = dom_e["col"], dom_e["rfl"], dom_e["sm"]
+
+        # Corroded Rust Layer (64:0/64:3, BEFORE pow 2.2 — tightened so dark Faro gunmetal dominates!)
+        rc_n = _t_sample(titan.get("rust_clr_file", ""), 24.0, "TitanRustCLR", -960)
+        if rc_n and t_ms:
+            rlut = titan.get("rust_lut_srgb") or [0.435, 0.248, 0.172]
+            v_rl = _vec(mat, "TitanRustLUT", [rlut[0] * 1.45, rlut[1] * 1.40, rlut[2] * 1.38], -960, -1040)
+            m_rc = _mk(mat, unreal.MaterialExpressionMultiply, -760, -960)
+            mel.connect_material_expressions(rc_n, "RGB", m_rc, "A")
+            mel.connect_material_expressions(v_rl, "", m_rc, "B")
+            n_rm_b = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -560, -760)
+            n_rm_b.set_editor_property("bias", -0.36)
+            n_rm_b.set_editor_property("scale", 1.24)
+            mel.connect_material_expressions(t_ms, "G", n_rm_b, "")
+            n_rm_s = _mk(mat, unreal.MaterialExpressionSaturate, -400, -760)
+            mel.connect_material_expressions(n_rm_b, "", n_rm_s, "")
+            n_rm_m = _mk(mat, unreal.MaterialExpressionMultiply, -280, -760)
+            n_rm_m.set_editor_property("const_b", 0.65)
+            mel.connect_material_expressions(n_rm_s, "", n_rm_m, "A")
+            srgb_e = _t_lerp(srgb_e, (m_rc, ""), n_rm_m, "", -140, -420)
+            rfl_e = _t_lerp(rfl_e, (_const(mat, 0.16, -340, 220), ""), n_rm_m, "", -140, 260)
+            sm_e = _t_lerp(sm_e, (_const(mat, 0.16, -340, 820), ""), n_rm_m, "", -140, 820)
+
+        # Exact DXIL pow(rgb, 2.2) -> Linear PBR!
+        n_gam = _mk(mat, unreal.MaterialExpressionPower, -20, -420)
+        n_gam.set_editor_property("const_exponent", 2.2)
+        mel.connect_material_expressions(srgb_e[0], srgb_e[1], n_gam, "Base")
+        lin_e = (n_gam, "")
+
+        # Baked 4K AO + Normal
+        if t_mn:
+            n_ao_m = _mk(mat, unreal.MaterialExpressionMultiply, 140, -380)
+            mel.connect_material_expressions(lin_e[0], lin_e[1], n_ao_m, "A")
+            mel.connect_material_expressions(t_mn, "B", n_ao_m, "B")
+            lin_e = (n_ao_m, "")
+            mel.connect_material_property(t_mn, "B", unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
+            n_mnrm = _reconstruct_normal_z(mat, t_mn, "R", t_mn, "G", -420, 1820)
+            mel.connect_material_property(n_mnrm, "", unreal.MaterialProperty.MP_NORMAL)
+
+        # World-Up StarMoss Overgrowth (AFTER pow 2.2 — top surfaces only!)
+        m_str = float(titan.get("moss_strength", 0.0))
+        mc_n = _t_sample(titan.get("moss_clr_file", ""), 18.0, "TitanStarMossCLR", -1240) if m_str > 0.01 else None
+        if mc_n:
+            mlut = titan.get("moss_lut_srgb") or [0.255, 0.355, 0.078]
+            v_ml = _vec(mat, "TitanMossLUT", [mlut[0] * 2.1, mlut[1] * 2.2, mlut[2] * 1.9], -780, -1320)
+            m_mc = _mk(mat, unreal.MaterialExpressionMultiply, -580, -1240)
+            mel.connect_material_expressions(mc_n, "RGB", m_mc, "A")
+            mel.connect_material_expressions(v_ml, "", m_mc, "B")
+            n_mg = _mk(mat, unreal.MaterialExpressionPower, -400, -1240)
+            n_mg.set_editor_property("const_exponent", 2.2)
+            mel.connect_material_expressions(m_mc, "", n_mg, "Base")
+
+            n_wn = _mk(mat, unreal.MaterialExpressionVertexNormalWS, -780, -1480)
+            n_wz = _mk(mat, unreal.MaterialExpressionComponentMask, -580, -1480)
+            n_wz.set_editor_property("r", False); n_wz.set_editor_property("g", False); n_wz.set_editor_property("b", True)
+            mel.connect_material_expressions(n_wn, "", n_wz, "")
+            n_wb = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -420, -1480)
+            n_wb.set_editor_property("bias", -0.45)
+            n_wb.set_editor_property("scale", 2.2 * m_str)
+            mel.connect_material_expressions(n_wz, "", n_wb, "")
+            n_ws = _mk(mat, unreal.MaterialExpressionSaturate, -240, -1480)
+            mel.connect_material_expressions(n_wb, "", n_ws, "")
+            lin_e = _t_lerp(lin_e, (n_mg, ""), n_ws, "", 320, -420)
+            rfl_e = _t_lerp(rfl_e, (_const(mat, 0.12, 120, 220), ""), n_ws, "", 280, 260)
+            sm_e = _t_lerp(sm_e, (_const(mat, 0.12, 120, 820), ""), n_ws, "", 280, 820)
+
+        # Decima RFL -> UE5 Metallic & F0 = RFL^2 + Smoothness -> Roughness
+        n_rb = _mk(mat, unreal.MaterialExpressionConstantBiasScale, 460, 260)
+        n_rb.set_editor_property("bias", -0.32)
+        n_rb.set_editor_property("scale", 3.846154)
+        mel.connect_material_expressions(rfl_e[0], rfl_e[1], n_rb, "")
+        n_met = _mk(mat, unreal.MaterialExpressionSaturate, 640, 260)
+        mel.connect_material_expressions(n_rb, "", n_met, "")
+        mel.connect_material_property(n_met, "", unreal.MaterialProperty.MP_METALLIC)
+
+        n_f0 = _mk(mat, unreal.MaterialExpressionMultiply, 460, 80)
+        mel.connect_material_expressions(rfl_e[0], rfl_e[1], n_f0, "A")
+        mel.connect_material_expressions(rfl_e[0], rfl_e[1], n_f0, "B")
+        n_bc = _t_lerp(lin_e, (n_f0, ""), n_met, "", 640, -240)
+        mel.connect_material_property(n_bc[0], n_bc[1], unreal.MaterialProperty.MP_BASE_COLOR)
+
+        n_rgh = _mk(mat, unreal.MaterialExpressionOneMinus, 520, 820)
+        mel.connect_material_expressions(sm_e[0], sm_e[1], n_rgh, "")
+        mel.connect_material_property(n_rgh, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+        # Optional DXIL Heat-Sink / Drill Weakspot Molten Crevice Glow
+        h_def = float(titan.get("heat_glow_default", 0.0))
+        if h_def > 0.01 and t_mn:
+            n_iao = _mk(mat, unreal.MaterialExpressionOneMinus, 180, 1220)
+            mel.connect_material_expressions(t_mn, "B", n_iao, "")
+            n_hp = _mk(mat, unreal.MaterialExpressionPower, 340, 1220)
+            n_hp.set_editor_property("const_exponent", 3.2)
+            mel.connect_material_expressions(n_iao, "", n_hp, "Base")
+            n_hc = _mpc_param(mat, "MuscleColor", lambda: _vec(mat, "HeatColor", [1.0, 0.20, 0.008], 180, 1040), 180, 1040)
+            n_hs = _mk(mat, unreal.MaterialExpressionMultiply, 500, 1220)
+            n_hs.set_editor_property("const_b", h_def * 9.0)
+            mel.connect_material_expressions(n_hp, "", n_hs, "A")
+            n_he = _mk(mat, unreal.MaterialExpressionMultiply, 660, 1140)
+            mel.connect_material_expressions(n_hc, "", n_he, "A")
+            mel.connect_material_expressions(n_hs, "", n_he, "B")
+            mel.connect_material_property(n_he, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+        mel.recompile_material(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+        return mat
+
+    # ------------------------------------------------------------------
     # SPECIALIZED ANIMATED SHADERS (Muscles, Cores, Eyes, Canisters, VFX)
     # ------------------------------------------------------------------
     if spec:
@@ -1654,8 +1882,20 @@ def build_single_material(slot_name: str, meta: dict):
         mel.connect_material_expressions(_vec(mat, "RockWeathering", c_dust, -440, -40), "", n_rk_l2, "B")
         mel.connect_material_expressions(n_gmul, "", n_rk_l2, "Alpha")
         base_color_expr = (n_rk_l2, "")
+    elif sprof == "foliage" and meta.get("uses_foliage_lut") and base_color_expr is not None:
+        ft_lin = meta.get("foliage_tint_linear") or [0.062, 0.160, 0.018]
+        n_fe = _mk(mat, unreal.MaterialExpressionMultiply, -540, -260)
+        n_fe.set_editor_property("const_b", 4.5948)
+        mel.connect_material_expressions(base_color_expr[0], base_color_expr[1], n_fe, "A")
+        n_ft = _vec(mat, "BiomeFoliageLUT", ft_lin, -540, -400)
+        n_fm = _mk(mat, unreal.MaterialExpressionMultiply, -340, -320)
+        mel.connect_material_expressions(n_fe, "", n_fm, "A")
+        mel.connect_material_expressions(n_ft, "", n_fm, "B")
+        n_fs = _mk(mat, unreal.MaterialExpressionSaturate, -200, -320)
+        mel.connect_material_expressions(n_fm, "", n_fs, "")
+        base_color_expr = (n_fs, "")
 
-    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "snow", "rock_volcanic", "rock_tint")
+    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "bark", "snow", "rock_volcanic", "rock_tint")
     if "Reflectance" in sockets and sprof not in _DIELECTRIC_PROFILES:
         rfl_n, rfl_ch = sockets["Reflectance"]
         n_bias = _mk(mat, unreal.MaterialExpressionConstantBiasScale, -620, 260)

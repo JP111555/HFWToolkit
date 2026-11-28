@@ -79,7 +79,7 @@
 
   // --- Machine Navigator ---
   const FLYER_CODES = new Set(["glider", "swooper", "stormbird", "sunwing", "waterwing", "dreadwing", "bat"]);
-  const HEAVY_CODES = new Set(["slaughterspine", "thunderjaw", "tremortusk", "slitherfang", "tideripper", "shellsnapper", "fireclaw", "frostclaw", "behemoth", "rockbreaker", "bilegut"]);
+  const HEAVY_CODES = new Set(["horus", "titan", "slaughterspine", "thunderjaw", "tremortusk", "slitherfang", "tideripper", "shellsnapper", "fireclaw", "frostclaw", "behemoth", "rockbreaker", "bilegut"]);
   const SAC_CODES = new Set(["bilegut", "tideripper", "frostclaw", "fireclaw", "snapmaw", "bellowback", "widemaw", "spikesnout", "burrower"]);
 
   function renderMachinesList() {
@@ -830,6 +830,7 @@
         body: JSON.stringify({
           machine: currentEntityData.entity_id,
           variant_index: Number($("#m-variant").value || 0),
+          lod_index: Number($("#m-lod") ? $("#m-lod").value : -1),
           unpack_textures: $("#chk-unpack") ? $("#chk-unpack").checked : false,
           pack_textures: $("#chk-pack").checked,
           export_fbx: Boolean(exportFbx),

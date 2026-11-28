@@ -121,6 +121,8 @@ _DETAIL_FORBIDDEN_TOKENS = (
     "_pbd_",
     "_jbd",
     "_fjnt",
+    "_pjnt",
+    "orbital",
     "proc",
     "roll",
     "push",
@@ -182,6 +184,8 @@ def _is_ignored_bone(name: str) -> bool:
         return True
     if "_aim_" in low or low.endswith("_aim") or low.startswith("aim_"):
         return True
+    if "middlearm" in low or "middlemouth" in low:
+        return False
     return any(tok in low for tok in _IGNORE_TOKENS)
 
 
@@ -454,7 +458,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         if len(tchain) >= 2:
             tails.append({"name": f"Tail_{side}" if side != "C" else "Tail", "side": side, "bones": tchain})
 
-    # 5b. Signature Articulated Appendages (Tremortusk Elephant Trunk, Bilegut Extendable Tongue!)
+    # 5b. Signature Articulated Appendages (Tremortusk Trunk, Bilegut Tongue, Horus Colossal Tentacles!)
     appendages: list[dict[str, Any]] = []
     for app_kind, app_tok, app_title in (("trunk", "trunk", "Trunk"), ("tongue", "tongue", "Tongue")):
         acands = [
@@ -477,6 +481,40 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                     "side": "C",
                     "parent_def": parent_map.get(ach[0]),
                     "bones": ach,
+                }
+            )
+
+    # Colossal Horus Tentacles (`L/R_outerTentacle`, `L/R_innerTentacle`, `C_a/b/cTentacle`)
+    for t_side, t_tok, t_title in (
+        ("L", "outertentacle_sjnt", "OuterTentacle_L"),
+        ("R", "outertentacle_sjnt", "OuterTentacle_R"),
+        ("L", "innertentacle_sjnt", "InnerTentacle_L"),
+        ("R", "innertentacle_sjnt", "InnerTentacle_R"),
+        ("C", "c_atentacle_sjnt", "Tentacle_A"),
+        ("C", "c_btentacle_sjnt", "Tentacle_B"),
+        ("C", "c_ctentacle_sjnt", "Tentacle_C"),
+    ):
+        tcands_h = [
+            n
+            for n in names
+            if not n.lower().startswith(("ctrl_", "mch_", "wgt_", "facial_"))
+            and "_fjnt" not in n.lower()
+            and "_pjnt" not in n.lower()
+            and "drill" not in n.lower()
+            and "piston" not in n.lower()
+            and "helper" not in n.lower()
+            and _extract_side(n) == t_side
+            and t_tok in n.lower()
+        ]
+        tchain_h = _longest_parent_chain(tcands_h, parent_map)
+        if len(tchain_h) >= 5:
+            appendages.append(
+                {
+                    "name": t_title,
+                    "kind": "tentacle",
+                    "side": t_side,
+                    "parent_def": parent_map.get(tchain_h[0]),
+                    "bones": tchain_h,
                 }
             )
 
@@ -789,6 +827,49 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 )
 
         wing_used_side = {b for w in wings if w["side"] == side for b in w["bones"]}
+        # Multi-arm colossal machines (Horus: `L/R_frontArm`, `L/R_middleArm`, `L/R_rearArm`)
+        has_horus_multi_arms = (
+            any(not _is_ignored_bone(n) and _extract_side(n) == side and "frontarm" in n.lower() for n in names)
+            and any(not _is_ignored_bone(n) and _extract_side(n) == side and "middlearm" in n.lower() for n in names)
+        )
+        if has_horus_multi_arms:
+            for a_tok, a_lbl in (("frontarm", f"FrontArm_{side}"), ("middlearm", f"MidArm_{side}"), ("reararm", f"RearArm_{side}")):
+                ma_cands = [
+                    n
+                    for n in names
+                    if not _is_ignored_bone(n)
+                    and n not in used_leg_bones
+                    and n not in wing_used_side
+                    and _extract_side(n) == side
+                    and a_tok in n.lower()
+                ]
+                mach = _longest_parent_chain(ma_cands, parent_map)
+                maclean: list[str] = []
+                for b in mach:
+                    if maclean:
+                        p0, p1 = head_map[maclean[-1]], head_map[b]
+                        if math.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2 + (p1[2] - p0[2]) ** 2) < 0.015:
+                            continue
+                    maclean.append(b)
+                if len(maclean) >= 3:
+                    ik_b = maclean[:3] if len(maclean) >= 4 else maclean[:2]
+                    hand_b = maclean[3] if len(maclean) >= 4 else maclean[2]
+                    extra_b = maclean[4:] if len(maclean) > 4 else []
+                    arms.append(
+                        {
+                            "name": a_lbl,
+                            "side": side,
+                            "clavicle": None,
+                            "ik_bones": ik_b,
+                            "hand_bone": hand_b,
+                            "extra_fk_bones": extra_b,
+                            "is_flipper": False,
+                            "full_chain": list(maclean),
+                            "chain_length": len(ik_b),
+                        }
+                    )
+            continue
+
         has_elbow_side = any(
             not _is_ignored_bone(n) and _extract_side(n) == side and "elbow" in n.lower()
             for n in names
@@ -957,7 +1038,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             chest_bone = np0
     if chest_bone is None and not spine_chain:
-        body_jnt = by_lower.get("c_body_0_jnt") or by_lower.get("c_body_sjnt_0")
+        body_jnt = by_lower.get("c_body_0_jnt") or by_lower.get("c_body_sjnt_0") or by_lower.get("c_gyro_sjnt_0")
         if body_jnt and body_jnt != hips_bone:
             chest_bone = body_jnt
 
@@ -1189,6 +1270,8 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         "jawdrill",
         "headdrill",
         "drillbit",
+        "tentacledrill",
+        "sidedrill",
         "_drill_",
         "drill_sjnt",
         "drill_jnt",
@@ -1210,6 +1293,16 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
 
     def _classify_spinner_group(bone_low: str) -> tuple[str, str]:
         """Return `(group_id, human_label)` so every distinct mechanical drill/grinder bank gets its own independent controls!"""
+        if "outertentacledrill" in bone_low:
+            return "outer_tentacle_drills", "Outer Tentacle Drills"
+        if "innertentacledrill" in bone_low:
+            return "inner_tentacle_drills", "Inner Tentacle Drills"
+        if "atentacledrill" in bone_low:
+            return "tentacle_a_drills", "Tentacle A Drills"
+        if "btentacledrill" in bone_low:
+            return "tentacle_b_drills", "Tentacle B Drills"
+        if "ctentacledrill" in bone_low:
+            return "tentacle_c_drills", "Tentacle C Drills"
         if "slotmachine" in bone_low:
             return "drum_grinders", "Drum Grinders"
         if "ballgrinder" in bone_low:
@@ -1241,6 +1334,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         return "rotors", "Rotors"
 
     spinners: list[dict[str, Any]] = []
+    spinner_bones_set: set[str] = set()
     for n in names:
         low = n.lower()
         if n in primary_used or _is_detail_forbidden(n):
@@ -1248,10 +1342,20 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         if any(ex in low for ex in _SPINNER_EXCL):
             continue
         if any(kw in low for kw in _SPINNER_KEYWORDS):
+            # Avoid duplicating consecutive child bones inside a 3-bone drill rod (`Drill_sjnt_0 -> _1 -> _2`),
+            # while still keeping distinct branching sub-drills (e.g. Horus `SideDrillA/B/C` branching off `TentacleDrill`)!
+            par_b = parent_map.get(n)
+            if par_b in spinner_bones_set:
+                cur_base = re.sub(r"_?s?jnt_?\d*$", "", low)
+                par_base = re.sub(r"_?s?jnt_?\d*$", "", par_b.lower())
+                if cur_base == par_base:
+                    primary_used.add(n)
+                    spinner_bones_set.add(n)
+                    continue
             side = _extract_side(n)
             stem = re.sub(r"^[LlRrCc]_", "", n)
             stem = re.sub(r"_?s?jnt_?\d*$", "", stem, flags=re.IGNORECASE)
-            stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:18] or "Spin"
+            stem = re.sub(r"[^A-Za-z0-9]+", "", stem)[:20] or "Spin"
             kind = (
                 "grinder"
                 if "grinder" in low
@@ -1270,6 +1374,7 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             )
             primary_used.add(n)
+            spinner_bones_set.add(n)
 
     # 8d. Categorized Machine Secondary Controls
     _FRILL_KEYWORDS = (
@@ -1461,7 +1566,11 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
         wing_span = math.sqrt(sum((p_wl[ax] - p_wr[ax]) ** 2 for ax in range(3)))
     is_true_flyer = bool(wings) and (wing_span >= rig_height * 0.85 or any(len(w["bones"]) >= 4 for w in wings) or len(legs) == 0)
 
-    if len(legs) >= 6:
+    is_titan = any(a.get("kind") == "tentacle" for a in appendages) or (len(legs) >= 4 and len(arms) >= 4)
+
+    if is_titan:
+        archetype = "titan"
+    elif len(legs) >= 6:
         archetype = "hexapod"
     elif is_true_aquatic:
         archetype = "aquatic"
@@ -1535,26 +1644,28 @@ def analyze_rig_chains(joint_specs: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         for tinfo in tails:
             if len(tinfo["bones"]) >= 7:
+                is_titan_tail = archetype == "titan"
                 spline_chains.append(
                     {
                         "name": tinfo["name"],
                         "kind": "tail",
                         "group_prop": "hfw_rig_tail",
                         "bones": list(tinfo["bones"]),
-                        "default_on": False,
+                        "default_on": is_titan_tail,
                         "knots": min(6, max(4, len(tinfo["bones"]) // 3 + 1)),
                     }
                 )
         for app in appendages:
             if len(app["bones"]) >= 7:
+                is_tent = app.get("kind") == "tentacle"
                 spline_chains.append(
                     {
                         "name": app["name"],
                         "kind": "appendage",
                         "group_prop": "hfw_rig_tail",
                         "bones": list(app["bones"]),
-                        "default_on": False,
-                        "knots": min(6, max(4, len(app["bones"]) // 3 + 1)),
+                        "default_on": is_tent,
+                        "knots": min(8, max(5, len(app["bones"]) // 7 + 1)) if is_tent else min(6, max(4, len(app["bones"]) // 3 + 1)),
                     }
                 )
 
@@ -2296,8 +2407,11 @@ def compute_dynamic_collection_labels(
     tail_lbl = "Tails FK" if len(tails) > 1 else "Tail FK"
     apps = spec.get("appendages") or []
     if apps:
-        app_names = list(dict.fromkeys(str(a.get("name", "Appendage")) for a in apps))
-        app_lbl = " & ".join(app_names[:2]) + " FK"
+        if any(a.get("kind") == "tentacle" for a in apps):
+            app_lbl = "Tentacles FK"
+        else:
+            app_names = list(dict.fromkeys(str(a.get("name", "Appendage")) for a in apps))
+            app_lbl = " & ".join(app_names[:2]) + " FK"
     else:
         app_lbl = "Appendage FK"
     wings_ik_lbl = "Wings IK"
@@ -2443,11 +2557,14 @@ def compute_dynamic_collection_labels(
     spline_chains = spec.get("spline_chains") or []
     if spline_chains:
         sk0 = spline_chains[0].get("kind")
-        spline_ik_lbl = (
-            "Serpent Spline IK"
-            if sk0 in ("spine", "serpent_full")
-            else ("Trunk Spline IK" if sk0 == "appendage" else "Tail Spline IK")
-        )
+        if arch == "titan":
+            spline_ik_lbl = "Tentacle Spline IK"
+        else:
+            spline_ik_lbl = (
+                "Serpent Spline IK"
+                if sk0 in ("spine", "serpent_full")
+                else ("Trunk Spline IK" if sk0 == "appendage" else "Tail Spline IK")
+            )
     else:
         spline_ik_lbl = "Spline IK"
 
@@ -2899,6 +3016,11 @@ def build_control_rig(
                         "bone": pb_nm,
                     }
                 )
+
+    # Colossal multi-hundred-plate assemblies (Horus: 1,800+ static hull segments) keep hull plates
+    # parented cleanly to DEF bones without spawning 1,800 redundant per-panel CTRL_Plate_* handles!
+    if len(visible_helper_meshes) > 120:
+        visible_helper_meshes.clear()
 
     all_spinners = list(spec.get("spinners") or []) + helper_spinners
 

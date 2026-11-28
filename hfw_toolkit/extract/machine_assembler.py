@@ -59,6 +59,7 @@ class MachineVariantOption:
     smr_id: str | None = None
     official_name: str = ""
     official_description: str = ""
+    entity_id: str = ""  # Optional alternate EntityResource override (e.g. Horus Clean Hull / Drill Tentacles)
 
 
 @dataclass(slots=True)
@@ -480,11 +481,72 @@ def _dr_matches_skeleton(
     return True
 
 
+def _discover_horus_variants(
+    game: HFWGame,
+    entity_oid: ObjectId,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[MachineVariantOption]] | None:
+    """Resolve Burning Shores FAS-BOR7 Horus (Titan) master boss entity and its 3 authentic variants."""
+    if str(entity_oid) not in ("14110:7066", "68784:265", "23470:744"):
+        return None
+    ce = game.read_object(entity_oid, read_subgroups=True)
+    comps = [game.resolve_ref(r) for r in ce.get("EntityComponentResources", ())]
+    direct_smr = next((c for c in comps if c and c["_type"] == "SkinnedModelResource"), None)
+
+    cr_name, cr_desc, _ = _extract_collectable_robot_info(game, 1624)
+    if not cr_name:
+        cr_name = "Horus"
+    if not cr_desc:
+        cr_desc = (
+            "The ultimate weapon of destruction from the Old World. Capable of devastating attacks "
+            "and machine production, though its ancient systems are prone to overheating."
+        )
+
+    candidates = [
+        ("14110:7066", 14110, "14110:1000", "1624:64", 1864, "Horus — Complete Boss (1,229 joints, 1,864 hull parts + 102 turrets & heat sinks)"),
+        ("68784:265", 68784, "", "68784:11", 1812, "Horus — Clean Hull / Cinematic (1,229 joints, 1,812 hull parts)"),
+        ("23470:744", 23470, "23470:402", "23470:239", 258, "Horus — Drill Tentacles Boss Phase (254 joints, 258 parts + 18 drills)"),
+    ]
+    # If the user explicitly queried one of the alternate Horus entities directly, place it first
+    if str(entity_oid) != "14110:7066":
+        candidates.sort(key=lambda c: 0 if c[0] == str(entity_oid) else 1)
+
+    variants: list[MachineVariantOption] = []
+    for ent_s, gid, dr_s, smr_s, pcnt, lbl in candidates:
+        try:
+            smr_oid = ObjectId.parse(smr_s)
+            game.graph.group(smr_oid.group_id)
+        except Exception:
+            continue
+        variants.append(
+            MachineVariantOption(
+                variant_index=len(variants),
+                label=lbl,
+                destructibility_id=dr_s,
+                group_id=gid,
+                part_count=pcnt,
+                smr_id=smr_s,
+                official_name=cr_name,
+                official_description=cr_desc,
+                entity_id=ent_s,
+            )
+        )
+
+    if not variants:
+        return None
+    if direct_smr is None and variants[0].smr_id:
+        direct_smr = game.read_object(ObjectId.parse(variants[0].smr_id), read_subgroups=True)
+    return ce, direct_smr, variants
+
+
 def discover_machine_variants(
     game: HFWGame,
     entity_oid: ObjectId,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, list[MachineVariantOption]]:
-    """Locate a machine's `ControlledEntityResource`, its `SkinnedModelResource`, and all associated `DestructibilityResource` variants."""
+    """Locate a machine's `ControlledEntityResource` (or Horus `EntityResource`), its `SkinnedModelResource`, and all associated variants."""
+    horus_res = _discover_horus_variants(game, entity_oid)
+    if horus_res is not None:
+        return horus_res
+
     ce = game.read_object(entity_oid, read_subgroups=True)
     comps = [game.resolve_ref(r) for r in ce.get("EntityComponentResources", ())]
     direct_smr = next((c for c in comps if c and c["_type"] == "SkinnedModelResource"), None)
@@ -1042,6 +1104,9 @@ def assemble_machine(
     if variants:
         vidx = max(0, min(variant_index, len(variants) - 1))
         selected_variant = variants[vidx]
+        if selected_variant.entity_id and selected_variant.entity_id != str(entity_oid):
+            entity_oid = ObjectId.parse(selected_variant.entity_id)
+            ce = game.read_object(entity_oid, read_subgroups=True)
         if selected_variant.smr_id:
             smr = game.read_object(ObjectId.parse(selected_variant.smr_id), read_subgroups=True)
 
@@ -1052,7 +1117,7 @@ def assemble_machine(
     if skel_obj is None:
         raise ValueError(f"SkinnedModelResource {smr['_id']} has no Skeleton")
 
-    # Gather ALL SkeletonHelpers from SMR + Skeleton group + CE group + selected variant group & its helper subgroups
+    # Gather ALL SkeletonHelpers from SMR + Skeleton group + CE group + selected variant group & 1-hop helper subgroups!
     helper_objs: list[dict[str, Any]] = []
     for href in smr.get("Helpers", ()):
         h = game.resolve_ref(href)
@@ -1061,12 +1126,16 @@ def assemble_machine(
 
     skeleton = extract_skeleton(game, skel_obj, helper_objs)
 
-    helper_gids: set[int] = {entity_oid.group_id, smr["_id"].group_id, skel_obj["_id"].group_id}
+    helper_seed_gids: set[int] = {entity_oid.group_id, smr["_id"].group_id, skel_obj["_id"].group_id}
     if selected_variant is not None:
-        selected_dr = game.read_object(ObjectId.parse(selected_variant.destructibility_id), read_subgroups=True)
-        helper_gids.add(selected_variant.group_id)
-        for sg in game.graph.group_subgroups(selected_variant.group_id):
-            if sg not in (1, 2, 3) and "SkeletonHelpers" in game.graph.group_types(sg):
+        if selected_variant.destructibility_id:
+            selected_dr = game.read_object(ObjectId.parse(selected_variant.destructibility_id), read_subgroups=True)
+        helper_seed_gids.add(selected_variant.group_id)
+
+    helper_gids: set[int] = set(helper_seed_gids)
+    for seed_g in list(helper_seed_gids):
+        for sg in game.graph.group_subgroups(seed_g):
+            if sg > 20 and "SkeletonHelpers" in game.graph.group_types(sg) and game.graph.group(sg).num_objects < 15_000:
                 helper_gids.add(sg)
 
     for hgid in helper_gids:
@@ -1199,6 +1268,17 @@ def assemble_machine(
     seen_mesh_attach_keys: set[tuple[str, str | None, int | None, int]] = set()
     used_material_ids: set[str] = set()
     material_objs: dict[str, dict[str, Any]] = {}
+    decoded_mesh_cache: dict[str, list[DecodedMesh]] = {}
+    aligned_mesh_obj_ids: set[int] = set()
+
+    def _decode_cached(mesh_root: dict[str, Any]) -> list[DecodedMesh]:
+        mrid = str(mesh_root.get("_id", ""))
+        if mrid and mrid in decoded_mesh_cache:
+            return decoded_mesh_cache[mrid]
+        res = decode_mesh_hierarchy(game, mesh_root, lod_index=lod_index)
+        if mrid:
+            decoded_mesh_cache[mrid] = res
+        return res
 
     def _register_materials(dm: DecodedMesh) -> None:
         for p in dm.primitives:
@@ -1211,8 +1291,9 @@ def assemble_machine(
 
     def _align_skinned_bone_indices(dm: DecodedMesh) -> None:
         """Align a skinned mesh's bone indices to `skeleton` if the mesh references a different Skeleton object."""
-        if not dm.is_skinned or not dm.skeleton_joint_names:
+        if not dm.is_skinned or not dm.skeleton_joint_names or id(dm) in aligned_mesh_obj_ids:
             return
+        aligned_mesh_obj_ids.add(id(dm))
         if dm.skeleton_id == skeleton.object_id and len(dm.skeleton_joint_names) == len(skeleton.joints):
             return
         # Check if 1:1 identity already holds by UUID/name
@@ -1267,7 +1348,7 @@ def assemble_machine(
         )
         parent_jname = skeleton.joints[parent_jidx].name if (parent_jidx is not None and 0 <= parent_jidx < len(skeleton.joints)) else None
 
-        decoded_meshes = decode_mesh_hierarchy(game, mesh_root, lod_index=lod_index)
+        decoded_meshes = _decode_cached(mesh_root)
         for dm_i, dm in enumerate(decoded_meshes):
             # Deduplicate identical (mesh_id, helper/joint, state) across SMR + DestructibilityResource
             dedup_key = (dm.object_id, helper_name or parent_jname, parent_jidx, state_index)
@@ -1332,13 +1413,14 @@ def assemble_machine(
     if selected_variant is not None:
         cr_name, cr_desc, tag_to_catalog_part = _extract_collectable_robot_info(game, selected_variant.group_id)
     if not tag_to_catalog_part:
-        ce_cr_name, ce_cr_desc, ce_tags = _extract_collectable_robot_info(game, entity_oid.group_id)
-        if ce_tags:
-            tag_to_catalog_part = ce_tags
-        if not cr_name:
-            cr_name = ce_cr_name
-        if not cr_desc:
-            cr_desc = ce_cr_desc
+        for fallback_gid in (entity_oid.group_id, smr["_id"].group_id):
+            ce_cr_name, ce_cr_desc, ce_tags = _extract_collectable_robot_info(game, fallback_gid)
+            if ce_tags and not tag_to_catalog_part:
+                tag_to_catalog_part = ce_tags
+            if ce_cr_name and not cr_name:
+                cr_name = ce_cr_name
+            if ce_cr_desc and not cr_desc:
+                cr_desc = ce_cr_desc
 
     # Step 1: Assemble all parts from the selected DestructibilityResource (gives full intact plates + broken states!)
     if selected_dr is not None:
@@ -1463,7 +1545,7 @@ def assemble_machine(
             enabled_default: bool,
             state_index: int,
         ) -> None:
-            decoded_list = decode_mesh_hierarchy(game, mesh_root, lod_index=lod_index)
+            decoded_list = _decode_cached(mesh_root)
             for dm_i, dm in enumerate(decoded_list):
                 ckey = (dm.object_id, state_index)
                 if ckey in child_seen:
@@ -1600,6 +1682,104 @@ def assemble_machine(
                     child_idx_counter += 1
             except Exception:
                 pass
+
+    # Step 2c: Recover dynamic intact skinned PBR parts wired via `NodeGraphObjectVariableOverride`!
+    # In HFW, Dreadwing's 3 flexible wing membranes (`2380:8289` Left Wing, `2380:3437` Right Wing,
+    # `2380:5769` Tail Wing, using `Bat_wings_CLR`) are swapped dynamically through its NodeGraph
+    # rather than listed in `SMR.ModelPartResources` or `DR.ConvertedParts`.
+    # Filter strictly to intact skinned PBR meshes (rejecting VFX shells and `_des_`/`destroyed` damage swaps!).
+    ngvo_gids: list[int] = [entity_oid.group_id]
+    if selected_variant is not None and selected_variant.group_id not in ngvo_gids:
+        ngvo_gids.append(selected_variant.group_id)
+    already_have_mids: set[str] = {p.mesh.object_id for p in parts}
+    seen_ngvo_mprs: set[str] = set()
+    for ng_gid in ngvo_gids:
+        if "NodeGraphObjectVariableOverride" not in game.graph.group_types(ng_gid):
+            continue
+        if game.graph.group(ng_gid).num_objects > 15_000:
+            continue
+        try:
+            ng_objs = game.read_group(ng_gid, read_subgroups=True)
+        except Exception:
+            continue
+        for o in ng_objs:
+            if o.get("_type") != "NodeGraphObjectVariableOverride":
+                continue
+            tgt = game.resolve_ref(o.get("Object"))
+            if not tgt or tgt.get("_type") != "ModelPartResource":
+                continue
+            mpr_id_s = str(tgt.get("_id", ""))
+            if not mpr_id_s or mpr_id_s in seen_ngvo_mprs:
+                continue
+            seen_ngvo_mprs.add(mpr_id_s)
+            mroot = game.resolve_ref(tgt.get("MeshResource"))
+            if mroot is None:
+                continue
+            dms = _decode_cached(mroot)
+            for dm_i, dm in enumerate(dms):
+                if not dm.is_skinned or dm.object_id in already_have_mids:
+                    continue
+                # Verify intact PBR material (must have Color/Normal/Surface_RMA and NOT be a damaged/destroyed mesh!)
+                p_mids = [pr.material_id for pr in dm.primitives if pr.material_id]
+                if not p_mids:
+                    continue
+                is_intact_pbr = False
+                is_damaged = False
+                mat_label_hint = ""
+                for mid in p_mids:
+                    try:
+                        mobj = material_objs.get(mid) or game.read_object(ObjectId.parse(mid), read_subgroups=True)
+                        mi_chk = parse_material(game, mobj)
+                    except Exception:
+                        continue
+                    mn_low = mi_chk.name.lower()
+                    if any(tok in mn_low for tok in ("_des_", "_dmg_", "destroyed", "_broken")):
+                        is_damaged = True
+                        break
+                    if any(r in mi_chk.roles for r in ("Color", "Normal", "Surface_RMA")):
+                        is_intact_pbr = True
+                        if not mat_label_hint:
+                            mat_label_hint = mi_chk.name
+                if is_damaged or not is_intact_pbr:
+                    continue
+
+                already_have_mids.add(dm.object_id)
+                _align_skinned_bone_indices(dm)
+                _register_materials(dm)
+
+                # Assign clean human-readable name (e.g. Wing_Membrane_L / Wing_Membrane_R / Wing_Membrane_Tail)
+                clean_nm = f"DynamicPart_{dm.object_id.replace(':', '_')}"
+                if "wing" in mat_label_hint.lower():
+                    all_pos = np.concatenate([pr.positions for pr in dm.primitives if len(pr.positions)], axis=0)
+                    cx = float(all_pos[:, 0].mean()) if len(all_pos) else 0.0
+                    if cx < -1.0:
+                        clean_nm = "Wing_Membrane_L"
+                    elif cx > 1.0:
+                        clean_nm = "Wing_Membrane_R"
+                    else:
+                        clean_nm = "Wing_Membrane_Tail"
+                elif mat_label_hint:
+                    clean_nm = f"{mat_label_hint}_{dm.object_id.replace(':', '_')}"
+                if len(dms) > 1:
+                    clean_nm = f"{clean_nm}_{dm_i}"
+
+                parts.append(
+                    AssembledPart(
+                        part_id=f"{mpr_id_s}_{dm_i}_ngvo",
+                        name=clean_nm,
+                        collection="Body",
+                        source_kind="NodeGraphPart",
+                        is_skinned=True,
+                        parent_joint_index=None,
+                        parent_joint_name=None,
+                        helper_name=None,
+                        local_offset_matrix=np.eye(4, dtype=np.float64),
+                        world_matrix=np.eye(4, dtype=np.float64),
+                        mesh=dm,
+                        enabled_by_default=True,
+                        state_index=0,
+                    )
+                )
 
     # Step 3: Parse all referenced materials AND apply Decima Variant/Apex RenderEffectShaderOverridesResource!
     tex_overrides: dict[int, ObjectId] = {}

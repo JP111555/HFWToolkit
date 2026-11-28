@@ -18,6 +18,7 @@ from hfw_toolkit.extract.textures import (
     LANE_TO_IDX,
     PackingChannel,
     decode_texture,
+    decode_texture_array_slices,
     export_packed_texture,
     export_packed_texture_set,
     export_standalone_texture,
@@ -31,6 +32,26 @@ from hfw_toolkit.shaders.character_dxil import (
     infer_character_eye_color,
     infer_character_hair_color,
     infer_character_skin_tone,
+)
+from hfw_toolkit.shaders.titan_dxil import (
+    HASH_TITAN_CLEAN_CLR_ARR,
+    HASH_TITAN_CLEAN_NMT_ARR,
+    HASH_TITAN_CLEAN_RFL_ARR,
+    HASH_TITAN_DMG_CLR_ARR,
+    HASH_TITAN_DMG_NMT_ARR,
+    HASH_TITAN_DMG_RFL_ARR,
+    HASH_TITAN_GRUNGE_CLR,
+    HASH_TITAN_GRUNGE_NMT,
+    HASH_TITAN_MACRO_MISC,
+    HASH_TITAN_MACRO_MSK,
+    HASH_TITAN_MACRO_NMT,
+    HASH_TITAN_MOSS_CLR,
+    HASH_TITAN_MOSS_NMT,
+    HASH_TITAN_RUST_CLR,
+    HASH_TITAN_RUST_HGT,
+    HASH_TITAN_RUST_NMT,
+    extract_titan_hull_spec,
+    is_titan_layered_material,
 )
 
 # Known Decima binding hashes for machine detail texture arrays (e.g. Tex 20:0 256x256x23 BC7)
@@ -263,6 +284,17 @@ def infer_machine_variant_profile(
     # Copy lists so callers can't mutate module globals
     for k in ("muscle_color", "cable_color", "eye_color", "eye_alert_color", "core_color", "plasma_color"):
         base[k] = list(base[k])
+
+    # Horus / FAS-BOR7 Titan: DXIL `10380:0` (`VB[4] = [1.0, 0.0, 0.0]`) uses iconic menacing Crimson Red
+    # optical lenses and molten orange-red cooling vents / heat sinks rather than Patrol Cyan!
+    mlow = f"{machine_hint} {variant_hint}".lower()
+    if any(k in mlow for k in ("titan", "horus")) and base["profile"] == "standard":
+        base["eye_color"] = [1.0, 0.04, 0.01]
+        base["eye_alert_color"] = [1.0, 0.22, 0.01]
+        base["eye_glow"] = 14.0
+        base["muscle_color"] = [1.0, 0.18, 0.01]
+        base["cable_color"] = [1.0, 0.18, 0.01]
+
     base["is_plasma"] = bool(is_plasma_machine)
     base["plasma_charge"] = 1.0 if is_plasma_machine else 0.0
     base["animation_speed"] = 1.0
@@ -312,6 +344,9 @@ def _extract_material_textures(
     skin_profile: dict[str, Any] | None = None,
     hair_profile: dict[str, Any] | None = None,
     eye_profile: dict[str, Any] | None = None,
+    titan_shader_cache: dict[str, Any] | None = None,
+    titan_lut_cache: dict[str, Any] | None = None,
+    titan_slice_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export textures referenced by `mat`'s primary technique.
 
@@ -405,6 +440,209 @@ def _extract_material_textures(
 
     is_machine_asset = asset_kind == "machine"
 
+    # ------------------------------------------------------------------
+    # HORUS / FAS-BOR7 TITAN 26-TB GROUP-132 LAYERED HULL SHADER
+    # ------------------------------------------------------------------
+    if is_titan_layered_material(mat):
+        titan_spec = extract_titan_hull_spec(
+            game,
+            mat,
+            dxc=dxc,
+            shader_cache=titan_shader_cache,
+            lut_cache=titan_lut_cache,
+        )
+        if titan_spec is not None:
+            sl_cache = titan_slice_cache if titan_slice_cache is not None else {}
+
+            def _export_titan_tb_png(tb_hash: int, desired_type: str, default_cspace: str = "Non-Color") -> str:
+                tb_obj = tb_by_hash.get(tb_hash)
+                if tb_obj is None or not tb_obj.resource_id:
+                    return ""
+                rid_t = tb_obj.resource_id
+                if tb_obj.resource_type == "Texture":
+                    if tb_obj.target_channels:
+                        if rid_t not in standalone_packed_cache:
+                            try:
+                                tobj = game.read_object(ObjectId.parse(rid_t), read_subgroups=True)
+                                packing = _target_channels_to_packing(tb_obj.target_channels)
+                                standalone_packed_cache[rid_t] = export_packed_texture(
+                                    game, tobj, packing, tb_obj.name, tex_dir, max_dimension=max_texture_size
+                                )
+                            except Exception:
+                                standalone_packed_cache[rid_t] = None
+                        ent = standalone_packed_cache.get(rid_t)
+                        if ent and ent.get("filename"):
+                            return str(ent["filename"])
+                    raw = _export_raw_tex(rid_t, tb_obj.name or f"HFW_Titan_{rid_t.replace(':', '_')}", default_cspace)
+                    return str(raw["filename"]) if (raw and raw.get("filename")) else ""
+                elif tb_obj.resource_type == "TextureSet":
+                    if rid_t not in ts_packed_cache:
+                        try:
+                            ts_obj = game.read_object(ObjectId.parse(rid_t), read_subgroups=True)
+                            ts_packed_cache[rid_t] = export_packed_texture_set(
+                                game, ts_obj, tex_dir, max_dimension=max_texture_size
+                            )
+                        except Exception:
+                            ts_packed_cache[rid_t] = []
+                    entries = ts_packed_cache.get(rid_t) or []
+                    for ent in entries:
+                        pk = ent.get("packing", {})
+                        if any(v.startswith(desired_type) for v in pk.values()):
+                            return str(ent.get("filename", ""))
+                    if entries:
+                        return str(entries[0].get("filename", ""))
+                return ""
+
+            def _export_titan_array_slice(tb_hash: int, fallback_rid: str, prefix: str, slice_idx: int) -> str:
+                tb_obj = tb_by_hash.get(tb_hash)
+                arr_rid = (tb_obj.resource_id if tb_obj and tb_obj.resource_id else fallback_rid)
+                fn_key = f"file:{arr_rid}:{slice_idx}"
+                if fn_key in sl_cache:
+                    return str(sl_cache[fn_key])
+                slices_key = f"slices:{arr_rid}"
+                if slices_key not in sl_cache:
+                    try:
+                        tobj = game.read_object(ObjectId.parse(arr_rid), read_subgroups=True)
+                        sl_cache[slices_key] = decode_texture_array_slices(game, tobj, max_slice_dim=512)
+                    except Exception:
+                        sl_cache[slices_key] = []
+                slices = sl_cache.get(slices_key) or []
+                if not slices:
+                    sl_cache[fn_key] = ""
+                    return ""
+                si = max(0, min(len(slices) - 1, int(slice_idx)))
+                fn = f"HFW_Titan_{prefix}_s{si:02d}.png"
+                fp = tex_dir / fn
+                if not fp.exists():
+                    Image.fromarray(slices[si], mode="RGBA").save(fp)
+                sl_cache[fn_key] = fn
+                return fn
+
+            macro_nmt_file = _export_titan_tb_png(HASH_TITAN_MACRO_NMT, "Normal")
+            macro_msk_file = _export_titan_tb_png(HASH_TITAN_MACRO_MSK, "Mask")
+            macro_misc_file = _export_titan_tb_png(HASH_TITAN_MACRO_MISC, "Misc_01")
+
+            # Measure exact DXIL 8-corner pixel coverage on this tile's 4K `MSK` map so Blender & UE5
+            # only build texture sampler branches for corners actually present on this hull tile!
+            corner_cov = [0.0] * 8
+            if macro_msk_file and (tex_dir / macro_msk_file).is_file():
+                try:
+                    msk_im = Image.open(tex_dir / macro_msk_file).convert("RGB").resize((64, 64), Image.NEAREST)
+                    ma = np.asarray(msk_im, dtype=np.float32) / 255.0
+                    bits = (
+                        (ma[:, :, 0] > 0.5).astype(np.int32)
+                        | ((ma[:, :, 1] > 0.5).astype(np.int32) << 1)
+                        | ((ma[:, :, 2] > 0.5).astype(np.int32) << 2)
+                    )
+                    remap = np.array([0, 1, 2, 6, 3, 5, 4, 7], dtype=np.int32)
+                    corners_px = remap[bits]
+                    for ci in range(8):
+                        corner_cov[ci] = float(np.mean(corners_px == ci))
+                except Exception:
+                    corner_cov = [1.0] * 8
+            else:
+                corner_cov = [1.0] * 8
+
+            dom_corner = int(np.argmax(corner_cov))
+            for c_entry in titan_spec["corners"]:
+                ci = int(c_entry["corner"])
+                is_act = (corner_cov[ci] >= 0.0005) or (ci == dom_corner)
+                c_entry["active"] = bool(is_act)
+                c_entry["coverage"] = round(corner_cov[ci], 4)
+                if is_act:
+                    s_idx = int(c_entry["slice_idx"])
+                    c_entry["clean_clr_file"] = _export_titan_array_slice(HASH_TITAN_CLEAN_CLR_ARR, "132:2", "CleanCLR", s_idx)
+                    c_entry["dmg_clr_file"] = _export_titan_array_slice(HASH_TITAN_DMG_CLR_ARR, "132:9", "DmgCLR", s_idx)
+                    c_entry["clean_nmt_file"] = _export_titan_array_slice(HASH_TITAN_CLEAN_NMT_ARR, "132:3", "CleanNMT", s_idx)
+                    c_entry["dmg_nmt_file"] = _export_titan_array_slice(HASH_TITAN_DMG_NMT_ARR, "132:6", "DmgNMT", s_idx)
+                    c_entry["clean_rfl_file"] = _export_titan_array_slice(HASH_TITAN_CLEAN_RFL_ARR, "132:8", "CleanRFL", s_idx)
+                    c_entry["dmg_rfl_file"] = _export_titan_array_slice(HASH_TITAN_DMG_RFL_ARR, "132:7", "DmgRFL", s_idx)
+                else:
+                    c_entry["clean_clr_file"] = ""
+                    c_entry["dmg_clr_file"] = ""
+                    c_entry["clean_nmt_file"] = ""
+                    c_entry["dmg_nmt_file"] = ""
+                    c_entry["clean_rfl_file"] = ""
+                    c_entry["dmg_rfl_file"] = ""
+
+            # Shared weathering maps (exported ONCE per bundle via cache!)
+            rust_clr_file = _export_titan_tb_png(HASH_TITAN_RUST_CLR, "Color")
+            rust_nmt_file = _export_titan_tb_png(HASH_TITAN_RUST_NMT, "Normal")
+            rust_hgt_file = _export_titan_tb_png(HASH_TITAN_RUST_HGT, "Height")
+            grunge_clr_file = _export_titan_tb_png(HASH_TITAN_GRUNGE_CLR, "Color")
+            grunge_nmt_file = _export_titan_tb_png(HASH_TITAN_GRUNGE_NMT, "Normal")
+            moss_clr_file = _export_titan_tb_png(HASH_TITAN_MOSS_CLR, "Color")
+            moss_nmt_file = _export_titan_tb_png(HASH_TITAN_MOSS_NMT, "Normal")
+
+            # Authentic DXIL heat-sink / drill weakspot molten crevice glow + variant moss calibration
+            nmt_tb = tb_by_hash.get(HASH_TITAN_MACRO_NMT)
+            macro_stem = (nmt_tb.name if nmt_tb and nmt_tb.name else mat.name)
+            t_ctx = f"{macro_stem} {mat.name} {mesh_part_hint} {catalog_part_hint}".lower()
+            v_low = (variant_hint or "").lower()
+            sh_id = pt.shader_id or ""
+
+            heat_default = 0.0
+            if sh_id == "4687:7" or any(k in t_ctx for k in ("drill_03", "drillweakspot", "drillcanister", "heatsink", "heat_sink", "cooling")):
+                heat_default = 1.10
+            elif sh_id == "14110:129" or "interactiveplates" in t_ctx:
+                heat_default = 0.85
+
+            if any(k in v_low for k in ("clean", "pristine", "intact")):
+                moss_strength = 0.08
+            elif any(k in t_ctx for k in ("drill", "interactiveplates", "climbingspot", "eye", "turret", "piston", "tentacle", "leg", "tail")):
+                moss_strength = 0.16
+            else:
+                moss_strength = 0.62
+
+            titan_layered = {
+                "shader_id": sh_id,
+                "dxil_parsed": bool(titan_spec["dxil_parsed"]),
+                "macro_name": macro_stem,
+                "macro_nmt_file": macro_nmt_file,
+                "macro_msk_file": macro_msk_file,
+                "macro_misc_file": macro_misc_file,
+                "dominant_corner": dom_corner,
+                "corners": titan_spec["corners"],
+                "rust_clr_file": rust_clr_file,
+                "rust_nmt_file": rust_nmt_file,
+                "rust_hgt_file": rust_hgt_file,
+                "rust_lut_srgb": titan_spec["rust_lut_srgb"],
+                "grunge_clr_file": grunge_clr_file,
+                "grunge_nmt_file": grunge_nmt_file,
+                "moss_clr_file": moss_clr_file,
+                "moss_nmt_file": moss_nmt_file,
+                "moss_lut_srgb": titan_spec["moss_lut_srgb"],
+                "moss_strength": moss_strength,
+                "heat_glow_default": heat_default,
+                "heat_color_hot": [1.0, 0.20, 0.008],
+                "heat_color_deep": [0.75, 0.03, 0.002],
+            }
+            return {
+                "texture_mode": "packed",
+                "packed_entries": [],
+                "maps": {},
+                "detail_maps": {},
+                "detail_array": None,
+                "detail_tile": [detail_tile_x, detail_tile_y],
+                "emissive_color": None,
+                "emissive_strength": 0.0,
+                "special_shader": None,
+                "emissive_overlay": None,
+                "surface_profile": "titan_hull",
+                "allow_alpha_cutout": False,
+                "outfit_layered": None,
+                "titan_layered": titan_layered,
+                "uses_skin_lut": False,
+                "skin_tone_linear": None,
+                "uses_hair_lut": False,
+                "hair_color_linear": None,
+                "eye_profile": None,
+                "iris_color_linear": None,
+                "peach_fuzz_intensity": None,
+                "translucency_file": "",
+                "asset_detail_normal_file": "",
+            }
+
     # Helper to identify shared placeholder / weather / fuzz-atlas junk textures on HFW characters & assets
     _CHAR_JUNK_TOKENS = (
         "placeholder_nmt",
@@ -454,8 +692,12 @@ def _extract_material_textures(
             for k in (
                 "shaders_hrz2/rock/moss/",
                 "starmoss_clr",
+                "starmoss_nmt",
+                "starmoss_hgt",
                 "snow_clumps_",
                 "snow_heavyfresh_",
+                "detail_jungle_rough",
+                "detail_albedo_noise",
             )
         )
 
@@ -531,8 +773,9 @@ def _extract_material_textures(
         # On characters & general assets, skip placeholder UV checkerboards, weather frost/dirt, and fuzz-atlas overlays!
         if not is_machine_asset and _is_char_junk(src_str):
             continue
-        # On general assets that ALREADY have their own unique `models/...` color map, skip world-space StarMoss overlay!
-        if asset_kind == "asset" and has_unique_model_color_binding and _is_world_moss_overlay(src_str):
+        # On ANY asset or overgrown machine (e.g. Horus eco_assets trees/bark!) that ALREADY has its own
+        # unique `models/...` color map, skip world-space StarMoss & jungle noise overlays from clobbering albedo!
+        if has_unique_model_color_binding and _is_world_moss_overlay(src_str):
             continue
         # Capture `Shaders_HRZ2/Materials/<Cat>/<Mat>/...` as layered sub-materials ONLY when a character or masked asset uses them!
         # (On non-masked single-material props/weapons, keep them as direct packed textures so the prop isn't left blank!)
@@ -756,11 +999,12 @@ def _extract_material_textures(
             except Exception:
                 continue
 
-    # On non-machine assets, sort packed_entries so unique `models/...` asset textures ALWAYS beat shared/shader overlays!
-    if not is_machine_asset and len(packed_entries) > 1:
+    # Sort packed_entries so unique `models/...` asset textures ALWAYS beat shared/shader overlays
+    # (critical for both characters/assets AND overgrown eco_assets trees/foliage mounted on Horus!)
+    if len(packed_entries) > 1:
         def _pe_priority(e: dict[str, Any]) -> tuple[int, int, int]:
             sp = f"{e.get('source_path', '')} {e.get('filename', '')}".replace("\\", "/").lower()
-            is_shader_overlay = 1 if ("shaders_hrz2/" in sp or "shaders/" in sp or "starmoss" in sp) else 0
+            is_shader_overlay = 1 if ("shaders_hrz2/" in sp or "shaders/" in sp or "starmoss" in sp or "detail_jungle_rough" in sp) else 0
             is_shared = 1 if "shared" in sp else 0
             area = int(e.get("width", 0)) * int(e.get("height", 0))
             return (is_shader_overlay, is_shared, -area)
@@ -1252,9 +1496,42 @@ def _extract_material_textures(
                     "layers": [first_l],
                 }
 
-    # Detect Character / General Asset material archetype hints (skin, hair, hair_face, peach_fuzz, eye, foliage, glass)
+    # Detect Character / General Asset / Overgrown Machine Eco-Asset material archetypes
+    # (skin, hair, hair_face, peach_fuzz, eye, foliage, bark, glass)
     surface_profile = "pbr"
     allow_alpha_cutout = True
+    if is_machine_asset:
+        pe_all_str = " ".join(
+            f"{e.get('filename', '')} {e.get('source_path', '')}" for e in packed_entries
+        ).replace("\\", "/")
+        tb_all_str = " ".join(_tb_source_str(tb) for tb in pt.texture_bindings)
+        ml_eco = f"{mat.name} {pe_all_str} {tb_all_str} {mesh_part_hint}".lower()
+        is_eco_asset = ("eco_assets/" in ml_eco) or any(
+            k in ml_eco
+            for k in (
+                "forest_ivy", "junglevine", "liana_", "monstera_", "naupaka_",
+                "pinstripe_ginger", "strangler_fig", "kapok_", "mangrove_",
+                "indian_date_palm", "carapa_", "brokentree", "root_set", "moss_dirt",
+            )
+        )
+        if is_eco_asset:
+            has_alpha_lane = (
+                "Alpha" in maps
+                or any(
+                    v.startswith("Alpha")
+                    for e in packed_entries
+                    for v in e.get("packing", {}).values()
+                )
+            )
+            if has_alpha_lane or any(
+                k in ml_eco
+                for k in ("frond", "ivy", "vine", "leaf", "leaves", "liana", "monstera", "naupaka", "ginger", "foliage")
+            ):
+                surface_profile = "foliage"
+                allow_alpha_cutout = True
+            else:
+                surface_profile = "bark"
+                allow_alpha_cutout = False
     if not is_machine_asset:
         pe_names = " ".join(e.get("filename", "") for e in packed_entries)
         ml = f"{mat.name} {pe_names} {mesh_part_hint} {' '.join(mat.material_tags)}".lower()
@@ -1333,10 +1610,52 @@ def _extract_material_textures(
                 except Exception:
                     continue
 
+    # Detect neutralized 0.5-centered HFW Foliage `_CLR` maps (Kapok, Carapa, Mangrove, Strangler Fig,
+    # Monstera, Naupaka, Forest Ivy — `sat < 0.18`) that rely on HFW's Biome Foliage LUT (`1:0`) for green color!
+    uses_foliage_lut = False
+    foliage_tint_linear: list[float] | None = None
+    if surface_profile == "foliage":
+        clr_fn = ""
+        for pe in packed_entries:
+            pk_vals = pe.get("packing", {}).values()
+            if "Color.R" in pk_vals and "Color.G" in pk_vals and "Color.B" in pk_vals:
+                clr_fn = pe.get("filename", "")
+                break
+        if not clr_fn:
+            clr_fn = maps.get("Color", "")
+        if clr_fn and (tex_dir / clr_fn).is_file():
+            try:
+                im_f = Image.open(tex_dir / clr_fn).convert("RGBA").resize((64, 64), Image.BILINEAR)
+                arr_f = np.asarray(im_f, dtype=np.float32) / 255.0
+                mask_f = arr_f[:, :, 3] > 0.5
+                if int(mask_f.sum()) < 16:
+                    mask_f = np.ones(arr_f.shape[:2], dtype=bool)
+                rgb_f = arr_f[mask_f, :3]
+                mean_rgb = rgb_f.mean(axis=0)
+                mean_sat = float(np.mean(rgb_f.max(axis=1) - rgb_f.min(axis=1)))
+                is_woody_brown = float(mean_rgb[0]) > float(mean_rgb[1]) * 1.15
+                if mean_sat < 0.18 and not is_woody_brown:
+                    uses_foliage_lut = True
+                    fl_low = f"{mat.name} {clr_fn}".lower()
+                    if any(k in fl_low for k in ("ivy", "moss", "fern")):
+                        # Deep lush forest ivy green (calibrated from 1:0 Biome Foliage LUT)
+                        foliage_tint_linear = [0.052, 0.138, 0.018]
+                    elif any(k in fl_low for k in ("monstera", "ginger", "naupaka")):
+                        # Vibrant tropical palm/monstera emerald
+                        foliage_tint_linear = [0.064, 0.172, 0.022]
+                    else:
+                        # Sunlit Burning Shores rainforest tree canopy (Kapok, Carapa, Mangrove, Fig)
+                        foliage_tint_linear = [0.068, 0.165, 0.020]
+            except Exception:
+                pass
+
     has_emissive = (
-        "Incandescence" in maps
-        or any("Incandescence" in v for e in packed_entries for v in e.get("packing", {}).values())
-        or (is_machine_asset and "DeferredEmissive" in mat.material_tags)
+        surface_profile not in ("foliage", "bark")
+        and (
+            "Incandescence" in maps
+            or any("Incandescence" in v for e in packed_entries for v in e.get("packing", {}).values())
+            or (is_machine_asset and "DeferredEmissive" in mat.material_tags)
+        )
     )
     if has_emissive:
         emissive_strength = 4.0
@@ -1355,6 +1674,9 @@ def _extract_material_textures(
         "surface_profile": surface_profile,
         "allow_alpha_cutout": allow_alpha_cutout,
         "outfit_layered": outfit_layered,
+        "titan_layered": None,
+        "uses_foliage_lut": uses_foliage_lut,
+        "foliage_tint_linear": foliage_tint_linear,
         "uses_skin_lut": uses_skin_lut,
         "skin_tone_linear": list(skin_profile["skin_tone_linear"]) if (uses_skin_lut and skin_profile) else None,
         "uses_hair_lut": uses_hair_lut,
@@ -1434,13 +1756,18 @@ def export_assembly_bundle(
         else None
     )
     dxc_tool = None
-    if asset_kind == "character":
+    has_titan_mats = any(is_titan_layered_material(m) for m in assembly.materials.values())
+    if asset_kind == "character" or has_titan_mats:
         try:
             from hfw_toolkit.shaders.dxc import DXCDisassembler
 
             dxc_tool = DXCDisassembler(game.config)
         except Exception:
             dxc_tool = None
+
+    titan_shader_cache: dict[str, Any] = {}
+    titan_lut_cache: dict[str, Any] = {}
+    titan_slice_cache: dict[str, Any] = {}
 
     # Map each material_id -> official HFW Focus Catalog part names (Priority 1) + mesh part names (Priority 2)
     # (so Slaughterspine's Metalbite Sac = Acid Green, Apex Slaughterspine's Purgewater Sac = Aqua Blue,
@@ -1485,13 +1812,19 @@ def export_assembly_bundle(
             skin_profile=skin_profile,
             hair_profile=hair_profile,
             eye_profile=eye_profile,
+            titan_shader_cache=titan_shader_cache,
+            titan_lut_cache=titan_lut_cache,
+            titan_slice_cache=titan_slice_cache,
         )
         pt = mat.primary_technique
         eff_mat_name = mat.name
-        # On characters/assets, prefer the unique asset texture stem over generic shared names like Frost_NMT / Paint_Dry_Base_NMT / StarMoss_clr
-        if asset_kind != "machine" and tex_info["packed_entries"]:
+        tl_meta = tex_info.get("titan_layered")
+        if tl_meta and tl_meta.get("macro_name"):
+            eff_mat_name = str(tl_meta["macro_name"])
+        elif tex_info["packed_entries"]:
+            # Prefer unique asset/eco texture stem over generic shared overlays like StarMoss_clr / Frost_NMT / Paint_Dry_Base_NMT
             mlow = eff_mat_name.lower()
-            if any(g in mlow for g in ("frost_", "dirt_", "paint_", "filler_", "placeholder", "leather_base", "leather_fullgrain", "metal_robotplate", "starmoss")):
+            if any(g in mlow for g in ("frost_", "dirt_", "paint_", "filler_", "placeholder", "leather_base", "leather_fullgrain", "metal_robotplate", "starmoss", "rust_clr", "grunge_clr")):
                 first_fn = tex_info["packed_entries"][0].get("filename", "")
                 if first_fn:
                     eff_mat_name = re.sub(r"_\d+_\d+_[A-Z_]+\.png$", "", first_fn) or eff_mat_name
@@ -1516,6 +1849,9 @@ def export_assembly_bundle(
             "surface_profile": tex_info.get("surface_profile", "pbr"),
             "allow_alpha_cutout": bool(tex_info.get("allow_alpha_cutout", True)),
             "outfit_layered": tex_info.get("outfit_layered"),
+            "titan_layered": tl_meta,
+            "uses_foliage_lut": bool(tex_info.get("uses_foliage_lut", False)),
+            "foliage_tint_linear": tex_info.get("foliage_tint_linear"),
             "uses_skin_lut": bool(tex_info.get("uses_skin_lut", False)),
             "skin_tone_linear": tex_info.get("skin_tone_linear"),
             "uses_hair_lut": bool(tex_info.get("uses_hair_lut", False)),
@@ -1535,38 +1871,50 @@ def export_assembly_bundle(
             ],
         }
 
-    # Pack all geometry arrays into a single compressed .npz archive
+    # Pack all geometry arrays into a single compressed .npz archive.
+    # Deduplicate identical static meshes by `part.mesh.object_id` so mega-assemblies like Horus
+    # (1,806 static parts sharing ~327 unique meshes) store each mesh ONCE and instance it in Blender!
     arrays: dict[str, np.ndarray] = {}
     parts_manifest: list[dict[str, Any]] = []
+    shared_static_prims: dict[str, list[dict[str, Any]]] = {}
 
     for p_idx, part in enumerate(assembly.parts):
-        prims_meta: list[dict[str, Any]] = []
-        for pr_idx, prim in enumerate(part.mesh.primitives):
-            prefix = f"p{p_idx}_m{pr_idx}"
-            arrays[f"{prefix}_pos"] = prim.positions.astype(np.float32, copy=False)
-            arrays[f"{prefix}_idx"] = prim.indices.astype(np.uint32, copy=False)
-            if prim.normals is not None:
-                arrays[f"{prefix}_nrm"] = prim.normals.astype(np.float32, copy=False)
-            for u_i, uv in enumerate(prim.uvs):
-                arrays[f"{prefix}_uv{u_i}"] = uv.astype(np.float32, copy=False)
-            for c_i, col in enumerate(prim.colors):
-                arrays[f"{prefix}_col{c_i}"] = col.astype(np.float32, copy=False)
-            if prim.bone_indices is not None and prim.bone_weights is not None:
-                arrays[f"{prefix}_bi"] = prim.bone_indices.astype(np.uint16, copy=False)
-                arrays[f"{prefix}_bw"] = prim.bone_weights.astype(np.float32, copy=False)
+        shared_mesh_id: str | None = None
+        if not part.is_skinned and part.mesh.object_id:
+            shared_mesh_id = part.mesh.object_id
 
-            prims_meta.append(
-                {
-                    "key": prefix,
-                    "material_id": prim.material_id,
-                    "vertex_count": int(len(prim.positions)),
-                    "index_count": int(len(prim.indices)),
-                    "has_normals": prim.normals is not None,
-                    "uv_count": len(prim.uvs),
-                    "color_count": len(prim.colors),
-                    "has_weights": prim.bone_indices is not None and prim.bone_weights is not None,
-                }
-            )
+        if shared_mesh_id is not None and shared_mesh_id in shared_static_prims:
+            prims_meta = [dict(pm) for pm in shared_static_prims[shared_mesh_id]]
+        else:
+            prims_meta = []
+            for pr_idx, prim in enumerate(part.mesh.primitives):
+                prefix = f"p{p_idx}_m{pr_idx}"
+                arrays[f"{prefix}_pos"] = prim.positions.astype(np.float32, copy=False)
+                arrays[f"{prefix}_idx"] = prim.indices.astype(np.uint32, copy=False)
+                if prim.normals is not None:
+                    arrays[f"{prefix}_nrm"] = prim.normals.astype(np.float32, copy=False)
+                for u_i, uv in enumerate(prim.uvs):
+                    arrays[f"{prefix}_uv{u_i}"] = uv.astype(np.float32, copy=False)
+                for c_i, col in enumerate(prim.colors):
+                    arrays[f"{prefix}_col{c_i}"] = col.astype(np.float32, copy=False)
+                if prim.bone_indices is not None and prim.bone_weights is not None:
+                    arrays[f"{prefix}_bi"] = prim.bone_indices.astype(np.uint16, copy=False)
+                    arrays[f"{prefix}_bw"] = prim.bone_weights.astype(np.float32, copy=False)
+
+                prims_meta.append(
+                    {
+                        "key": prefix,
+                        "material_id": prim.material_id,
+                        "vertex_count": int(len(prim.positions)),
+                        "index_count": int(len(prim.indices)),
+                        "has_normals": prim.normals is not None,
+                        "uv_count": len(prim.uvs),
+                        "color_count": len(prim.colors),
+                        "has_weights": prim.bone_indices is not None and prim.bone_weights is not None,
+                    }
+                )
+            if shared_mesh_id is not None and prims_meta:
+                shared_static_prims[shared_mesh_id] = prims_meta
 
         if not prims_meta:
             continue
@@ -1582,23 +1930,24 @@ def export_assembly_bundle(
             part_coll = "Focus_Overlay"
             part_enabled = False
 
-        parts_manifest.append(
-            {
-                "part_id": part.part_id,
-                "name": part.name,
-                "collection": part_coll,
-                "source_kind": part.source_kind,
-                "is_skinned": part.is_skinned,
-                "parent_joint_index": part.parent_joint_index,
-                "parent_joint_name": part.parent_joint_name,
-                "helper_name": part.helper_name,
-                "local_offset_matrix": part.local_offset_matrix.tolist(),
-                "world_matrix": part.world_matrix.tolist(),
-                "enabled_by_default": part_enabled,
-                "state_index": part.state_index,
-                "primitives": prims_meta,
-            }
-        )
+        part_entry: dict[str, Any] = {
+            "part_id": part.part_id,
+            "name": part.name,
+            "collection": part_coll,
+            "source_kind": part.source_kind,
+            "is_skinned": part.is_skinned,
+            "parent_joint_index": part.parent_joint_index,
+            "parent_joint_name": part.parent_joint_name,
+            "helper_name": part.helper_name,
+            "local_offset_matrix": part.local_offset_matrix.tolist(),
+            "world_matrix": part.world_matrix.tolist(),
+            "enabled_by_default": part_enabled,
+            "state_index": part.state_index,
+            "primitives": prims_meta,
+        }
+        if shared_mesh_id is not None:
+            part_entry["shared_mesh_id"] = shared_mesh_id
+        parts_manifest.append(part_entry)
 
     # Include helpers referenced by parts so armature stays clean and organized
     used_helper_names = {p["helper_name"] for p in parts_manifest if p["helper_name"]}

@@ -56,7 +56,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 class ExportBlendRequest(BaseModel):
     machine: str
     variant_index: int = 0
-    lod_index: int = 0
+    lod_index: int = -1  # -1 = Auto (LOD 2 for colossal Horus; LOD 0 for standard machines)
     include_broken_states: bool = True
     unpack_textures: bool = False
     pack_textures: bool = False
@@ -195,13 +195,15 @@ class ToolkitServerState:
                 self._asm_cache.move_to_end(key)
                 return cached
         oid, code, disp = resolve_machine_entity_id(self.game, self.catalog, entity_id)
+        # Colossal Horus (`14110:7066`, 16.68M LOD0 tris) previews cleanly at LOD 2 (~2.45M tris, <2s)!
+        preview_lod = 2 if (code.lower() in ("titan", "horus") or str(oid) in ("14110:7066", "68784:265")) else 0
         asm = assemble_machine(
             self.game,
             oid,
             codename=code,
             display_name=disp,
             variant_index=variant_index,
-            lod_index=0,
+            lod_index=preview_lod,
             include_broken_states=True,
         )
         with self._lock:
@@ -635,13 +637,15 @@ def create_app(config: ToolkitConfig | None = None) -> FastAPI:
         def _worker() -> None:
             try:
                 oid, code, disp = resolve_machine_entity_id(state.game, state.catalog, req.machine)
+                is_colossal = code.lower() in ("titan", "horus") or str(oid) in ("14110:7066", "68784:265")
+                eff_lod = (2 if is_colossal else 0) if req.lod_index < 0 else req.lod_index
                 asm = assemble_machine(
                     state.game,
                     oid,
                     codename=code,
                     display_name=disp,
                     variant_index=req.variant_index,
-                    lod_index=req.lod_index,
+                    lod_index=eff_lod,
                     include_broken_states=req.include_broken_states,
                 )
                 tex_lbl = "Unpacking textures" if req.unpack_textures else "Exporting native packed game textures"

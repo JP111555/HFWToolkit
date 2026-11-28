@@ -335,13 +335,51 @@ def parse_material(game: HFWGame, render_effect_obj: dict[str, Any]) -> Material
             if tb.semantic_role == "Translucency":
                 tags.add("Translucency")
 
-        # Choose most descriptive primary texture name (prefer non-detail Color or Normal)
-        for preferred in ("Color", "Normal", "Surface_RMA", "Emissive", "MuscleFiber_Color"):
-            if roles.get(preferred):
-                cand = roles[preferred][0].name
-                if cand and not cand.startswith("Tex_"):
-                    mat_name = cand
+        # Choose most descriptive primary texture name: ALWAYS prefer a unique `models/` / `dlc/models/`
+        # asset texture (e.g. `Titan_Body_Bottom_01_NMT`, `Carapa_b001_Trunk_c006_NMT`) over shared
+        # `Shaders_HRZ2/` weathering overlays (`StarMoss_clr`, `Rust_CLR`, `Grunge_CLR`)!
+        def _is_shared_overlay_tb(tb_obj: TextureBindingInfo) -> bool:
+            sp = (" ".join(tb_obj.source_paths.values()) + " " + (tb_obj.name or "")).replace("\\", "/").lower()
+            return any(
+                k in sp
+                for k in (
+                    "shaders_hrz2/",
+                    "starmoss",
+                    "rust_clr",
+                    "rust_nmt",
+                    "rust_hgt",
+                    "grunge_clr",
+                    "grunge_nmt",
+                    "placeholder",
+                    "detail_jungle_rough",
+                    "detail_albedo_noise",
+                )
+            )
+
+        def _is_unique_model_tb(tb_obj: TextureBindingInfo) -> bool:
+            sp = (" ".join(tb_obj.source_paths.values())).replace("\\", "/").lower()
+            return ("models/" in sp) and not _is_shared_overlay_tb(tb_obj)
+
+        for preferred in ("Color", "Normal", "Surface_RMA", "Mask", "Emissive", "MuscleFiber_Color"):
+            cands = roles.get(preferred) or []
+            unique_hit = next((tb.name for tb in cands if tb.name and not tb.name.startswith("Tex_") and _is_unique_model_tb(tb)), None)
+            if unique_hit:
+                mat_name = unique_hit
+                break
+        if mat_name.startswith("Mat_"):
+            for preferred in ("Color", "Normal", "Surface_RMA", "Emissive", "MuscleFiber_Color"):
+                cands = roles.get(preferred) or []
+                non_ov = next((tb.name for tb in cands if tb.name and not tb.name.startswith("Tex_") and not _is_shared_overlay_tb(tb)), None)
+                if non_ov:
+                    mat_name = non_ov
                     break
+        if mat_name.startswith("Mat_"):
+            for preferred in ("Color", "Normal", "Surface_RMA", "Emissive", "MuscleFiber_Color"):
+                if roles.get(preferred):
+                    cand = roles[preferred][0].name
+                    if cand and not cand.startswith("Tex_"):
+                        mat_name = cand
+                        break
         if mat_name.startswith("Mat_") and primary.texture_bindings:
             for tb in primary.texture_bindings:
                 if tb.name and not tb.name.startswith("Tex_"):

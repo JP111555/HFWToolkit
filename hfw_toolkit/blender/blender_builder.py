@@ -3397,6 +3397,733 @@ def _build_layered_outfit_material(
     return True
 
 
+def _build_titan_layered_material(
+    mat: bpy.types.Material,
+    titan: dict[str, Any],
+    tex_dir: Path,
+    img_cache: dict[str, bpy.types.Image],
+) -> bool:
+    """Build Guerrilla's exact DXIL Horus / FAS-BOR7 Titan 26-TB Group-132 Multi-Layer Hull Shader.
+
+    Reconstructs `ps_1256_1_p1.ll` faithfully in Cycles & EEVEE:
+      - Macro 4K `Titan_*_NMT` (`R,G=Normal`, `B=Baked AO`, `A=Curvature`),
+        `Titan_*_MSK` (3-bit RGB 8-corner mask), and `Titan_*_MISC` (`R=Damage`, `G=Rust`, `B=Grunge/Moss`).
+      - Active-corner-only sampling of Clean (`132:2/3/8`) <-> Damaged (`132:9/6/7`) Group-132 slices
+        at each corner's exact DXIL `tile_scale` (`6x..32x`), tinted by `2.0 * PaintLUT_132_5` via `PaintMask`!
+      - Corroded iron-oxide Rust (`64:0/1/3`) & oil Grunge (`132:0/1`) layered BEFORE exact DXIL `Gamma 2.2`!
+      - Baked Macro Curvature + Macro/Micro AO applied in linear PBR space.
+      - Lush forest `StarMoss` (`1:0/1/2`) blended AFTER `Gamma 2.2` ONLY on world-upward-facing surfaces!
+      - Exact `HFW_DecimaPBR` conversion (`Smoothness -> Roughness`, `Reflectance -> Metallic + F0 = RFL^2`).
+      - Optional DXIL deep-crevice `(1 - AO)^4` molten orange-red heat glow on Cooling Vents / Drill Weakspots!
+    """
+    corners = titan.get("corners") or []
+    if len(corners) < 8:
+        return False
+
+    nt = mat.node_tree
+    nt.nodes.clear()
+    mat["hfw_shader_kind"] = "titan_hull_layered"
+
+    out_node = nt.nodes.new("ShaderNodeOutputMaterial")
+    out_node.location = (1860, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (1480, 0)
+    nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    tc.location = (-2720, 260)
+
+    # 1. Sample 4K Macro NMT/AO/CRV, MSK, and MISC
+    nmt_img = _load_image(tex_dir, titan.get("macro_nmt_file", ""), "Non-Color", img_cache)
+    msk_img = _load_image(tex_dir, titan.get("macro_msk_file", ""), "Non-Color", img_cache)
+    misc_img = _load_image(tex_dir, titan.get("macro_misc_file", ""), "Non-Color", img_cache)
+
+    macro_nx = None
+    macro_ny = None
+    macro_ao = None
+    macro_crv = None
+    if nmt_img is not None:
+        t_mn = nt.nodes.new("ShaderNodeTexImage")
+        t_mn.image = nmt_img
+        t_mn.label = "HFW Titan Macro NMT_AO_CRV"
+        t_mn.location = (-2360, -1420)
+        sep_mn = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_mn.label = "Unpack Macro NMT/AO"
+        sep_mn.location = (-2060, -1420)
+        nt.links.new(t_mn.outputs["Color"], sep_mn.inputs["Color"])
+        macro_nx = sep_mn.outputs["Red"]
+        macro_ny = sep_mn.outputs["Green"]
+        macro_ao = sep_mn.outputs["Blue"]
+        macro_crv = t_mn.outputs["Alpha"]
+
+    misc_dmg = None
+    misc_rust = None
+    misc_grunge = None
+    if misc_img is not None:
+        t_ms = nt.nodes.new("ShaderNodeTexImage")
+        t_ms.image = misc_img
+        t_ms.label = "HFW Titan Macro MISC (R=Dmg, G=Rust, B=Grunge)"
+        t_ms.location = (-2360, -960)
+        sep_ms = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_ms.location = (-2060, -960)
+        nt.links.new(t_ms.outputs["Color"], sep_ms.inputs["Color"])
+        misc_dmg = sep_ms.outputs["Red"]
+        misc_rust = sep_ms.outputs["Green"]
+        misc_grunge = sep_ms.outputs["Blue"]
+
+    # 2. Sample ONLY active corners, deduplicating TextureImage nodes shared across corners with identical (slice, tile)!
+    dom_corner = int(titan.get("dominant_corner", 0))
+    active_ids = [int(c["corner"]) for c in corners if c.get("active")]
+    if not active_ids:
+        active_ids = [dom_corner]
+
+    uv_scale_cache: dict[float, Any] = {}
+    slice_tex_cache: dict[tuple[str, float], Any] = {}
+    slice_sep_cache: dict[tuple[str, float], Any] = {}
+    # Cache Clean<->Damaged per (slice_idx, tile_scale) so identical slices with different paint LUTs share textures!
+    pair_cache: dict[tuple[int, float], dict[str, Any]] = {}
+
+    def _get_scaled_uv(scale: float) -> Any:
+        key = round(float(scale), 2)
+        if key not in uv_scale_cache:
+            vm = nt.nodes.new("ShaderNodeVectorMath")
+            vm.operation = "SCALE"
+            vm.inputs["Scale"].default_value = key
+            vm.label = f"Titan Tile UV ({key:.0f}x)"
+            vm.location = (-2440, 620 - len(uv_scale_cache) * 140)
+            nt.links.new(tc.outputs["UV"], vm.inputs[0])
+            uv_scale_cache[key] = vm.outputs["Vector"]
+        return uv_scale_cache[key]
+
+    def _get_slice_tex(fname: str, scale: float, lbl: str, y_hint: float) -> Any | None:
+        if not fname:
+            return None
+        key = (fname, round(float(scale), 2))
+        if key not in slice_tex_cache:
+            img = _load_image(tex_dir, fname, "Non-Color", img_cache)
+            if img is None:
+                slice_tex_cache[key] = None
+                return None
+            tn = nt.nodes.new("ShaderNodeTexImage")
+            tn.image = img
+            tn.label = lbl
+            tn.location = (-2100, y_hint)
+            nt.links.new(_get_scaled_uv(scale), tn.inputs["Vector"])
+            slice_tex_cache[key] = tn
+        return slice_tex_cache[key]
+
+    def _get_slice_sep(fname: str, scale: float, lbl: str, y_hint: float) -> Any | None:
+        key = (fname, round(float(scale), 2))
+        if key not in slice_sep_cache:
+            tn = _get_slice_tex(fname, scale, lbl, y_hint)
+            if tn is None:
+                slice_sep_cache[key] = None
+                return None
+            sp = nt.nodes.new("ShaderNodeSeparateColor")
+            sp.location = (-1820, y_hint)
+            nt.links.new(tn.outputs["Color"], sp.inputs["Color"])
+            slice_sep_cache[key] = sp
+        return slice_sep_cache[key]
+
+    def _lerp_float(a: Any, b: Any, fac: Any, x: float, y: float, lbl: str = "") -> Any:
+        if fac is None or a == b:
+            return a
+        m = nt.nodes.new("ShaderNodeMix")
+        m.data_type = "FLOAT"
+        if lbl:
+            m.label = lbl
+        m.location = (x, y)
+        nt.links.new(fac, m.inputs["Factor"])
+        if isinstance(a, (int, float)):
+            m.inputs[2].default_value = float(a)
+        else:
+            nt.links.new(a, m.inputs[2])
+        if isinstance(b, (int, float)):
+            m.inputs[3].default_value = float(b)
+        else:
+            nt.links.new(b, m.inputs[3])
+        return m.outputs[0]
+
+    def _lerp_rgba(a: Any, b: Any, fac: Any, x: float, y: float, lbl: str = "") -> Any:
+        if fac is None or a == b:
+            return a
+        m = nt.nodes.new("ShaderNodeMix")
+        m.data_type = "RGBA"
+        if lbl:
+            m.label = lbl
+        m.location = (x, y)
+        nt.links.new(fac, m.inputs["Factor"])
+        nt.links.new(a, m.inputs[6])
+        nt.links.new(b, m.inputs[7])
+        return m.outputs[2]
+
+    corner_data: dict[int, dict[str, Any]] = {}
+    for slot_i, ci in enumerate(active_ids):
+        cinfo = corners[ci]
+        s_idx = int(cinfo.get("slice_idx", 11))
+        t_scale = float(cinfo.get("tile_scale", 16.0))
+        y_base = 1100 - slot_i * 420
+        pkey = (s_idx, round(t_scale, 2))
+
+        if pkey not in pair_cache:
+            c_clr_n = _get_slice_tex(cinfo.get("clean_clr_file", ""), t_scale, f"CleanCLR s{s_idx:02d}", y_base)
+            d_clr_n = _get_slice_tex(cinfo.get("dmg_clr_file", ""), t_scale, f"DmgCLR s{s_idx:02d}", y_base - 120)
+            c_nmt_s = _get_slice_sep(cinfo.get("clean_nmt_file", ""), t_scale, f"CleanNMT s{s_idx:02d}", y_base - 240)
+            d_nmt_s = _get_slice_sep(cinfo.get("dmg_nmt_file", ""), t_scale, f"DmgNMT s{s_idx:02d}", y_base - 320)
+            c_rfl_s = _get_slice_sep(cinfo.get("clean_rfl_file", ""), t_scale, f"CleanRFL s{s_idx:02d}", y_base - 400)
+            d_rfl_s = _get_slice_sep(cinfo.get("dmg_rfl_file", ""), t_scale, f"DmgRFL s{s_idx:02d}", y_base - 480)
+
+            if c_clr_n is not None and d_clr_n is not None:
+                raw_clr = _lerp_rgba(c_clr_n.outputs["Color"], d_clr_n.outputs["Color"], misc_dmg, -1520, y_base, f"s{s_idx:02d} Clean<->Dmg CLR")
+            elif c_clr_n is not None:
+                raw_clr = c_clr_n.outputs["Color"]
+            else:
+                fb = nt.nodes.new("ShaderNodeRGB")
+                fb.outputs[0].default_value = (0.50, 0.50, 0.50, 1.0)
+                fb.location = (-1520, y_base)
+                raw_clr = fb.outputs[0]
+
+            if c_rfl_s is not None and d_rfl_s is not None:
+                rfl_s = _lerp_float(c_rfl_s.outputs["Red"], d_rfl_s.outputs["Red"], misc_dmg, -1520, y_base - 140)
+                mao_s = _lerp_float(c_rfl_s.outputs["Green"], d_rfl_s.outputs["Green"], misc_dmg, -1520, y_base - 210)
+                pm_s = _lerp_float(c_rfl_s.outputs["Blue"], d_rfl_s.outputs["Blue"], misc_dmg, -1520, y_base - 280)
+            elif c_rfl_s is not None:
+                rfl_s, mao_s, pm_s = c_rfl_s.outputs["Red"], c_rfl_s.outputs["Green"], c_rfl_s.outputs["Blue"]
+            else:
+                rfl_s, mao_s, pm_s = 0.22, 1.0, 1.0
+
+            if c_nmt_s is not None and d_nmt_s is not None:
+                nx_s = _lerp_float(c_nmt_s.outputs["Red"], d_nmt_s.outputs["Red"], misc_dmg, -1520, y_base - 350)
+                ny_s = _lerp_float(c_nmt_s.outputs["Green"], d_nmt_s.outputs["Green"], misc_dmg, -1520, y_base - 420)
+                sm_s = _lerp_float(c_nmt_s.outputs["Blue"], d_nmt_s.outputs["Blue"], misc_dmg, -1520, y_base - 490)
+            elif c_nmt_s is not None:
+                nx_s, ny_s, sm_s = c_nmt_s.outputs["Red"], c_nmt_s.outputs["Green"], c_nmt_s.outputs["Blue"]
+            else:
+                nx_s, ny_s, sm_s = 0.5, 0.5, 0.45
+
+            pair_cache[pkey] = {
+                "raw_clr": raw_clr,
+                "rfl": rfl_s,
+                "mao": mao_s,
+                "paint_mask": pm_s,
+                "nx": nx_s,
+                "ny": ny_s,
+                "smooth": sm_s,
+            }
+
+        pd = pair_cache[pkey]
+        # Exact DXIL Paint LUT Tint: `lerp(raw_clr, raw_clr * (2.0 * PaintLUT_132_5), PaintMask)`
+        p_srgb = cinfo.get("paint_lut_srgb") or [0.502, 0.502, 0.502]
+        lut_idx = int(cinfo.get("color_lut_idx", 0))
+        if lut_idx == 0 or (abs(p_srgb[0] - 0.502) < 0.01 and abs(p_srgb[1] - 0.502) < 0.01 and abs(p_srgb[2] - 0.502) < 0.01):
+            c_col = pd["raw_clr"]
+        else:
+            # 2.0 * paint_lut_srgb (clamped cleanly after multiplying raw_clr)
+            t_mul = nt.nodes.new("ShaderNodeVectorMath")
+            t_mul.operation = "MULTIPLY"
+            t_mul.inputs[1].default_value = (float(p_srgb[0]) * 2.0, float(p_srgb[1]) * 2.0, float(p_srgb[2]) * 2.0)
+            t_mul.label = f"C{ci} PaintLUT[{lut_idx}] * 2"
+            t_mul.location = (-1260, y_base + 40)
+            nt.links.new(pd["raw_clr"], t_mul.inputs[0])
+
+            pm = pd["paint_mask"]
+            if isinstance(pm, (int, float)):
+                c_col = t_mul.outputs["Vector"] if pm >= 0.5 else pd["raw_clr"]
+            else:
+                c_col = _lerp_rgba(pd["raw_clr"], t_mul.outputs["Vector"], pm, -1040, y_base + 40, f"C{ci} PaintMask Blend")
+
+        corner_data[ci] = {
+            "clr": c_col,
+            "rfl": pd["rfl"],
+            "mao": pd["mao"],
+            "nx": pd["nx"],
+            "ny": pd["ny"],
+            "smooth": pd["smooth"],
+            "rust_mult": float(cinfo.get("rust_mult", 1.0)),
+        }
+
+    # Fill inactive corners from dominant corner (zero extra texture nodes!)
+    dom_d = corner_data.get(dom_corner) or next(iter(corner_data.values()))
+    all_c = [corner_data.get(i, dom_d) for i in range(8)]
+
+    # 3. Blend active corners via exact DXIL 8-corner `MSK.RGB` trilinear tree (or direct if 1 corner!)
+    if msk_img is not None and len(active_ids) > 1:
+        t_msk = nt.nodes.new("ShaderNodeTexImage")
+        t_msk.image = msk_img
+        t_msk.label = "HFW Titan Macro MSK (8-Corner RGB)"
+        t_msk.location = (-1680, -1720)
+        sep_mk = nt.nodes.new("ShaderNodeSeparateColor")
+        sep_mk.location = (-1400, -1720)
+        nt.links.new(t_msk.outputs["Color"], sep_mk.inputs["Color"])
+
+        def _sharp(sock, lbl: str, y: float):
+            mr = nt.nodes.new("ShaderNodeMapRange")
+            mr.clamp = True
+            mr.label = f"Sharpen {lbl}"
+            mr.inputs["From Min"].default_value = 0.42
+            mr.inputs["From Max"].default_value = 0.58
+            mr.inputs["To Min"].default_value = 0.0
+            mr.inputs["To Max"].default_value = 1.0
+            mr.location = (-1180, y)
+            nt.links.new(sock, mr.inputs["Value"])
+            return mr.outputs["Result"]
+
+        r_bit = _sharp(sep_mk.outputs["Red"], "MSK.R", -1560)
+        g_bit = _sharp(sep_mk.outputs["Green"], "MSK.G", -1720)
+        b_bit = _sharp(sep_mk.outputs["Blue"], "MSK.B", -1880)
+
+        def _tri_rgba(vals: list[Any], x0: float, y0: float):
+            # Exact DXIL corner order: (0,0,0)=0, (1,0,0)=1, (0,1,0)=2, (1,1,0)=6, (0,0,1)=3, (1,0,1)=5, (0,1,1)=4, (1,1,1)=7
+            c00 = _lerp_rgba(vals[0], vals[1], r_bit, x0, y0 + 210)
+            c10 = _lerp_rgba(vals[2], vals[6], r_bit, x0, y0 + 70)
+            c01 = _lerp_rgba(vals[3], vals[5], r_bit, x0, y0 - 70)
+            c11 = _lerp_rgba(vals[4], vals[7], r_bit, x0, y0 - 210)
+            cb0 = _lerp_rgba(c00, c10, g_bit, x0 + 180, y0 + 120)
+            cb1 = _lerp_rgba(c01, c11, g_bit, x0 + 180, y0 - 120)
+            return _lerp_rgba(cb0, cb1, b_bit, x0 + 360, y0)
+
+        def _tri_float(vals: list[Any], x0: float, y0: float):
+            f00 = _lerp_float(vals[0], vals[1], r_bit, x0, y0 + 150)
+            f10 = _lerp_float(vals[2], vals[6], r_bit, x0, y0 + 50)
+            f01 = _lerp_float(vals[3], vals[5], r_bit, x0, y0 - 50)
+            f11 = _lerp_float(vals[4], vals[7], r_bit, x0, y0 - 150)
+            fb0 = _lerp_float(f00, f10, g_bit, x0 + 160, y0 + 90)
+            fb1 = _lerp_float(f01, f11, g_bit, x0 + 160, y0 - 90)
+            return _lerp_float(fb0, fb1, b_bit, x0 + 320, y0)
+
+        metal_srgb = _tri_rgba([d["clr"] for d in all_c], -760, 420)
+        metal_rfl = _tri_float([d["rfl"] for d in all_c], -760, -140)
+        metal_smooth = _tri_float([d["smooth"] for d in all_c], -760, -560)
+        metal_mao = _tri_float([d["mao"] for d in all_c], -760, -960)
+        metal_nx = _tri_float([d["nx"] for d in all_c], -760, -1380)
+        metal_ny = _tri_float([d["ny"] for d in all_c], -760, -1800)
+        rust_mult = _tri_float([d["rust_mult"] for d in all_c], -760, -2180)
+    else:
+        metal_srgb = dom_d["clr"]
+        metal_rfl = dom_d["rfl"]
+        metal_smooth = dom_d["smooth"]
+        metal_mao = dom_d["mao"]
+        metal_nx = dom_d["nx"]
+        metal_ny = dom_d["ny"]
+        rust_mult = dom_d["rust_mult"]
+
+    # 4. Exact DXIL Corroded Iron-Oxide Rust Layer (`64:0/1/3`, BEFORE Gamma 2.2!)
+    srgb_cur = metal_srgb
+    rfl_cur = metal_rfl
+    smooth_cur = metal_smooth
+    micro_nx_cur = metal_nx
+    micro_ny_cur = metal_ny
+
+    rust_clr_img = _load_image(tex_dir, titan.get("rust_clr_file", ""), "Non-Color", img_cache)
+    rust_nmt_img = _load_image(tex_dir, titan.get("rust_nmt_file", ""), "Non-Color", img_cache)
+    rust_hgt_img = _load_image(tex_dir, titan.get("rust_hgt_file", ""), "Non-Color", img_cache)
+    if rust_clr_img is not None and misc_rust is not None:
+        uv_rust = _get_scaled_uv(24.0)
+        t_rc = nt.nodes.new("ShaderNodeTexImage")
+        t_rc.image = rust_clr_img
+        t_rc.label = "HFW Rust_CLR (64:0)"
+        t_rc.location = (-280, 920)
+        nt.links.new(uv_rust, t_rc.inputs["Vector"])
+
+        rlut = titan.get("rust_lut_srgb") or [0.435, 0.248, 0.172]
+        r_col = nt.nodes.new("ShaderNodeVectorMath")
+        r_col.operation = "MULTIPLY"
+        r_col.inputs[1].default_value = (float(rlut[0]) * 1.45, float(rlut[1]) * 1.40, float(rlut[2]) * 1.38)
+        r_col.label = "Rust_CLR * RustLUT (64:3)"
+        r_col.location = (20, 920)
+        nt.links.new(t_rc.outputs["Color"], r_col.inputs[0])
+
+        # Height-broken rust mask (matching DXIL ps_1256_1_p1.ll): preserves dominant dark charcoal-black Faro
+        # gunmetal armor plates while pitting seams, crevices, and corrosion streaks with weathered dark rust!
+        rm_base = nt.nodes.new("ShaderNodeMapRange")
+        rm_base.interpolation_type = "SMOOTHSTEP"
+        rm_base.clamp = True
+        rm_base.label = "Rust Mask (MISC.G)"
+        rm_base.inputs["From Min"].default_value = 0.36
+        rm_base.inputs["From Max"].default_value = 0.94
+        rm_base.inputs["To Min"].default_value = 0.0
+        rm_base.inputs["To Max"].default_value = 0.72
+        rm_base.location = (-260, 680)
+        nt.links.new(misc_rust, rm_base.inputs["Value"])
+        rust_m = rm_base.outputs["Result"]
+
+        if macro_ao is not None:
+            # Subtle crevice rust boost `(0.75 - AO) * 0.22`
+            ao_inv = nt.nodes.new("ShaderNodeMapRange")
+            ao_inv.clamp = True
+            ao_inv.inputs["From Min"].default_value = 0.10
+            ao_inv.inputs["From Max"].default_value = 0.72
+            ao_inv.inputs["To Min"].default_value = 0.22
+            ao_inv.inputs["To Max"].default_value = 0.0
+            ao_inv.location = (-260, 500)
+            nt.links.new(macro_ao, ao_inv.inputs["Value"])
+            r_add = nt.nodes.new("ShaderNodeMath")
+            r_add.operation = "ADD"
+            r_add.use_clamp = True
+            r_add.location = (-60, 620)
+            nt.links.new(rust_m, r_add.inputs[0])
+            nt.links.new(ao_inv.outputs["Result"], r_add.inputs[1])
+            rust_m = r_add.outputs["Value"]
+
+        # Height-map corrosion breakup (`Rust_HGT` 64:0 -> crisp jagged pitted rust edges!)
+        if rust_hgt_img is not None:
+            t_rh = nt.nodes.new("ShaderNodeTexImage")
+            t_rh.image = rust_hgt_img
+            t_rh.label = "HFW Rust_HGT (64:0)"
+            t_rh.location = (-480, 1140)
+            nt.links.new(uv_rust, t_rh.inputs["Vector"])
+            rh_mr = nt.nodes.new("ShaderNodeMapRange")
+            rh_mr.clamp = True
+            rh_mr.inputs["From Min"].default_value = 0.20
+            rh_mr.inputs["From Max"].default_value = 0.85
+            rh_mr.inputs["To Min"].default_value = 0.18
+            rh_mr.inputs["To Max"].default_value = 1.0
+            rh_mr.location = (-180, 1140)
+            nt.links.new(t_rh.outputs["Color"], rh_mr.inputs["Value"])
+            rh_mul = nt.nodes.new("ShaderNodeMath")
+            rh_mul.operation = "MULTIPLY"
+            rh_mul.use_clamp = True
+            rh_mul.location = (20, 720)
+            nt.links.new(rust_m, rh_mul.inputs[0])
+            nt.links.new(rh_mr.outputs["Result"], rh_mul.inputs[1])
+            rust_m = rh_mul.outputs["Value"]
+
+        # Multiply by corner rust_mult (e.g. 0.3 on bare steel corner 3)
+        r_mul_c = nt.nodes.new("ShaderNodeMath")
+        r_mul_c.operation = "MULTIPLY"
+        r_mul_c.use_clamp = True
+        r_mul_c.label = "Rust * CornerRustMult"
+        r_mul_c.location = (160, 620)
+        nt.links.new(rust_m, r_mul_c.inputs[0])
+        if isinstance(rust_mult, (int, float)):
+            r_mul_c.inputs[1].default_value = float(rust_mult)
+        else:
+            nt.links.new(rust_mult, r_mul_c.inputs[1])
+        rust_mask = r_mul_c.outputs["Value"]
+
+        srgb_cur = _lerp_rgba(srgb_cur, r_col.outputs["Vector"], rust_mask, 320, 580, "Metal <-> Rust Albedo")
+        rfl_cur = _lerp_float(rfl_cur, 0.16, rust_mask, 320, -140, "Metal <-> Rust RFL")
+        smooth_cur = _lerp_float(smooth_cur, 0.16, rust_mask, 320, -480, "Metal <-> Rust Smoothness")
+
+        if rust_nmt_img is not None:
+            t_rn = nt.nodes.new("ShaderNodeTexImage")
+            t_rn.image = rust_nmt_img
+            t_rn.label = "HFW Rust_NMT (64:1)"
+            t_rn.location = (-280, -1240)
+            nt.links.new(uv_rust, t_rn.inputs["Vector"])
+            sep_rn = nt.nodes.new("ShaderNodeSeparateColor")
+            sep_rn.location = (0, -1240)
+            nt.links.new(t_rn.outputs["Color"], sep_rn.inputs["Color"])
+            micro_nx_cur = _lerp_float(micro_nx_cur, sep_rn.outputs["Red"], rust_mask, 320, -1240)
+            micro_ny_cur = _lerp_float(micro_ny_cur, sep_rn.outputs["Green"], rust_mask, 320, -1420)
+
+    # 5. Subtle DXIL Grunge / Oil Grime Layer (`132:1`, 0.5-centered, BEFORE Gamma 2.2!)
+    grunge_clr_img = _load_image(tex_dir, titan.get("grunge_clr_file", ""), "Non-Color", img_cache)
+    if grunge_clr_img is not None and misc_grunge is not None:
+        t_gc = nt.nodes.new("ShaderNodeTexImage")
+        t_gc.image = grunge_clr_img
+        t_gc.label = "HFW Grunge_CLR (132:1)"
+        t_gc.location = (60, 1180)
+        nt.links.new(_get_scaled_uv(24.0), t_gc.inputs["Vector"])
+
+        g_x2 = nt.nodes.new("ShaderNodeVectorMath")
+        g_x2.operation = "SCALE"
+        g_x2.inputs["Scale"].default_value = 1.85
+        g_x2.location = (320, 1180)
+        nt.links.new(t_gc.outputs["Color"], g_x2.inputs[0])
+
+        g_w = nt.nodes.new("ShaderNodeMath")
+        g_w.operation = "MULTIPLY"
+        g_w.inputs[1].default_value = 0.40
+        g_w.use_clamp = True
+        g_w.location = (320, 1020)
+        nt.links.new(misc_grunge, g_w.inputs[0])
+
+        g_mul = nt.nodes.new("ShaderNodeMix")
+        g_mul.data_type = "RGBA"
+        g_mul.blend_type = "MULTIPLY"
+        g_mul.clamp_result = True
+        g_mul.label = "Apply Grunge (MISC.B)"
+        g_mul.location = (520, 580)
+        nt.links.new(g_w.outputs["Value"], g_mul.inputs["Factor"])
+        nt.links.new(srgb_cur, g_mul.inputs[6])
+        nt.links.new(g_x2.outputs["Vector"], g_mul.inputs[7])
+        srgb_cur = g_mul.outputs[2]
+
+    # 6. CRITICAL EXACT DXIL `pow(rgb, 2.2)` (ps_1256_1_p1.ll L1953-1961):
+    #    Converts Linear-header sRGB-stored Group-132 Paint/Rust into authentic deep gunmetal linear PBR!
+    gam_22 = nt.nodes.new("ShaderNodeGamma")
+    gam_22.inputs["Gamma"].default_value = 2.2
+    gam_22.label = "DXIL pow(rgb, 2.2) -> Linear PBR"
+    gam_22.location = (700, 560)
+    nt.links.new(srgb_cur, gam_22.inputs["Color"])
+    lin_cur = gam_22.outputs["Color"]
+
+    # 7. Apply Baked 4K Curvature (`NMT.A`) & Baked AO (`MacroAO * MicroAO`) in Linear Space
+    if macro_crv is not None:
+        crv_mr = nt.nodes.new("ShaderNodeMapRange")
+        crv_mr.clamp = True
+        crv_mr.label = "4K Curvature Edge Highlight"
+        crv_mr.inputs["From Min"].default_value = 0.25
+        crv_mr.inputs["From Max"].default_value = 0.75
+        crv_mr.inputs["To Min"].default_value = 0.80
+        crv_mr.inputs["To Max"].default_value = 1.28
+        crv_mr.location = (560, 320)
+        nt.links.new(macro_crv, crv_mr.inputs["Value"])
+
+        crv_sc = nt.nodes.new("ShaderNodeVectorMath")
+        crv_sc.operation = "SCALE"
+        crv_sc.location = (740, 360)
+        nt.links.new(lin_cur, crv_sc.inputs[0])
+        nt.links.new(crv_mr.outputs["Result"], crv_sc.inputs["Scale"])
+        lin_cur = crv_sc.outputs["Vector"]
+
+    if macro_ao is not None:
+        ao_comb = macro_ao
+        if not isinstance(metal_mao, (int, float)):
+            ao_m = nt.nodes.new("ShaderNodeMath")
+            ao_m.operation = "MULTIPLY"
+            ao_m.use_clamp = True
+            ao_m.location = (560, 140)
+            nt.links.new(macro_ao, ao_m.inputs[0])
+            nt.links.new(metal_mao, ao_m.inputs[1])
+            ao_comb = ao_m.outputs["Value"]
+        ao_mul = nt.nodes.new("ShaderNodeMix")
+        ao_mul.data_type = "RGBA"
+        ao_mul.blend_type = "MULTIPLY"
+        ao_mul.inputs["Factor"].default_value = 0.86
+        ao_mul.label = "Apply 4K Macro+Micro AO"
+        ao_mul.location = (880, 440)
+        nt.links.new(lin_cur, ao_mul.inputs[6])
+        nt.links.new(ao_comb, ao_mul.inputs[7])
+        lin_cur = ao_mul.outputs[2]
+
+    # 8. Exact DXIL World-Up StarMoss Overgrowth (`1:0/1/2`, AFTER Gamma 2.2 — ONLY on upward-facing surfaces!)
+    moss_str = float(titan.get("moss_strength", 0.0))
+    moss_clr_img = _load_image(tex_dir, titan.get("moss_clr_file", ""), "Non-Color", img_cache) if moss_str > 0.01 else None
+    moss_nmt_img = _load_image(tex_dir, titan.get("moss_nmt_file", ""), "Non-Color", img_cache) if moss_str > 0.01 else None
+    if moss_clr_img is not None:
+        geom = nt.nodes.new("ShaderNodeNewGeometry")
+        geom.location = (180, 1620)
+        sep_gn = nt.nodes.new("ShaderNodeSeparateXYZ")
+        sep_gn.location = (380, 1620)
+        nt.links.new(geom.outputs["Normal"], sep_gn.inputs["Vector"])
+
+        # Only upward-facing carapace/leg tops (`worldNormal.Z > 0.42`) grow jungle moss!
+        up_mr = nt.nodes.new("ShaderNodeMapRange")
+        up_mr.interpolation_type = "SMOOTHSTEP"
+        up_mr.clamp = True
+        up_mr.label = "World-Up Moss Slope (Normal.Z)"
+        up_mr.inputs["From Min"].default_value = 0.42
+        up_mr.inputs["From Max"].default_value = 0.86
+        up_mr.inputs["To Min"].default_value = 0.0
+        up_mr.inputs["To Max"].default_value = 1.0
+        up_mr.location = (560, 1620)
+        nt.links.new(sep_gn.outputs["Z"], up_mr.inputs["Value"])
+
+        # Macro world-space 3D patch breakup (replaces DXIL `15:0` 3D noise!)
+        ns_m = nt.nodes.new("ShaderNodeTexNoise")
+        ns_m.inputs["Scale"].default_value = 0.08
+        ns_m.inputs["Detail"].default_value = 5.0
+        ns_m.inputs["Roughness"].default_value = 0.62
+        ns_m.label = "World Moss Patch Noise (15:0)"
+        ns_m.location = (380, 1400)
+        nt.links.new(geom.outputs["Position"], ns_m.inputs["Vector"])
+
+        ns_mr = nt.nodes.new("ShaderNodeMapRange")
+        ns_mr.interpolation_type = "SMOOTHSTEP"
+        ns_mr.clamp = True
+        ns_mr.inputs["From Min"].default_value = 0.50
+        ns_mr.inputs["From Max"].default_value = 0.78
+        ns_mr.inputs["To Min"].default_value = 0.0
+        ns_mr.inputs["To Max"].default_value = 1.0
+        ns_mr.location = (560, 1400)
+        nt.links.new(ns_m.outputs["Fac"], ns_mr.inputs["Value"])
+
+        m_msk = nt.nodes.new("ShaderNodeMath")
+        m_msk.operation = "MULTIPLY"
+        m_msk.use_clamp = True
+        m_msk.location = (740, 1520)
+        nt.links.new(up_mr.outputs["Result"], m_msk.inputs[0])
+        nt.links.new(ns_mr.outputs["Result"], m_msk.inputs[1])
+
+        m_scl = nt.nodes.new("ShaderNodeMath")
+        m_scl.operation = "MULTIPLY"
+        m_scl.inputs[1].default_value = moss_str
+        m_scl.use_clamp = True
+        m_scl.label = "Final Top-Surface Moss Mask"
+        m_scl.location = (900, 1520)
+        nt.links.new(m_msk.outputs["Value"], m_scl.inputs[0])
+        moss_mask = m_scl.outputs["Value"]
+
+        # Lush dark rainforest StarMoss (`MossLUT * StarMoss_clr`, gamma 2.2)
+        uv_moss = _get_scaled_uv(18.0)
+        t_mc = nt.nodes.new("ShaderNodeTexImage")
+        t_mc.image = moss_clr_img
+        t_mc.label = "HFW StarMoss_clr (1:1)"
+        t_mc.location = (380, 1140)
+        nt.links.new(uv_moss, t_mc.inputs["Vector"])
+
+        mlut = titan.get("moss_lut_srgb") or [0.255, 0.355, 0.078]
+        m_tint = nt.nodes.new("ShaderNodeVectorMath")
+        m_tint.operation = "MULTIPLY"
+        m_tint.inputs[1].default_value = (float(mlut[0]) * 1.65, float(mlut[1]) * 1.80, float(mlut[2]) * 1.55)
+        m_tint.label = "StarMoss * MossLUT (1:0)"
+        m_tint.location = (640, 1140)
+        nt.links.new(t_mc.outputs["Color"], m_tint.inputs[0])
+
+        m_gam = nt.nodes.new("ShaderNodeGamma")
+        m_gam.inputs["Gamma"].default_value = 2.2
+        m_gam.location = (820, 1140)
+        nt.links.new(m_tint.outputs["Vector"], m_gam.inputs["Color"])
+
+        lin_cur = _lerp_rgba(lin_cur, m_gam.outputs["Color"], moss_mask, 1040, 520, "Hull <-> Top-Up StarMoss")
+        rfl_cur = _lerp_float(rfl_cur, 0.12, moss_mask, 780, -140, "Hull <-> Moss RFL")
+        smooth_cur = _lerp_float(smooth_cur, 0.12, moss_mask, 780, -480, "Hull <-> Moss Smoothness")
+
+        if moss_nmt_img is not None:
+            t_msn = nt.nodes.new("ShaderNodeTexImage")
+            t_msn.image = moss_nmt_img
+            t_msn.label = "HFW StarMoss_nmt (1:2)"
+            t_msn.location = (380, -1520)
+            nt.links.new(uv_moss, t_msn.inputs["Vector"])
+            sep_msn = nt.nodes.new("ShaderNodeSeparateColor")
+            sep_msn.location = (640, -1520)
+            nt.links.new(t_msn.outputs["Color"], sep_msn.inputs["Color"])
+            micro_nx_cur = _lerp_float(micro_nx_cur, sep_msn.outputs["Red"], moss_mask, 820, -1420)
+            micro_ny_cur = _lerp_float(micro_ny_cur, sep_msn.outputs["Green"], moss_mask, 820, -1600)
+
+    # 9. Exact HFW Decima PBR Conversion (`Smoothness -> Roughness`, `Reflectance -> Metallic & F0 = RFL^2`)
+    pbr_grp = nt.nodes.new("ShaderNodeGroup")
+    pbr_grp.node_tree = _ensure_decima_pbr_node_group()
+    pbr_grp.label = "HFW Decima PBR (Titan Steel/Paint)"
+    pbr_grp.location = (1180, 200)
+    nt.links.new(lin_cur, pbr_grp.inputs["Color"])
+    if isinstance(smooth_cur, (int, float)):
+        pbr_grp.inputs["Smoothness"].default_value = float(smooth_cur)
+    else:
+        nt.links.new(smooth_cur, pbr_grp.inputs["Smoothness"])
+    if isinstance(rfl_cur, (int, float)):
+        pbr_grp.inputs["Reflectance"].default_value = float(rfl_cur)
+    else:
+        nt.links.new(rfl_cur, pbr_grp.inputs["Reflectance"])
+    pbr_grp.inputs["AO"].default_value = 1.0  # Already folded Macro+Micro AO in linear space!
+
+    nt.links.new(pbr_grp.outputs["Base Color"], bsdf.inputs["Base Color"])
+    nt.links.new(pbr_grp.outputs["Metallic"], bsdf.inputs["Metallic"])
+    nt.links.new(pbr_grp.outputs["Roughness"], bsdf.inputs["Roughness"])
+    if "Specular IOR Level" in bsdf.inputs:
+        nt.links.new(pbr_grp.outputs["Specular IOR Level"], bsdf.inputs["Specular IOR Level"])
+
+    # 10. Combine Macro 4K Normal + Micro/Rust/Moss Normal via Tangent-Space UDN Addition
+    if macro_nx is not None and macro_ny is not None:
+        def _udn_comb(mac_s, mic_s, y: float):
+            if isinstance(mic_s, (int, float)):
+                return mac_s
+            off = nt.nodes.new("ShaderNodeMath")
+            off.operation = "MULTIPLY_ADD"
+            off.inputs[1].default_value = 0.72
+            off.inputs[2].default_value = -0.36
+            off.location = (960, y)
+            nt.links.new(mic_s, off.inputs[0])
+            sm = nt.nodes.new("ShaderNodeMath")
+            sm.operation = "ADD"
+            sm.use_clamp = True
+            sm.location = (1120, y)
+            nt.links.new(mac_s, sm.inputs[0])
+            nt.links.new(off.outputs["Value"], sm.inputs[1])
+            return sm.outputs["Value"]
+
+        nx_fin = _udn_comb(macro_nx, micro_nx_cur, -1180)
+        ny_fin = _udn_comb(macro_ny, micro_ny_cur, -1380)
+        nrm_rec = nt.nodes.new("ShaderNodeGroup")
+        nrm_rec.node_tree = _ensure_normal_reconstruct_z_group()
+        nrm_rec.inputs["Flip Green"].default_value = 0.0
+        nrm_rec.location = (1260, -1240)
+        nt.links.new(nx_fin, nrm_rec.inputs["Normal X"])
+        nt.links.new(ny_fin, nrm_rec.inputs["Normal Y"])
+        nrm_map = nt.nodes.new("ShaderNodeNormalMap")
+        nrm_map.location = (1440, -1240)
+        nt.links.new(nrm_rec.outputs["Normal RGB"], nrm_map.inputs["Color"])
+        nt.links.new(nrm_map.outputs["Normal"], bsdf.inputs["Normal"])
+
+    # 11. Optional DXIL Deep-Crevice Molten Heat Glow on Horus Heat-Sinks / InteractivePlates / Drill Weakspots!
+    heat_def = float(titan.get("heat_glow_default", 0.0))
+    if heat_def > 0.01 and macro_ao is not None and "Emission Color" in bsdf.inputs:
+        mctrl = nt.nodes.new("ShaderNodeGroup")
+        mctrl.node_tree = _ensure_machine_shader_control_group()
+        mctrl.label = "HFW Machine Shader Control"
+        mctrl.location = (740, -760)
+
+        # Exact DXIL `(1 - AO)^4` deep crevice glow: cooling vents & drill canisters burn hot inside recesses!
+        h_inv = nt.nodes.new("ShaderNodeMapRange")
+        h_inv.clamp = True
+        h_inv.label = "Crevice Heat (1 - MacroAO)"
+        h_inv.inputs["From Min"].default_value = 0.04
+        h_inv.inputs["From Max"].default_value = 0.68
+        h_inv.inputs["To Min"].default_value = 1.0
+        h_inv.inputs["To Max"].default_value = 0.0
+        h_inv.location = (780, -960)
+        nt.links.new(macro_ao, h_inv.inputs["Value"])
+
+        h_pow = nt.nodes.new("ShaderNodeMath")
+        h_pow.operation = "POWER"
+        h_pow.inputs[1].default_value = 3.2
+        h_pow.use_clamp = True
+        h_pow.location = (960, -960)
+        nt.links.new(h_inv.outputs["Result"], h_pow.inputs[0])
+
+        t_drv = _add_time_driver_node(nt, (540, -1080), "HFW Titan Heat Pulse Time")
+        t_f = nt.nodes.new("ShaderNodeMath")
+        t_f.operation = "MULTIPLY"
+        t_f.inputs[1].default_value = 2.4
+        t_f.location = (720, -1080)
+        nt.links.new(t_drv.outputs[0], t_f.inputs[0])
+        s_p = nt.nodes.new("ShaderNodeMath")
+        s_p.operation = "SINE"
+        s_p.location = (860, -1080)
+        nt.links.new(t_f.outputs["Value"], s_p.inputs[0])
+        p_mod = nt.nodes.new("ShaderNodeMath")
+        p_mod.operation = "MULTIPLY_ADD"
+        p_mod.inputs[1].default_value = 0.16
+        p_mod.inputs[2].default_value = 0.88
+        p_mod.location = (1000, -1080)
+        nt.links.new(s_p.outputs["Value"], p_mod.inputs[0])
+
+        h_m1 = nt.nodes.new("ShaderNodeMath")
+        h_m1.operation = "MULTIPLY"
+        h_m1.location = (1140, -960)
+        nt.links.new(h_pow.outputs["Value"], h_m1.inputs[0])
+        nt.links.new(p_mod.outputs["Value"], h_m1.inputs[1])
+
+        h_str = nt.nodes.new("ShaderNodeMath")
+        h_str.operation = "MULTIPLY"
+        h_str.inputs[1].default_value = heat_def * 9.0
+        h_str.location = (1280, -960)
+        nt.links.new(h_m1.outputs["Value"], h_str.inputs[0])
+
+        h_fin = nt.nodes.new("ShaderNodeMath")
+        h_fin.operation = "MULTIPLY"
+        h_fin.location = (1400, -920)
+        nt.links.new(h_str.outputs["Value"], h_fin.inputs[0])
+        nt.links.new(mctrl.outputs["Muscle Glow Scale"], h_fin.inputs[1])
+
+        hc_deep = titan.get("heat_color_deep") or [0.75, 0.03, 0.002]
+        h_col = nt.nodes.new("ShaderNodeMix")
+        h_col.data_type = "RGBA"
+        h_col.label = "Deep Crimson -> Molten Orange"
+        h_col.inputs[6].default_value = (hc_deep[0], hc_deep[1], hc_deep[2], 1.0)
+        h_col.location = (1140, -760)
+        nt.links.new(h_pow.outputs["Value"], h_col.inputs["Factor"])
+        nt.links.new(mctrl.outputs["Muscle Color"], h_col.inputs[7])
+
+        nt.links.new(h_col.outputs[2], bsdf.inputs["Emission Color"])
+        if "Emission Strength" in bsdf.inputs:
+            nt.links.new(h_fin.outputs["Value"], bsdf.inputs["Emission Strength"])
+
+    return True
+
+
 def _build_material(
     mat_meta: dict[str, Any],
     tex_dir: Path,
@@ -3580,6 +4307,12 @@ def _build_material(
     outfit_layered = mat_meta.get("outfit_layered")
     if outfit_layered and outfit_layered.get("layers"):
         if _build_layered_outfit_material(mat, outfit_layered, tex_dir, img_cache):
+            return mat
+
+    # Check if this is a Horus / FAS-BOR7 Titan 26-TB Group-132 Layered Hull Material!
+    titan_layered = mat_meta.get("titan_layered")
+    if titan_layered and titan_layered.get("corners"):
+        if _build_titan_layered_material(mat, titan_layered, tex_dir, img_cache):
             return mat
 
     # Standard Decima Machine/Armor Deferred PBR Shader (`HFW_MachineDetailArray` -> `HFW_DecimaPBR` -> `Principled BSDF`)
@@ -3939,13 +4672,34 @@ def _build_material(
         nt.links.new(g_scl.outputs["Value"], m_dust.inputs["Factor"])
         nt.links.new(m_rock.outputs[2], m_dust.inputs[6])
         color_sock = m_dust.outputs[2]
+    elif sprof == "foliage" and mat_meta.get("uses_foliage_lut") and color_sock is not None:
+        # Exact HFW Biome Foliage LUT (`1:0`) reconstruction for neutralized 0.5-centered leaf maps
+        # (Kapok, Carapa, Mangrove, Strangler Fig, Monstera, Forest Ivy): `4.5948 * FoliageLUT_linear * Leaf_linear`!
+        ft_lin = mat_meta.get("foliage_tint_linear") or [0.062, 0.160, 0.018]
+        fl_exp = nt.nodes.new("ShaderNodeVectorMath")
+        fl_exp.operation = "SCALE"
+        fl_exp.inputs["Scale"].default_value = 4.5948
+        fl_exp.label = "Neutral-0.5 Leaf Expand (2^2.2)"
+        fl_exp.location = (-220, 340)
+        nt.links.new(color_sock, fl_exp.inputs[0])
+
+        fl_mul = nt.nodes.new("ShaderNodeMix")
+        fl_mul.data_type = "RGBA"
+        fl_mul.blend_type = "MULTIPLY"
+        fl_mul.clamp_result = True
+        fl_mul.inputs["Factor"].default_value = 1.0
+        fl_mul.inputs[7].default_value = (float(ft_lin[0]), float(ft_lin[1]), float(ft_lin[2]), 1.0)
+        fl_mul.label = "HFW Biome Foliage LUT Tint (1:0)"
+        fl_mul.location = (20, 360)
+        nt.links.new(fl_exp.outputs["Vector"], fl_mul.inputs[6])
+        color_sock = fl_mul.outputs[2]
 
     # 3. Exact DXIL-verified Decima PBR Conversion (`HFW_DecimaPBR`):
     #    - Inverts Decima Smoothness -> true PBR Roughness (fixes plastic shine on matte paint + matte edges on bare metal!)
     #    - Converts Decima Specular/Reflectance -> Blender Metallic + Base Color ONLY on potentially metallic surfaces
     #      (NEVER on Hair / Skin / Foliage / Landscape Rock, where `Reflectance` is hair sheen/scatter — e.g. Aloy's
     #      `181:1.R` jumps to 0.75-1.0 at the hair tips, which must stay dielectric hair sheen, NOT copper metal!)
-    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "snow", "rock_volcanic", "rock_tint")
+    _DIELECTRIC_PROFILES = ("hair", "hair_face", "skin", "eye", "teeth", "foliage", "bark", "snow", "rock_volcanic", "rock_tint")
     if sprof in ("rock_volcanic", "rock_tint"):
         # Per DXIL `8490:1` L1020 (`0x3FD99999A0000000 = 0.40` max rock smoothness): remap `_LUM` / macro Smoothness
         # into realistic dry basalt/stone Smoothness (`0.08..0.34` -> PBR Roughness `0.66..0.92`, ZERO wet plastic shine!)
@@ -4499,7 +5253,12 @@ def _build_material(
             _configure_blended_material(mat)
             if hasattr(mat, "blend_method"):
                 try:
-                    mat.blend_method = "CLIP"
+                    mat.blend_method = "HASHED"
+                except Exception:
+                    pass
+            if hasattr(mat, "use_backface_culling"):
+                try:
+                    mat.use_backface_culling = False
                 except Exception:
                     pass
             if "Alpha" not in sockets and "Mask_Alpha" in sockets:
@@ -4508,6 +5267,13 @@ def _build_material(
             bsdf.inputs["Subsurface Weight"].default_value = 0.35
         if "Subsurface Scale" in bsdf.inputs:
             bsdf.inputs["Subsurface Scale"].default_value = 0.02
+        if "Subsurface Radius" in bsdf.inputs:
+            bsdf.inputs["Subsurface Radius"].default_value = (0.45, 0.88, 0.16)
+    elif sprof == "bark":
+        if smooth_sock is None:
+            bsdf.inputs["Roughness"].default_value = 0.84
+        if "Specular IOR Level" in bsdf.inputs:
+            bsdf.inputs["Specular IOR Level"].default_value = 0.30
     elif sprof == "cloth":
         if "Sheen Weight" in bsdf.inputs:
             bsdf.inputs["Sheen Weight"].default_value = 0.45
@@ -4643,170 +5409,183 @@ def _build_part_mesh_object(
     helper_bone_map: dict[str, str],
     target_coll: bpy.types.Collection,
     entity_id: str,
+    shared_mesh_cache: dict[str, bpy.types.Mesh] | None = None,
 ) -> bpy.types.Object | None:
     """Create a Blender mesh object combining the part's primitives, with skinning OR exact bone parenting."""
     prims = part_meta["primitives"]
     if not prims:
         return None
 
-    all_pos = []
-    all_nrm = []
-    all_col0 = []
-    all_faces = []
-    face_mat_indices = []
-    all_uvs: list[list[np.ndarray]] = []
-    all_bi = []
-    all_bw = []
-
-    max_uvs = max(p["uv_count"] for p in prims)
-    has_any_col0 = any(p.get("color_count", 0) > 0 for p in prims)
-    has_all_nrm = all(p["has_normals"] for p in prims)
-    has_any_weights = part_meta["is_skinned"] and any(p["has_weights"] for p in prims)
-    for _ in range(max_uvs):
-        all_uvs.append([])
-
-    used_mats: list[bpy.types.Material | None] = []
-    mat_slot_lookup: dict[str | None, int] = {}
-    vert_offset = 0
-
-    for prim in prims:
-        key = prim["key"]
-        pos = npz[f"{key}_pos"].astype(np.float32, copy=True)
-        idx = npz[f"{key}_idx"]
-        n_verts = len(pos)
-        if n_verts == 0 or len(idx) < 3:
-            continue
-
-        mid = prim["material_id"]
-        mat_obj = mat_map.get(mid) if mid else None
-        if mid not in mat_slot_lookup:
-            mat_slot_lookup[mid] = len(used_mats)
-            used_mats.append(mat_obj)
-        mslot = mat_slot_lookup[mid]
-
-        nrm_arr = npz[f"{key}_nrm"] if (f"{key}_nrm" in npz) else None
-
-        # CRITICAL CYCLES & EEVEE FIX:
-        # In Decima, `muscle_fiber_overlay` (`19501:0`/`21395:0`/`20640:0`/`26679:0`) shares BIT-FOR-BIT IDENTICAL
-        # (`0.000000m`) coplanar vertices with the opaque body muscle mesh underneath (rendered in DX12 with LEQUAL depth-bias).
-        # Offset these overlay vertices outward by +1.4mm along their smooth vertex normals so Cycles raytracing & Eevee
-        # NEVER suffer coplanar z-fighting speckles or dark triangles while keeping skinning 100% locked!
-        if mat_obj is not None and mat_obj.get("hfw_special_shader") == "muscle_fiber_overlay":
-            if nrm_arr is not None and len(nrm_arr) == n_verts:
-                v_nrm = nrm_arr.astype(np.float32, copy=False)
-            else:
-                v_nrm = np.zeros((n_verts, 3), dtype=np.float32)
-                t_local = idx[: (len(idx) // 3) * 3].reshape(-1, 3)
-                e1 = pos[t_local[:, 1]] - pos[t_local[:, 0]]
-                e2 = pos[t_local[:, 2]] - pos[t_local[:, 0]]
-                fn = np.cross(e1, e2)
-                np.add.at(v_nrm, t_local[:, 0], fn)
-                np.add.at(v_nrm, t_local[:, 1], fn)
-                np.add.at(v_nrm, t_local[:, 2], fn)
-            n_lens = np.linalg.norm(v_nrm, axis=1, keepdims=True)
-            unit_n = np.where(n_lens > 1e-6, v_nrm / np.maximum(n_lens, 1e-6), 0.0)
-            pos = pos + unit_n * np.float32(0.0014)
-
-        all_pos.append(pos)
-        if has_all_nrm:
-            all_nrm.append(nrm_arr)
-
-        if has_any_col0:
-            ckey = f"{key}_col0"
-            if ckey in npz:
-                c0 = npz[ckey].astype(np.float32, copy=False)
-                if c0.shape[1] == 3:
-                    c0 = np.concatenate([c0, np.ones((n_verts, 1), dtype=np.float32)], axis=1)
-                all_col0.append(c0[:, :4])
-            else:
-                c_def = np.zeros((n_verts, 4), dtype=np.float32)
-                c_def[:, 3] = 1.0
-                all_col0.append(c_def)
-
-        for u_i in range(max_uvs):
-            ukey = f"{key}_uv{u_i}"
-            if ukey in npz:
-                # Decima UVs are ALREADY V-up (0 = bottom, 1 = top), matching Blender UV space directly!
-                uv = npz[ukey].copy()
-                # Guard against dead all-zero UV1 slots (e.g. SeykaTrimsUV2 primitives): mirror UV0 cleanly!
-                if u_i >= 1 and float(np.ptp(uv)) < 1e-5 and f"{key}_uv0" in npz:
-                    uv = npz[f"{key}_uv0"].copy()
-                all_uvs[u_i].append(uv)
-            else:
-                if u_i >= 1 and f"{key}_uv0" in npz:
-                    all_uvs[u_i].append(npz[f"{key}_uv0"].copy())
-                else:
-                    all_uvs[u_i].append(np.zeros((n_verts, 2), dtype=np.float32))
-
-        if has_any_weights:
-            bikey = f"{key}_bi"
-            bwkey = f"{key}_bw"
-            if bikey in npz and bwkey in npz:
-                all_bi.append(npz[bikey])
-                all_bw.append(npz[bwkey])
-            else:
-                all_bi.append(np.zeros((n_verts, 1), dtype=np.uint16))
-                all_bw.append(np.zeros((n_verts, 1), dtype=np.float32))
-
-        tris = idx[: (len(idx) // 3) * 3].reshape(-1, 3) + vert_offset
-        valid = (tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 0] != tris[:, 2])
-        tris = tris[valid]
-        all_faces.append(tris)
-        face_mat_indices.append(np.full(len(tris), mslot, dtype=np.int32))
-        vert_offset += n_verts
-
-    if not all_pos or not all_faces:
-        return None
-
-    positions = np.concatenate(all_pos, axis=0)
-    faces = np.concatenate(all_faces, axis=0)
-    if len(faces) == 0:
-        return None
-    mat_indices = np.concatenate(face_mat_indices, axis=0)
-
     pname = part_meta["name"]
-    mesh = bpy.data.meshes.new(pname)
-    n_verts_total = len(positions)
-    n_tris_total = len(faces)
+    shared_mid = (
+        str(part_meta.get("shared_mesh_id") or "")
+        if (not part_meta["is_skinned"] and shared_mesh_cache is not None)
+        else ""
+    )
+    mesh: bpy.types.Mesh | None = shared_mesh_cache.get(shared_mid) if (shared_mid and shared_mesh_cache is not None) else None
+    has_any_weights = False
+    all_bi: list[np.ndarray] = []
+    all_bw: list[np.ndarray] = []
 
-    mesh.vertices.add(n_verts_total)
-    mesh.vertices.foreach_set("co", positions.ravel())
+    if mesh is None:
+        all_pos = []
+        all_nrm = []
+        all_col0 = []
+        all_faces = []
+        face_mat_indices = []
+        all_uvs: list[list[np.ndarray]] = []
 
-    mesh.loops.add(n_tris_total * 3)
-    mesh.loops.foreach_set("vertex_index", faces.ravel())
+        max_uvs = max(p["uv_count"] for p in prims)
+        has_any_col0 = any(p.get("color_count", 0) > 0 for p in prims)
+        has_all_nrm = all(p["has_normals"] for p in prims)
+        has_any_weights = part_meta["is_skinned"] and any(p["has_weights"] for p in prims)
+        for _ in range(max_uvs):
+            all_uvs.append([])
 
-    mesh.polygons.add(n_tris_total)
-    mesh.polygons.foreach_set("loop_start", np.arange(0, n_tris_total * 3, 3, dtype=np.int32))
-    mesh.polygons.foreach_set("loop_total", np.full(n_tris_total, 3, dtype=np.int32))
-    mesh.polygons.foreach_set("use_smooth", np.ones(n_tris_total, dtype=bool))
-    mesh.polygons.foreach_set("material_index", mat_indices)
+        used_mats: list[bpy.types.Material | None] = []
+        mat_slot_lookup: dict[str | None, int] = {}
+        vert_offset = 0
 
-    mesh.update(calc_edges=True)
+        for prim in prims:
+            key = prim["key"]
+            pos = npz[f"{key}_pos"].astype(np.float32, copy=True)
+            idx = npz[f"{key}_idx"]
+            n_verts = len(pos)
+            if n_verts == 0 or len(idx) < 3:
+                continue
 
-    loop_vidxs = faces.ravel()
-    for u_i in range(max_uvs):
-        uv_verts = np.concatenate(all_uvs[u_i], axis=0)
-        uv_layer = mesh.uv_layers.new(name=f"UV{u_i}")
-        uv_loops = uv_verts[loop_vidxs]
-        uv_layer.data.foreach_set("uv", uv_loops.ravel())
+            mid = prim["material_id"]
+            mat_obj = mat_map.get(mid) if mid else None
+            if mid not in mat_slot_lookup:
+                mat_slot_lookup[mid] = len(used_mats)
+                used_mats.append(mat_obj)
+            mslot = mat_slot_lookup[mid]
 
-    if has_any_col0 and all_col0:
-        col_verts = np.concatenate(all_col0, axis=0)
-        col_attr = mesh.color_attributes.new(name="Color0", type="FLOAT_COLOR", domain="CORNER")
-        col_loops = np.ascontiguousarray(col_verts[loop_vidxs], dtype=np.float32)
-        col_attr.data.foreach_set("color", col_loops.ravel())
+            nrm_arr = npz[f"{key}_nrm"] if (f"{key}_nrm" in npz) else None
 
-    if has_all_nrm and all_nrm:
-        nrm_verts = np.concatenate(all_nrm, axis=0)
-        lens = np.linalg.norm(nrm_verts, axis=1, keepdims=True)
-        nrm_verts = np.where(lens > 1e-6, nrm_verts / np.maximum(lens, 1e-6), np.array([0.0, 0.0, 1.0], dtype=np.float32))
-        try:
-            mesh.normals_split_custom_set_from_vertices(nrm_verts)
-        except Exception:
-            pass
+            # CRITICAL CYCLES & EEVEE FIX:
+            # In Decima, `muscle_fiber_overlay` (`19501:0`/`21395:0`/`20640:0`/`26679:0`) shares BIT-FOR-BIT IDENTICAL
+            # (`0.000000m`) coplanar vertices with the opaque body muscle mesh underneath (rendered in DX12 with LEQUAL depth-bias).
+            # Offset these overlay vertices outward by +1.4mm along their smooth vertex normals so Cycles raytracing & Eevee
+            # NEVER suffer coplanar z-fighting speckles or dark triangles while keeping skinning 100% locked!
+            if mat_obj is not None and mat_obj.get("hfw_special_shader") == "muscle_fiber_overlay":
+                if nrm_arr is not None and len(nrm_arr) == n_verts:
+                    v_nrm = nrm_arr.astype(np.float32, copy=False)
+                else:
+                    v_nrm = np.zeros((n_verts, 3), dtype=np.float32)
+                    t_local = idx[: (len(idx) // 3) * 3].reshape(-1, 3)
+                    e1 = pos[t_local[:, 1]] - pos[t_local[:, 0]]
+                    e2 = pos[t_local[:, 2]] - pos[t_local[:, 0]]
+                    fn = np.cross(e1, e2)
+                    np.add.at(v_nrm, t_local[:, 0], fn)
+                    np.add.at(v_nrm, t_local[:, 1], fn)
+                    np.add.at(v_nrm, t_local[:, 2], fn)
+                n_lens = np.linalg.norm(v_nrm, axis=1, keepdims=True)
+                unit_n = np.where(n_lens > 1e-6, v_nrm / np.maximum(n_lens, 1e-6), 0.0)
+                pos = pos + unit_n * np.float32(0.0014)
 
-    for m in used_mats:
-        mesh.materials.append(m)
+            all_pos.append(pos)
+            if has_all_nrm:
+                all_nrm.append(nrm_arr)
+
+            if has_any_col0:
+                ckey = f"{key}_col0"
+                if ckey in npz:
+                    c0 = npz[ckey].astype(np.float32, copy=False)
+                    if c0.shape[1] == 3:
+                        c0 = np.concatenate([c0, np.ones((n_verts, 1), dtype=np.float32)], axis=1)
+                    all_col0.append(c0[:, :4])
+                else:
+                    c_def = np.zeros((n_verts, 4), dtype=np.float32)
+                    c_def[:, 3] = 1.0
+                    all_col0.append(c_def)
+
+            for u_i in range(max_uvs):
+                ukey = f"{key}_uv{u_i}"
+                if ukey in npz:
+                    # Decima UVs are ALREADY V-up (0 = bottom, 1 = top), matching Blender UV space directly!
+                    uv = npz[ukey].copy()
+                    # Guard against dead all-zero UV1 slots (e.g. SeykaTrimsUV2 primitives): mirror UV0 cleanly!
+                    if u_i >= 1 and float(np.ptp(uv)) < 1e-5 and f"{key}_uv0" in npz:
+                        uv = npz[f"{key}_uv0"].copy()
+                    all_uvs[u_i].append(uv)
+                else:
+                    if u_i >= 1 and f"{key}_uv0" in npz:
+                        all_uvs[u_i].append(npz[f"{key}_uv0"].copy())
+                    else:
+                        all_uvs[u_i].append(np.zeros((n_verts, 2), dtype=np.float32))
+
+            if has_any_weights:
+                bikey = f"{key}_bi"
+                bwkey = f"{key}_bw"
+                if bikey in npz and bwkey in npz:
+                    all_bi.append(npz[bikey])
+                    all_bw.append(npz[bwkey])
+                else:
+                    all_bi.append(np.zeros((n_verts, 1), dtype=np.uint16))
+                    all_bw.append(np.zeros((n_verts, 1), dtype=np.float32))
+
+            tris = idx[: (len(idx) // 3) * 3].reshape(-1, 3) + vert_offset
+            valid = (tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 0] != tris[:, 2])
+            tris = tris[valid]
+            all_faces.append(tris)
+            face_mat_indices.append(np.full(len(tris), mslot, dtype=np.int32))
+            vert_offset += n_verts
+
+        if not all_pos or not all_faces:
+            return None
+
+        positions = np.concatenate(all_pos, axis=0)
+        faces = np.concatenate(all_faces, axis=0)
+        if len(faces) == 0:
+            return None
+        mat_indices = np.concatenate(face_mat_indices, axis=0)
+
+        mesh = bpy.data.meshes.new(pname)
+        n_verts_total = len(positions)
+        n_tris_total = len(faces)
+
+        mesh.vertices.add(n_verts_total)
+        mesh.vertices.foreach_set("co", positions.ravel())
+
+        mesh.loops.add(n_tris_total * 3)
+        mesh.loops.foreach_set("vertex_index", faces.ravel())
+
+        mesh.polygons.add(n_tris_total)
+        mesh.polygons.foreach_set("loop_start", np.arange(0, n_tris_total * 3, 3, dtype=np.int32))
+        mesh.polygons.foreach_set("loop_total", np.full(n_tris_total, 3, dtype=np.int32))
+        mesh.polygons.foreach_set("use_smooth", np.ones(n_tris_total, dtype=bool))
+        mesh.polygons.foreach_set("material_index", mat_indices)
+
+        mesh.update(calc_edges=True)
+
+        loop_vidxs = faces.ravel()
+        for u_i in range(max_uvs):
+            uv_verts = np.concatenate(all_uvs[u_i], axis=0)
+            uv_layer = mesh.uv_layers.new(name=f"UV{u_i}")
+            uv_loops = uv_verts[loop_vidxs]
+            uv_layer.data.foreach_set("uv", uv_loops.ravel())
+
+        if has_any_col0 and all_col0:
+            col_verts = np.concatenate(all_col0, axis=0)
+            col_attr = mesh.color_attributes.new(name="Color0", type="FLOAT_COLOR", domain="CORNER")
+            col_loops = np.ascontiguousarray(col_verts[loop_vidxs], dtype=np.float32)
+            col_attr.data.foreach_set("color", col_loops.ravel())
+
+        if has_all_nrm and all_nrm:
+            nrm_verts = np.concatenate(all_nrm, axis=0)
+            lens = np.linalg.norm(nrm_verts, axis=1, keepdims=True)
+            nrm_verts = np.where(lens > 1e-6, nrm_verts / np.maximum(lens, 1e-6), np.array([0.0, 0.0, 1.0], dtype=np.float32))
+            try:
+                mesh.normals_split_custom_set_from_vertices(nrm_verts)
+            except Exception:
+                pass
+
+        for m in used_mats:
+            mesh.materials.append(m)
+
+        if shared_mid and shared_mesh_cache is not None:
+            shared_mesh_cache[shared_mid] = mesh
 
     obj = bpy.data.objects.new(pname, mesh)
     obj["hfw_entity_id"] = entity_id
@@ -5157,6 +5936,7 @@ def import_bundle_into_scene(
     _bind_native_shader_drivers(arm_obj, asset_kind, shader_controls, has_plasma_charge=has_plasma_charge)
 
     created = 0
+    shared_mesh_cache: dict[str, bpy.types.Mesh] = {}
     for pmeta in manifest["parts"]:
         coll = sub_colls.get(pmeta["collection"], root_coll)
         obj = _build_part_mesh_object(
@@ -5168,9 +5948,28 @@ def import_bundle_into_scene(
             helper_bone_map,
             coll,
             manifest["entity_id"],
+            shared_mesh_cache=shared_mesh_cache,
         )
         if obj is not None:
             created += 1
+
+    # Auto-bump camera & 3D viewport clip_end for colossal machines (e.g. 289m FAS-BOR7 Horus!)
+    try:
+        jpos_arr = np.array([[j["world_matrix"][0][3], j["world_matrix"][1][3], j["world_matrix"][2][3]] for j in manifest.get("joints", ())], dtype=np.float64)
+        if len(jpos_arr) >= 2:
+            span = float(np.linalg.norm(jpos_arr.max(axis=0) - jpos_arr.min(axis=0)))
+            if span > 60.0:
+                clip_target = max(2500.0, span * 8.0)
+                if bpy.context.scene.camera and bpy.context.scene.camera.data:
+                    bpy.context.scene.camera.data.clip_end = max(bpy.context.scene.camera.data.clip_end, clip_target)
+                for scr in bpy.data.screens:
+                    for area in scr.areas:
+                        if area.type == "VIEW_3D":
+                            for space in area.spaces:
+                                if space.type == "VIEW_3D":
+                                    space.clip_end = max(space.clip_end, clip_target)
+    except Exception:
+        pass
 
     def _hide_layer_collection(layer_coll: bpy.types.LayerCollection, target_name: str) -> None:
         if layer_coll.collection.name == target_name:

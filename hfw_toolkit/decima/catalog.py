@@ -403,6 +403,47 @@ class AssetCatalog:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
         self._migrate_machine_catalog_v12()
+        self._migrate_horus_v13()
+
+    def _migrate_horus_v13(self) -> None:
+        """Idempotent fast migration registering Burning Shores FAS-BOR7 Horus (`14110:7066`) when DLC assets exist."""
+        try:
+            row = self.conn.execute("SELECT value FROM meta WHERE key = 'horus_v13'").fetchone()
+            if row is not None and row["value"] == "1":
+                return
+            # Only inject Horus if Burning Shores Titan TextureSets exist in this indexed game install
+            ts_rows = self.conn.execute(
+                "SELECT group_id, object_index, name FROM texture_sets WHERE lower(codename) = 'titan' LIMIT 50"
+            ).fetchall()
+            if not ts_rows:
+                return
+            sample_hints = [r["name"] for r in ts_rows[:5]]
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO entities
+                    VALUES (14110, 7066, 'EntityResource', 'machine', 'titan', 'Horus', 1, 1, 1864, ?)
+                    """,
+                    (json.dumps(sample_hints),),
+                )
+                self.conn.executemany(
+                    "INSERT OR IGNORE INTO entity_texture_sets VALUES (14110, ?, ?)",
+                    [(int(r["group_id"]), int(r["object_index"])) for r in ts_rows],
+                )
+                self.conn.execute(
+                    "DELETE FROM entity_variants WHERE entity_group_id = 14110 AND entity_object_index = 7066"
+                )
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO entity_variants VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (14110, 7066, 0, "Horus — Complete Boss (1,229 joints, 1,864 hull parts + 102 turrets & heat sinks)", "14110:1000", "1624:64", 1864),
+                        (14110, 7066, 1, "Horus — Clean Hull / Cinematic (1,229 joints, 1,812 hull parts)", "", "68784:11", 1812),
+                        (14110, 7066, 2, "Horus — Drill Tentacles Boss Phase (254 joints, 258 parts + 18 drills)", "23470:402", "23470:239", 258),
+                    ],
+                )
+                self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('horus_v13', '1')")
+        except Exception:
+            pass
 
     def _migrate_machine_catalog_v12(self) -> None:
         """Idempotent fast migration fixing swapped Skydrifter/Glinthawk names and stale contaminated variants."""
@@ -862,6 +903,39 @@ class AssetCatalog:
             else:
                 row_list[3] = "machine_subpart"
                 validated_rows[idx_pos] = tuple(row_list)
+
+        # Inject Burning Shores colossal FAS-BOR7 Horus (`14110:7066`, EntityResource — not ControlledEntityResource!)
+        # whenever Burning Shores archives (`group 14110` + `group 1624`) are present in the live streaming graph.
+        try:
+            gm_h = graph.group(14110)
+            graph.group(1624)
+            if 7066 < gm_h.num_objects and names_by_hash[tt_idx[gm_h.type_start + 7066]] == "EntityResource":
+                titan_ts_names = [
+                    r["name"]
+                    for r in self.conn.execute(
+                        "SELECT name FROM texture_sets WHERE lower(codename) = 'titan' LIMIT 5"
+                    ).fetchall()
+                ]
+                validated_rows.append(
+                    (
+                        14110,
+                        7066,
+                        "EntityResource",
+                        "machine",
+                        "titan",
+                        "Horus",
+                        1,
+                        1,
+                        1864,
+                        json.dumps(titan_ts_names),
+                    )
+                )
+                for tgid, tlist in ts_by_group.items():
+                    for oidx, _tcat, tcode in tlist:
+                        if tcode.lower() == "titan":
+                            ets_rows.append((14110, tgid, oidx))
+        except Exception:
+            pass
 
         return validated_rows, ets_rows
 

@@ -158,9 +158,16 @@
               <option value="selected">Anims: Checked (0)</option>
             </select>
           </div>
-          <div class="export-row">
-            <label class="chk-inline"><input type="checkbox" id="chk-unpack" /> Unpack Maps</label>
-            <label class="chk-inline"><input type="checkbox" id="chk-pack" /> Pack .blend</label>
+          <div class="export-row" style="align-items:center;gap:6px;">
+            <select id="m-lod" class="compact-select" style="width:118px;" title="Mesh Level of Detail (Auto picks LOD 2 for colossal Horus, LOD 0 for all other machines)">
+              <option value="-1" selected>LOD: Auto</option>
+              <option value="0">LOD 0 (Hero)</option>
+              <option value="1">LOD 1 (High)</option>
+              <option value="2">LOD 2 (Med)</option>
+              <option value="3">LOD 3 (Fast)</option>
+            </select>
+            <label class="chk-inline"><input type="checkbox" id="chk-unpack" /> Unpack</label>
+            <label class="chk-inline"><input type="checkbox" id="chk-pack" /> Pack</label>
           </div>
         </div>
 
